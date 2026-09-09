@@ -83,3 +83,46 @@ Stage 7 (Coder Core): GRADUATED.
   YODAW_LLM_KEEP_ALIVE; GitHub reuse search is gated behind
   YODAW_ENABLE_GITHUB.
 
+Stage 8 (Execution Runtime): GRADUATED.
+
+- The public API is asynchronous: POST /api/v1/missions persists
+  and enqueues the mission and returns {id, status: QUEUED}
+  immediately; clients poll GET /api/v1/missions/{id}. Long LLM
+  calls no longer hold HTTP connections open.
+- Missions execute from a durable SQLite-backed queue (WAL,
+  busy timeout, indexed status columns, schema migrations) with
+  transaction-based atomic claims: two coordinators can never
+  receive the same mission, across threads and processes.
+- Concurrency is bounded (YODAW_MAX_CONCURRENT_MISSIONS) with
+  per-repository exclusion leases, so the same target repository
+  is never mutated by two missions concurrently while different
+  repositories run in parallel.
+- Cancellation is real: queued missions cancel immediately;
+  executing missions stop at cooperative checkpoints (around LLM
+  calls, edits, validation, repairs, and before commit) and never
+  leave a failed attempt committed.
+- Heartbeats persist to the mission payload on a dedicated thread
+  independent of worker execution; failures are counted and
+  logged, never silent. The watchdog recovers stale executing
+  missions with explicit InterruptedExecution evidence, inspecting
+  leftover branches instead of re-running (no duplicate commits).
+- Provider calls retry transient faults with bounded exponential
+  backoff and jitter, classified so deterministic errors are not
+  retried; every attempt is recorded in evidence.
+- /api/v1 routes support bearer-key authentication with
+  constant-time comparison (YODAW_API_KEY), local-dev mode without
+  a key, and secret redaction in evidence and events.
+- Structured mission events (queued/started/completed/cancelled/
+  recovered plus worker and lifecycle events) are queryable via
+  GET /api/v1/missions/{id}/events.
+- python -m app.runtime runs API + coordinator + watchdog in one
+  production entrypoint; SIGTERM/SIGINT drain inflight missions,
+  release leases, and shut down cleanly.
+- Proven by a 103-test suite (Stage 7 regression included), a
+  hermetic runtime E2E through the real process with a fake
+  planner, a heartbeat E2E with a deliberately slow planner, and
+  one live-provider smoke through the real runtime: mission
+  m_96949292485e PASSED with ollama/qwen2.5-coder:7b, commit
+  f0bd860 on yodaw/task-1788983754, learning record lr_5fc52f08e0d0,
+  POST latency under one second.
+
