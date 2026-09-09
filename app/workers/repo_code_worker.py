@@ -1,5 +1,7 @@
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -12,8 +14,30 @@ from app.learning.retrieval import (
 )
 
 
+class ToolMissingError(RuntimeError):
+    """A validation tool is not available in the environment."""
+
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def which(tool: str):
+    return shutil.which(tool)
+
+
+def read_text_preserve(path: Path) -> str:
+    """Read file text without newline translation so CRLF files
+    keep their exact line endings in memory."""
+    with path.open("r", newline="") as handle:
+        return handle.read()
+
+
+def write_text_preserve(path: Path, text: str) -> None:
+    """Write file text without newline translation so untouched
+    regions keep their original line endings byte-for-byte."""
+    with path.open("w", newline="") as handle:
+        handle.write(text)
 
 
 def run(cmd, cwd=None, timeout=300):
@@ -75,9 +99,13 @@ def detect_test_commands(worktree: Path):
         or (worktree / "tests").exists()
         or (worktree / "pyproject.toml").exists()
     ):
+        # Run under the interpreter that is executing YODAW itself
+        # instead of relying on a PATH lookup; this avoids confusing
+        # failures when 'python' is not on PATH while never
+        # hardcoding a user-specific environment path.
         commands.append(
             [
-                "python",
+                sys.executable or "python",
                 "-B",
                 "-m",
                 "pytest",
@@ -88,6 +116,12 @@ def detect_test_commands(worktree: Path):
         )
 
     if (worktree / "package.json").exists():
+        if not which("npm"):
+            raise ToolMissingError(
+                "npm executable not found on PATH; "
+                "cannot run JavaScript validation"
+            )
+
         commands.append(["npm", "test", "--", "--runInBand"])
 
     return commands
@@ -205,7 +239,7 @@ def prepare_edits(
             }
 
         if target_file not in original_contents:
-            original_contents[target_file] = target.read_text()
+            original_contents[target_file] = read_text_preserve(target)
 
         current = staged_contents.get(
             target_file,
@@ -284,7 +318,7 @@ def apply_edits(worktree: Path, staged_contents: dict, touched_files: list):
     """
     for target_file in touched_files:
         target = (worktree / target_file).resolve()
-        target.write_text(staged_contents[target_file])
+        write_text_preserve(target, staged_contents[target_file])
 
 
 def restore_originals(
@@ -300,7 +334,7 @@ def restore_originals(
     """
     for edited_file, original_text in original_contents.items():
         edited_path = (worktree / edited_file).resolve()
-        edited_path.write_text(original_text)
+        write_text_preserve(edited_path, original_text)
 
     evidence.append(
         {
@@ -313,16 +347,27 @@ def restore_originals(
     )
 
 
-def run_validation(worktree: Path, evidence: list):
+def run_validation(
+    worktree: Path,
+    evidence: list,
+    test_commands: list,
+):
     """
     Run every detected test command once and return
     (passed, results).
     """
-    test_commands = detect_test_commands(worktree)
     results = []
 
     for cmd in test_commands:
-        result = run(cmd, cwd=worktree)
+        try:
+            result = run(cmd, cwd=worktree)
+        except FileNotFoundError as exc:
+            # A selected validation tool must exist; fail with a
+            # clear environment diagnostic, never a silent one.
+            raise ToolMissingError(
+                f"Validation tool not executable: {cmd[0]} ({exc})"
+            ) from exc
+
         evidence.append(result)
         results.append(result)
 
@@ -397,6 +442,90 @@ def collect_learning_lessons(
     return "\n".join(format_lessons(records))
 
 
+def cleanup_worktree(
+    worktree: Path,
+    repo: Path,
+    keep_worktree: bool,
+    evidence: list,
+    failed: bool,
+):
+    """
+    Safe worktree lifecycle cleanup.
+
+    Policy:
+    - keep_worktree=True keeps the worktree for any outcome.
+    - failed missions keep their worktree explicitly for
+      debugging/evidence (recorded, never silent).
+    - successful missions remove the worktree and prune.
+
+    Cleanup failure must never hide the original mission result;
+    it is recorded as worktree_cleanup_error evidence instead.
+    """
+    if keep_worktree:
+        action = "kept_by_request"
+    elif failed:
+        action = "kept_failed_for_debugging"
+    else:
+        action = "removed"
+
+    evidence.append(
+        {
+            "type": "worktree_cleanup",
+            "action": action,
+            "worktree": str(worktree),
+            "timestamp": now_iso(),
+        }
+    )
+
+    if action != "removed":
+        return
+
+    try:
+        remove_result = run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=repo,
+        )
+        evidence.append(remove_result)
+
+        if remove_result["returncode"] != 0:
+            evidence.append(
+                {
+                    "type": "worktree_cleanup_error",
+                    "worktree": str(worktree),
+                    "error": (
+                        "git worktree remove failed; "
+                        "used filesystem fallback"
+                    ),
+                    "timestamp": now_iso(),
+                }
+            )
+
+            shutil.rmtree(worktree, ignore_errors=True)
+
+        prune_result = run(
+            ["git", "worktree", "prune"],
+            cwd=repo,
+        )
+        evidence.append(prune_result)
+
+    except Exception as exc:
+        evidence.append(
+            {
+                "type": "worktree_cleanup_error",
+                "worktree": str(worktree),
+                "error": str(exc),
+                "timestamp": now_iso(),
+            }
+        )
+
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+            run(["git", "worktree", "prune"], cwd=repo)
+        except Exception:
+            # Cleanup is best-effort; the mission result stands.
+            pass
+
+
 def worktree_is_clean(worktree: Path) -> bool:
     status = run(
         ["git", "status", "--short"],
@@ -468,6 +597,7 @@ class RepoCodeWorker(Worker):
         max_retries = int(metadata.get("max_retries", 1))
         retries = 0
         mission_id = metadata.get("mission_id")
+        keep_worktree = bool(metadata.get("keep_worktree", False))
 
         try:
             source_status = run(
@@ -562,6 +692,36 @@ class RepoCodeWorker(Worker):
 
             is_llm_mission = explicit_edits is None
 
+            # Detect validation tooling once, before any edit is
+            # applied, so a missing tool fails fast with a clear
+            # environment error instead of a confusing one.
+            try:
+                test_commands = detect_test_commands(worktree)
+            except ToolMissingError as exc:
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
+                return WorkerResult(
+                    success=False,
+                    output={
+                        "goal": goal,
+                        "repo": str(repo),
+                        "branch": branch_name,
+                        "tests_passed": False,
+                    },
+                    evidence=evidence,
+                    error={
+                        "type": "ToolMissingError",
+                        "message": str(exc),
+                    },
+                    retryable=False,
+                )
+
             lessons = ""
 
             if is_llm_mission:
@@ -595,6 +755,14 @@ class RepoCodeWorker(Worker):
                         )
 
                         if llm_plan.get("action") == "blocked":
+                            cleanup_worktree(
+                                worktree,
+                                repo,
+                                keep_worktree,
+                                evidence,
+                                failed=True,
+                            )
+
                             return WorkerResult(
                                 success=False,
                                 output={
@@ -660,6 +828,14 @@ class RepoCodeWorker(Worker):
                     )
 
                     if repair_plan.get("action") == "blocked":
+                        cleanup_worktree(
+                            worktree,
+                            repo,
+                            keep_worktree,
+                            evidence,
+                            failed=True,
+                        )
+
                         return WorkerResult(
                             success=False,
                             output={
@@ -708,9 +884,20 @@ class RepoCodeWorker(Worker):
                 )
 
                 if prepare_error is not None:
+                    cleanup_worktree(
+                        worktree,
+                        repo,
+                        keep_worktree,
+                        evidence,
+                        failed=True,
+                    )
+
+                    output = {"worktree": str(worktree)}
+                    output.update(prepare_error["output"])
+
                     return WorkerResult(
                         success=False,
-                        output=prepare_error["output"],
+                        output=output,
                         evidence=evidence,
                         error=prepare_error["error"],
                         retryable=False,
@@ -737,6 +924,7 @@ class RepoCodeWorker(Worker):
                 tests_passed, test_results = run_validation(
                     worktree,
                     evidence,
+                    test_commands,
                 )
 
                 if tests_passed:
@@ -787,6 +975,14 @@ class RepoCodeWorker(Worker):
                 )
 
                 if not clean_after_restore:
+                    cleanup_worktree(
+                        worktree,
+                        repo,
+                        keep_worktree,
+                        evidence,
+                        failed=True,
+                    )
+
                     return WorkerResult(
                         success=False,
                         output={
@@ -833,6 +1029,14 @@ class RepoCodeWorker(Worker):
                 attempt += 1
 
             if repair_error is not None:
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
                 return WorkerResult(
                     success=False,
                     output={
@@ -853,6 +1057,14 @@ class RepoCodeWorker(Worker):
             if not tests_passed:
                 # Final attempt failed validation (e.g. deterministic
                 # edits with no repair path); nothing was committed.
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
                 return WorkerResult(
                     success=False,
                     output={
@@ -881,6 +1093,14 @@ class RepoCodeWorker(Worker):
             evidence.append(status_before_commit)
 
             if not status_before_commit["stdout"].strip():
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
                 return WorkerResult(
                     success=False,
                     output={
@@ -921,6 +1141,14 @@ class RepoCodeWorker(Worker):
             evidence.append(commit_result)
 
             if commit_result["returncode"] != 0:
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
                 return WorkerResult(
                     success=False,
                     output={
@@ -948,6 +1176,17 @@ class RepoCodeWorker(Worker):
             )
             evidence.append(final_status)
 
+            # Successful mission: remove the isolated worktree so
+            # workspace/ does not accumulate directories. This runs
+            # only after the commit is fully recorded.
+            cleanup_worktree(
+                worktree,
+                repo,
+                keep_worktree,
+                evidence,
+                failed=False,
+            )
+
             return WorkerResult(
                 success=True,
                 output={
@@ -965,7 +1204,7 @@ class RepoCodeWorker(Worker):
                     ),
                     "target_files": touched_files,
                     "edit_count": len(prepared_edits),
-                    "tests_detected": len(detect_test_commands(worktree)),
+                    "tests_detected": len(test_commands),
                     "tests_passed": True,
                     "retries": retries,
                     "attempts": attempt + 1,

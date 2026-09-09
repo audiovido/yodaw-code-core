@@ -95,15 +95,17 @@ def test_atomic_multi_file_execution(tmp_path):
         "helpers.py",
     }
 
-    worktree = output["worktree"]
+    # Successful missions remove the isolated worktree; the commit
+    # is verified through git objects on the mission branch.
+    branch = output["branch"]
 
     changed = set(
         git(
-            worktree,
+            repo,
             "show",
             "--name-only",
             "--pretty=format:",
-            "HEAD",
+            branch,
         ).splitlines()
     )
 
@@ -368,9 +370,12 @@ def test_repeated_edits_to_same_file_compose_in_memory(tmp_path):
     assert output["working_tree_clean"] is True
 
     # The second edit matched text that only existed in the
-    # staged in-memory content of the first edit.
-    final_text = (
-        Path(output["worktree"]) / "calc.py"
-    ).read_text()
+    # staged in-memory content of the first edit; the final
+    # content is verified through the committed git object.
+    branch = output["branch"]
 
-    assert final_text == "def value():\n    return 42\n"
+    final_text = git(repo, "show", f"{branch}:calc.py")
+
+    # git() strips trailing whitespace, so compare without the
+    # final newline of the stored blob.
+    assert final_text == "def value():\n    return 42"

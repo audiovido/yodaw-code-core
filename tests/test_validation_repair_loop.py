@@ -157,21 +157,27 @@ def test_first_attempt_fails_second_passes(divide_repo, monkeypatch):
     assert output["attempts"] == 2
     assert output["working_tree_clean"] is True
 
-    worktree = Path(output["worktree"])
+    # Successful missions remove the isolated worktree; the
+    # final state is verified through git objects on the branch.
+    branch = output["branch"]
 
     # Exactly one commit beyond baseline and only final code in it.
-    assert git(worktree, "rev-list", "--count", "HEAD") == "2"
-    final_code = (worktree / "calculator.py").read_text()
+    assert git(divide_repo, "rev-list", "--count", branch) == "2"
+    final_code = git(
+        divide_repo,
+        "show",
+        f"{branch}:calculator.py",
+    )
     assert "return a / b" in final_code
     assert "a // b" not in final_code
 
     # The broken attempt must never have been committed.
     commit_files = git(
-        worktree,
+        divide_repo,
         "show",
         "--name-only",
         "--pretty=format:",
-        "HEAD",
+        branch,
     ).split()
     assert commit_files == ["calculator.py"]
 
@@ -438,28 +444,31 @@ def test_multi_file_failed_attempt_then_multi_file_repair(tmp_path, monkeypatch)
     assert set(output["target_files"]) == {"service.py", "helpers.py"}
     assert output["working_tree_clean"] is True
 
-    worktree = Path(output["worktree"])
+    branch = output["branch"]
 
     # Atomic behavior across attempts: exactly one commit with
     # only the corrected content, nothing from the failed attempt.
-    assert git(worktree, "rev-list", "--count", "HEAD") == "2"
+    assert git(repo, "rev-list", "--count", branch) == "2"
 
     changed = set(
         git(
-            worktree,
+            repo,
             "show",
             "--name-only",
             "--pretty=format:",
-            "HEAD",
+            branch,
         ).split()
     )
 
     assert changed == {"service.py", "helpers.py"}
 
-    assert "return 2" in (worktree / "service.py").read_text()
-    assert "return 3" not in (worktree / "service.py").read_text()
-    assert "return 20" in (worktree / "helpers.py").read_text()
-    assert "return 30" not in (worktree / "helpers.py").read_text()
+    service_code = git(repo, "show", f"{branch}:service.py")
+    helpers_code = git(repo, "show", f"{branch}:helpers.py")
+
+    assert "return 2" in service_code
+    assert "return 3" not in service_code
+    assert "return 20" in helpers_code
+    assert "return 30" not in helpers_code
 
     assert git(repo, "rev-parse", "HEAD") == baseline
 
@@ -508,7 +517,11 @@ def test_no_repair_when_first_attempt_passes(divide_repo, monkeypatch):
     assert output["tests_passed"] is True
     assert output["working_tree_clean"] is True
 
-    worktree = Path(output["worktree"])
-
-    # One final commit containing the initial plan only.
-    assert git(worktree, "rev-list", "--count", "HEAD") == "2"
+    # One final commit containing the initial plan only; the
+    # worktree itself is removed by the success lifecycle policy.
+    assert git(
+        divide_repo,
+        "rev-list",
+        "--count",
+        output["branch"],
+    ) == "2"
