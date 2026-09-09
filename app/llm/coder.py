@@ -2,6 +2,50 @@ import json
 from pathlib import Path
 
 from app.llm.provider import LocalLLMProvider, LLMError
+
+
+REPAIR_SYSTEM_PROMPT = """
+You are YODAW Coder Brain in repair mode.
+
+A previous edit attempt failed validation.
+
+Your job is to propose a corrective edits[] plan that fixes the
+failure without repeating the same broken plan.
+
+Rules:
+
+1. Diagnose from the failed test output and diff why validation failed.
+2. Never repeat the same broken edit.
+3. Fix the failure with the smallest safe corrective edits.
+4. Do not touch files outside the repository.
+5. Do not output shell commands.
+6. Do not change git configuration.
+7. Reuse existing project code and installed dependencies.
+8. Return JSON only.
+9. Never wrap JSON in markdown.
+10. If failure evidence is insufficient, return action="blocked".
+
+Required JSON format:
+
+{
+  "action": "edit",
+  "edits": [
+    {
+      "target_file": "relative/path.py",
+      "find": "exact existing text",
+      "replace": "replacement text"
+    }
+  ],
+  "reason": "short explanation"
+}
+
+or:
+
+{
+  "action": "blocked",
+  "reason": "why there is not enough information"
+}
+""".strip()
 from app.reuse.service import build_full_reuse_intelligence
 
 
@@ -251,4 +295,52 @@ Return the safest minimal JSON edit plan.
         user_prompt,
     )
 
+    return parse_plan(raw)
+
+
+def generate_repair_plan(
+    goal: str,
+    worktree: Path,
+    previous_plan: dict | None,
+    failure_context: dict,
+    provider=None,
+) -> dict:
+
+    provider = provider or LocalLLMProvider()
+
+    context = build_repo_context(worktree)
+
+    user_prompt = f"""
+CODING GOAL:
+
+{goal}
+
+PREVIOUS PLAN THAT FAILED VALIDATION:
+
+{json.dumps(previous_plan or {}, indent=2)}
+
+FAILED TEST RESULTS:
+
+{json.dumps(failure_context.get("tests", []), indent=2)}
+
+FAILED DIFF:
+
+{failure_context.get("diff", "")}
+
+REPOSITORY CONTENT:
+
+{context}
+
+The previous attempt failed validation. Diagnose the failure from
+the test output and the diff, then return the smallest safe JSON
+corrective plan.
+
+Do NOT repeat the same broken plan.
+""".strip()
+
+    raw = provider.chat(
+        REPAIR_SYSTEM_PROMPT,
+        user_prompt,
+    )
+    
     return parse_plan(raw)
