@@ -31,6 +31,38 @@ def run(cmd, cwd=None, timeout=300):
     }
 
 
+def find_relaxed_unique_match(original: str, needle: str):
+    """
+    Find a unique multiline match while ignoring leading/trailing
+    whitespace on each line. Returns the exact source slice so the
+    replacement still applies to real repository text.
+    """
+    needle_lines = needle.strip().splitlines()
+    if not needle_lines:
+        return None
+
+    original_lines = original.splitlines(keepends=True)
+    normalized_needle = [line.strip() for line in needle_lines]
+
+    matches = []
+
+    for start in range(len(original_lines)):
+        end = start + len(normalized_needle)
+
+        if end > len(original_lines):
+            break
+
+        candidate = original_lines[start:end]
+
+        if [line.strip() for line in candidate] == normalized_needle:
+            matches.append("".join(candidate))
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
 def detect_test_commands(worktree: Path):
     commands = []
 
@@ -266,7 +298,26 @@ class RepoCodeWorker(Worker):
 
             original = target.read_text()
 
+            actual_find_text = find_text
+
             if find_text not in original:
+                actual_find_text = find_relaxed_unique_match(
+                    original,
+                    find_text,
+                )
+
+                if actual_find_text is not None:
+                    evidence.append(
+                        {
+                            "type": "relaxed_match",
+                            "file": target_file,
+                            "requested_find": find_text,
+                            "actual_find": actual_find_text,
+                            "timestamp": now_iso(),
+                        }
+                    )
+
+            if actual_find_text is None or actual_find_text not in original:
                 return WorkerResult(
                     success=False,
                     output={
@@ -275,13 +326,16 @@ class RepoCodeWorker(Worker):
                     evidence=evidence,
                     error={
                         "type": "FindTextMissing",
-                        "message": "Requested source text not found",
+                        "message": (
+                            "Requested source text was not found "
+                            "as an exact or unique relaxed match"
+                        ),
                     },
                     retryable=False,
                 )
 
             modified = original.replace(
-                find_text,
+                actual_find_text,
                 replace_text,
                 1,
             )
