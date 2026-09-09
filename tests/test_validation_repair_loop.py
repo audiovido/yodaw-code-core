@@ -80,7 +80,7 @@ def make_llm(monkeypatch, plans):
     calls = {"plan": 0, "repair": 0}
     prompts = []
 
-    def fake_generate_edit_plan(goal, worktree):
+    def fake_generate_edit_plan(goal, worktree, lessons=""):
         func, plan = plans[calls["plan"]]
         calls["plan"] += 1
         prompts.append(("plan", func, goal))
@@ -92,6 +92,7 @@ def make_llm(monkeypatch, plans):
         previous_plan,
         failure_context,
         provider=None,
+        lessons="",
     ):
         func, plan = plans[1 + calls["repair"]]
         calls["repair"] += 1
@@ -305,7 +306,7 @@ def test_repair_plan_blocked_returns_clean_failure(divide_repo, monkeypatch):
 def test_repair_llm_error_preserves_evidence(divide_repo, monkeypatch):
     baseline = git(divide_repo, "rev-parse", "HEAD")
 
-    def fake_generate_edit_plan(goal, worktree):
+    def fake_generate_edit_plan(goal, worktree, lessons=""):
         return BROKEN_DIVIDE_PLAN
 
     def fake_generate_repair_plan(*args, **kwargs):
@@ -485,7 +486,7 @@ def test_no_repair_when_first_attempt_passes(divide_repo, monkeypatch):
     monkeypatch.setattr(
         worker_module,
         "generate_edit_plan",
-        lambda goal, worktree: good_initial_plan,
+        lambda goal, worktree, lessons="": good_initial_plan,
     )
     monkeypatch.setattr(
         worker_module,

@@ -48,7 +48,7 @@ pythonpath = .
         run(["git", "add", "."], repo)
         run(["git", "commit", "-m", "baseline"], repo)
 
-        def fake_generate(goal, worktree):
+        def fake_generate(goal, worktree, lessons=""):
             return {
                 "action": "edit",
                 "target_file": "calc.py",

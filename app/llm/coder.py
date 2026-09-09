@@ -46,7 +46,38 @@ or:
   "reason": "why there is not enough information"
 }
 """.strip()
+
+from app.learning.retrieval import (
+    format_lessons,
+    retrieve_relevant_learnings,
+)
 from app.reuse.service import build_full_reuse_intelligence
+
+
+def build_lessons_context(goal: str, limit: int = 3) -> str:
+    """
+    Retrieve relevant prior experience for planning context.
+    Retrieval is advisory: it must never corrupt a mission and
+    must never modify policy or constitution files.
+    """
+    try:
+        records = retrieve_relevant_learnings(goal, limit=limit)
+
+        if not records:
+            return ""
+
+        lessons = format_lessons(records)
+
+        return (
+            "\nRELEVANT PRIOR EXPERIENCE (guidance only, "
+            "do not blindly copy previous patches):\n\n"
+            + "\n".join(lessons)
+            + "\n"
+        )
+
+    except Exception:
+        # Learning retrieval failure must never break planning.
+        return ""
 
 
 SYSTEM_PROMPT = """
@@ -255,11 +286,13 @@ def generate_edit_plan(
     goal: str,
     worktree: Path,
     provider=None,
+    lessons: str = "",
 ) -> dict:
 
     provider = provider or LocalLLMProvider()
 
     context = build_repo_context(worktree)
+    lessons = lessons or build_lessons_context(goal)
     reuse_report = build_full_reuse_intelligence(
         worktree,
         goal,
@@ -278,7 +311,7 @@ REUSE ANALYSIS:
 REPOSITORY CONTENT:
 
 {context}
-
+{lessons}
 Before proposing new code, check the reuse analysis.
 
 Priority:
@@ -304,11 +337,13 @@ def generate_repair_plan(
     previous_plan: dict | None,
     failure_context: dict,
     provider=None,
+    lessons: str = "",
 ) -> dict:
 
     provider = provider or LocalLLMProvider()
 
     context = build_repo_context(worktree)
+    lessons = lessons or build_lessons_context(goal)
 
     user_prompt = f"""
 CODING GOAL:
@@ -330,7 +365,7 @@ FAILED DIFF:
 REPOSITORY CONTENT:
 
 {context}
-
+{lessons}
 The previous attempt failed validation. Diagnose the failure from
 the test output and the diff, then return the smallest safe JSON
 corrective plan.

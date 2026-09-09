@@ -176,7 +176,7 @@ def test_legacy_llm_plan_is_normalized_to_single_edit(tmp_path, monkeypatch):
         },
     )
 
-    def fake_generate(goal, worktree):
+    def fake_generate(goal, worktree, lessons=""):
         # Legacy Stage 6 single-edit plan shape.
         return {
             "action": "edit",

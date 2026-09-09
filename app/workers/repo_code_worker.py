@@ -6,6 +6,10 @@ from datetime import datetime, timezone
 
 from app.workers.base import Worker, WorkerResult
 from app.llm.coder import generate_edit_plan, generate_repair_plan
+from app.learning.retrieval import (
+    format_lessons,
+    retrieve_relevant_learnings,
+)
 
 
 def now_iso():
@@ -343,6 +347,56 @@ def build_failure_context(
     }
 
 
+def collect_learning_lessons(
+    goal: str,
+    evidence: list,
+    mission_id: str | None = None,
+    limit: int = 3,
+):
+    """
+    Retrieve relevant prior learnings for planning context and
+    record retrieval evidence. Retrieval is advisory guidance and
+    must never corrupt the mission.
+    """
+    try:
+        records = retrieve_relevant_learnings(goal, limit=limit)
+    except Exception as exc:
+        evidence.append(
+            {
+                "type": "learning_retrieval",
+                "mission_id": mission_id,
+                "records_used": [],
+                "count": 0,
+                "error": str(exc),
+                "timestamp": now_iso(),
+            }
+        )
+        return ""
+
+    evidence.append(
+        {
+            "type": "learning_retrieval",
+            "mission_id": mission_id,
+            "records_used": [
+                {
+                    "id": record.id,
+                    "mission_id": record.mission_id,
+                    "outcome": record.outcome,
+                    "goal": record.goal,
+                }
+                for record in records
+            ],
+            "count": len(records),
+            "timestamp": now_iso(),
+        }
+    )
+
+    if not records:
+        return ""
+
+    return "\n".join(format_lessons(records))
+
+
 def worktree_is_clean(worktree: Path) -> bool:
     status = run(
         ["git", "status", "--short"],
@@ -413,6 +467,7 @@ class RepoCodeWorker(Worker):
 
         max_retries = int(metadata.get("max_retries", 1))
         retries = 0
+        mission_id = metadata.get("mission_id")
 
         try:
             source_status = run(
@@ -507,6 +562,15 @@ class RepoCodeWorker(Worker):
 
             is_llm_mission = explicit_edits is None
 
+            lessons = ""
+
+            if is_llm_mission:
+                lessons = collect_learning_lessons(
+                    goal,
+                    evidence,
+                    mission_id=mission_id,
+                )
+
             attempt = 0
             previous_plan = None
             repair_error = None
@@ -519,6 +583,7 @@ class RepoCodeWorker(Worker):
                         llm_plan = generate_edit_plan(
                             goal,
                             worktree,
+                            lessons=lessons,
                         )
 
                         evidence.append(
@@ -571,6 +636,7 @@ class RepoCodeWorker(Worker):
                                 diff_text=failure_diff_text,
                                 touched_files=failure_touched_files,
                             ),
+                            lessons=lessons,
                         )
 
                     except Exception as exc:
