@@ -8,6 +8,14 @@ from pathlib import Path
 from app.core.models import Mission, MissionStatus
 from app.storage.db import DB_PATH, connect
 
+# Stage 10.6: shared relay policy. The SQLite store applies the
+# same backoff schedule on failed delivery attempts, so the
+# backoff behavior is identical for every backend and the relay
+# implementation stays transport-agnostic.
+OUTBOX_MAX_ATTEMPTS = 5
+OUTBOX_BACKOFF_BASE_SECONDS = 1.0
+OUTBOX_BACKOFF_MAX_SECONDS = 60.0
+
 
 def now_ts() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -146,7 +154,78 @@ def _migration_2_multi_tenant(db):
     )
 
 
-MIGRATIONS = [_migration_1_runtime_columns, _migration_2_multi_tenant]
+def _migration_3_stage10_governance(db):
+    """
+    Stage 10: generalized outbox governance and the audit hash
+    chain.
+
+    Outbox: idempotency keys (unique), scheduled retry time,
+    and dead-letter state. Existing rows get NULL keys and are
+    immediately due, so Stage 9 pending messages relay unchanged.
+
+    Audit: per-event hash-chain columns. Existing Stage 9 rows
+    are backfilled into the chain in append (seq) order, so a
+    database that never had a chain verifies as intact from its
+    inception instead of failing verification.
+    """
+    _add_column(db, "mission_outbox", "idempotency_key", "TEXT")
+    _add_column(db, "mission_outbox", "next_attempt_at", "TEXT")
+    _add_column(db, "mission_outbox", "dead_lettered_at", "TEXT")
+
+    # Unique idempotency key; a plain unique index on a column
+    # that may hold many historical NULLs is fine in SQLite
+    # (NULLs are distinct in unique indexes).
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_idem "
+        "ON mission_outbox(idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_due "
+        "ON mission_outbox(dead_lettered_at, next_attempt_at, id)"
+    )
+
+    # The audit table may not exist yet (mission-store migrations
+    # run before the audit store is first constructed); create it
+    # with the full Stage 10 shape, then backfill the chain.
+    from app.tenants.audit import _ensure_table as _ensure_audit_table
+
+    _ensure_audit_table(db)
+
+    # Backfill the chain for pre-Stage-10 rows in append order.
+    from app.tenants.audit import canonical_event_payload, event_chain_hash
+
+    rows = db.execute(
+        "SELECT seq, ts, actor, client_id, action, mission_id, data "
+        "FROM audit_events WHERE event_hash IS NULL ORDER BY seq ASC"
+    ).fetchall()
+
+    prev = None
+    for seq, ts, actor, client_id, action, mission_id, data in rows:
+        digest = event_chain_hash(
+            prev,
+            canonical_event_payload(
+                seq=seq,
+                ts=ts,
+                actor=actor,
+                client_id=client_id,
+                action=action,
+                mission_id=mission_id,
+                data=data,
+            ),
+        )
+        db.execute(
+            "UPDATE audit_events SET prev_hash=?, event_hash=? WHERE seq=?",
+            (prev, digest, seq),
+        )
+        prev = digest
+
+
+MIGRATIONS = [
+    _migration_1_runtime_columns,
+    _migration_2_multi_tenant,
+    _migration_3_stage10_governance,
+]
 
 
 def _migrate(db: sqlite3.Connection) -> None:
@@ -722,38 +801,97 @@ class MissionStore:
         mission_id: str,
         kind: str,
         payload: dict,
+        idempotency_key: str | None = None,
     ) -> int:
-        """Append a message to the durable outbox."""
-        with connect(self.path) as db:
-            cursor = db.execute(
-                """
-                INSERT INTO mission_outbox(
-                    mission_id, kind, payload, created_at
-                )
-                VALUES(?, ?, ?, ?)
-                """,
-                (
-                    mission_id,
-                    kind,
-                    json.dumps(payload),
-                    now_ts(),
-                ),
-            )
-            return cursor.lastrowid
+        """
+        Append a message to the durable outbox.
 
-    def outbox_pending(self, limit: int = 100) -> list[dict]:
-        """Undelivered messages, FIFO, with attempt counts."""
+        Stage 10.6: an optional idempotency key makes enqueue
+        itself replay-safe — producers that crash after commit
+        and re-run their transaction insert nothing the second
+        time and receive the original message id.
+        """
+        with connect(self.path) as db:
+            if idempotency_key:
+                existing = db.execute(
+                    """
+                    SELECT id FROM mission_outbox
+                    WHERE idempotency_key=?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+
+                if existing:
+                    return existing[0]
+
+            try:
+                cursor = db.execute(
+                    """
+                    INSERT INTO mission_outbox(
+                        mission_id, kind, payload, created_at,
+                        idempotency_key, next_attempt_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        mission_id,
+                        kind,
+                        json.dumps(payload),
+                        now_ts(),
+                        idempotency_key,
+                        now_ts(),
+                    ),
+                )
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                # Lost a concurrent idempotent-insert race.
+                existing = db.execute(
+                    "SELECT id FROM mission_outbox WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    return existing[0]
+                raise
+
+    def outbox_pending(
+        self, limit: int = 100, kinds: list[str] | None = None
+    ) -> list[dict]:
+        """
+        Due undelivered messages, FIFO, with attempt counts.
+
+        Stage 10.6: retry-scheduled messages (backoff after a
+        failure) are not due until their next_attempt_at, and
+        dead-lettered messages are never pending again until an
+        operator requeues them. `kinds` restricts the pass to a
+        subset of message kinds (a handler-family drain).
+        """
+        clauses = [
+            "delivered_at IS NULL",
+            "dead_lettered_at IS NULL",
+            "(next_attempt_at IS NULL OR next_attempt_at <= ?)",
+        ]
+        params: list = [now_ts()]
+
+        if kinds:
+            clauses.append(
+                "kind IN (%s)" % ",".join("?" for _ in kinds)
+            )
+            params.extend(kinds)
+
+        params.append(max(1, int(limit)))
+
         with connect(self.path) as db:
             rows = db.execute(
                 """
                 SELECT id, mission_id, kind, payload, created_at,
                        attempts
                 FROM mission_outbox
-                WHERE delivered_at IS NULL
+                WHERE %s
                 ORDER BY id ASC
                 LIMIT ?
-                """,
-                (max(1, int(limit)),),
+                """
+                % " AND ".join(clauses),
+                params,
             ).fetchall()
 
         return [
@@ -773,23 +911,134 @@ class MissionStore:
             db.execute(
                 """
                 UPDATE mission_outbox
-                SET delivered_at=?, attempts=attempts+1
+                SET delivered_at=?, attempts=attempts+1,
+                    next_attempt_at=NULL
                 WHERE id=?
                 """,
                 (now_ts(), outbox_id),
             )
 
     def outbox_mark_failed(self, outbox_id: int, error: str) -> None:
-        """Record a failed delivery attempt; stays pending for retry."""
+        """
+        Record a failed delivery attempt.
+
+        Stage 10.6: schedules the retry with exponential backoff
+        (shared constants above) and dead-letters the message
+        after OUTBOX_MAX_ATTEMPTS so a poison message cannot
+        retry forever.
+        """
+        now = now_ts()
+
+        with connect(self.path) as db:
+            row = db.execute(
+                "SELECT attempts FROM mission_outbox WHERE id=?",
+                (outbox_id,),
+            ).fetchone()
+
+            if not row:
+                return
+
+            attempts = row[0] + 1
+
+            if attempts >= OUTBOX_MAX_ATTEMPTS:
+                db.execute(
+                    """
+                    UPDATE mission_outbox
+                    SET attempts=?, last_error=?, dead_lettered_at=?
+                    WHERE id=?
+                    """,
+                    (attempts, error[:500], now, outbox_id),
+                )
+                return
+
+            backoff = min(
+                OUTBOX_BACKOFF_MAX_SECONDS,
+                OUTBOX_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
+            )
+            next_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=backoff)
+            ).isoformat()
+
+            db.execute(
+                """
+                UPDATE mission_outbox
+                SET attempts=?, last_error=?, next_attempt_at=?
+                WHERE id=?
+                """,
+                (attempts, error[:500], next_at, outbox_id),
+            )
+
+    def outbox_dead_letter(self, outbox_id: int) -> None:
+        """Operator action: dead-letter a message immediately."""
         with connect(self.path) as db:
             db.execute(
                 """
                 UPDATE mission_outbox
-                SET attempts=attempts+1, last_error=?
-                WHERE id=?
+                SET dead_lettered_at=?
+                WHERE id=? AND delivered_at IS NULL
                 """,
-                (error[:500], outbox_id),
+                (now_ts(), outbox_id),
             )
+
+    def outbox_requeue_dead(self, outbox_id: int | None = None) -> int:
+        """
+        Operator action: return dead-lettered message(s) to the
+        pending queue. Returns how many messages were requeued.
+        """
+        with connect(self.path) as db:
+            if outbox_id is None:
+                cursor = db.execute(
+                    """
+                    UPDATE mission_outbox
+                    SET dead_lettered_at=NULL, next_attempt_at=?,
+                        attempts=0
+                    WHERE dead_lettered_at IS NOT NULL
+                    """,
+                    (now_ts(),),
+                )
+            else:
+                cursor = db.execute(
+                    """
+                    UPDATE mission_outbox
+                    SET dead_lettered_at=NULL, next_attempt_at=?,
+                        attempts=0
+                    WHERE id=? AND dead_lettered_at IS NOT NULL
+                    """,
+                    (now_ts(), outbox_id),
+                )
+
+            return cursor.rowcount
+
+    def outbox_message(self, outbox_id: int) -> dict | None:
+        """One outbox row, for inspection tooling."""
+        with connect(self.path) as db:
+            row = db.execute(
+                """
+                SELECT id, mission_id, kind, payload, created_at,
+                       attempts, delivered_at, last_error,
+                       idempotency_key, next_attempt_at,
+                       dead_lettered_at
+                FROM mission_outbox WHERE id=?
+                """,
+                (outbox_id,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "id": row[0],
+            "mission_id": row[1],
+            "kind": row[2],
+            "payload": json.loads(row[3]),
+            "created_at": row[4],
+            "attempts": row[5],
+            "delivered_at": row[6],
+            "last_error": row[7],
+            "idempotency_key": row[8],
+            "next_attempt_at": row[9],
+            "dead_lettered_at": row[10],
+        }
 
     def outbox_stats(self) -> dict:
         with connect(self.path) as db:
@@ -798,7 +1047,8 @@ class MissionStore:
                 SELECT
                     COUNT(*),
                     SUM(CASE WHEN delivered_at IS NULL THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END)
                 FROM mission_outbox
                 """
             ).fetchone()
@@ -807,4 +1057,5 @@ class MissionStore:
             "total": row[0],
             "pending": row[1] or 0,
             "delivered": row[2] or 0,
+            "dead_lettered": row[3] or 0,
         }

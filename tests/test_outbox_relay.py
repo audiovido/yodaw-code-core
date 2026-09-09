@@ -135,23 +135,34 @@ def test_failure_is_recorded_and_retried(tmp_path, caplog):
         assert relay._failures == 1
 
     # The failure is recorded on the message with its error.
-    pending = store.outbox_pending()
-    assert len(pending) == 1
-    assert pending[0]["attempts"] == 1
+    # Stage 10.6: the message stays undelivered (still counted as
+    # pending in stats) but is retry-scheduled with backoff, so it
+    # is not yet due for another drain pass.
+    assert store.outbox_stats()["pending"] == 1
+    assert store.outbox_pending() == []
 
     import sqlite3
 
     db = sqlite3.connect(str(tmp_path / "db.sqlite"))
-    error = db.execute(
-        "SELECT last_error FROM mission_outbox WHERE id=?",
-        (pending[0]["id"],),
-    ).fetchone()[0]
+    row = db.execute(
+        "SELECT attempts, last_error, next_attempt_at FROM mission_outbox"
+    ).fetchone()
     db.close()
 
-    assert "learning store outage" in error
+    assert row[0] == 1
+    assert "learning store outage" in row[1]
+    assert row[2] is not None, "backoff must schedule a retry time"
     assert "outbox delivery failed" in caplog.text
 
-    # Recovery: with the handler fixed, the next pass delivers.
+    # Recovery: once the backoff window passes, the next pass
+    # delivers. Force the schedule due to keep the test hermetic.
+    db = sqlite3.connect(str(tmp_path / "db.sqlite"))
+    db.execute(
+        "UPDATE mission_outbox SET next_attempt_at='2000-01-01T00:00:00+00:00'"
+    )
+    db.commit()
+    db.close()
+
     relay2 = OutboxRelay(store=store)
     assert relay2.drain_once() == 1
     assert store.outbox_stats()["pending"] == 0
