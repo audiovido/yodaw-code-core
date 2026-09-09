@@ -19,11 +19,14 @@ def poll_mission(
     mission_id: str,
     timeout: float = 30.0,
     interval: float = 0.1,
+    headers: dict | None = None,
 ):
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
-        response = client.get(f"/api/v1/missions/{mission_id}")
+        response = client.get(
+            f"/api/v1/missions/{mission_id}", headers=headers
+        )
         assert response.status_code == 200
 
         mission = response.json()
