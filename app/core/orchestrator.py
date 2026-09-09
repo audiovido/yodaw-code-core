@@ -42,10 +42,22 @@ def run_mission(mission: Mission) -> Mission:
     mission.worker = worker.name
 
     try:
-        result = worker.execute(mission.goal)
+        if mission.capability == "repo-code":
+            result = worker.execute(
+                mission.goal,
+                mission.metadata,
+            )
+        else:
+            result = worker.execute(mission.goal)
 
         mission.evidence.extend(result.get("evidence", []))
-        mission.result = result.get("output", {})
+
+        mission.result = {
+            **result.get("output", {}),
+        }
+
+        if result.get("error"):
+            mission.result["error"] = result["error"]
 
         mission.status = (
             MissionStatus.passed
