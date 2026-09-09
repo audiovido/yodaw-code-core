@@ -792,6 +792,88 @@ class MissionStore:
         return row[0]
 
     # -----------------------------------------------------
+    # Stage 10.4: persistence-backed token-bucket rate limiting
+    # -----------------------------------------------------
+
+    def _ensure_rate_limits_table(self, db) -> None:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+                bucket_key TEXT PRIMARY KEY,
+                tokens REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+
+    def rate_limit_take(
+        self,
+        bucket_key: str,
+        *,
+        now: float,
+        capacity: int,
+        refill_per_second: float,
+        tokens: float = 1.0,
+    ) -> tuple[bool, float]:
+        """
+        Atomic token-bucket debit for one client bucket.
+
+        Runs inside one immediate transaction, so multiple API
+        processes sharing the database enforce ONE shared bucket
+        (multi-process safe by construction). Returns
+        (allowed, retry_after_seconds).
+        """
+        with connect(self.path) as db:
+            self._ensure_rate_limits_table(db)
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                "SELECT tokens, updated_at FROM rate_limit_buckets "
+                "WHERE bucket_key=?",
+                (bucket_key,),
+            ).fetchone()
+
+            if row:
+                current, updated_at = row
+                elapsed = max(0.0, now - updated_at)
+                level = min(
+                    float(capacity), current + elapsed * refill_per_second
+                )
+            else:
+                # New buckets start full: a first request is always
+                # admitted and the burst allowance is available.
+                level = float(capacity)
+
+            if level + 1e-9 >= tokens:
+                level -= tokens
+                allowed = True
+                retry_after = 0.0
+            else:
+                allowed = False
+                deficit = tokens - level
+                retry_after = (
+                    deficit / refill_per_second
+                    if refill_per_second > 0
+                    else 60.0
+                )
+
+            db.execute(
+                """
+                INSERT INTO rate_limit_buckets(
+                    bucket_key, tokens, updated_at
+                )
+                VALUES(?, ?, ?)
+                ON CONFLICT(bucket_key) DO UPDATE SET
+                    tokens=excluded.tokens,
+                    updated_at=excluded.updated_at
+                """,
+                (bucket_key, level, now),
+            )
+            db.commit()
+
+        return allowed, retry_after
+
+    # -----------------------------------------------------
     # Stage 9.5: exactly-once outbox (learning relay)
     # -----------------------------------------------------
 

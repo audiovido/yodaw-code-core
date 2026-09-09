@@ -194,6 +194,24 @@ class ClientStore:
             )
             return cursor.rowcount > 0
 
+    def set_quota(
+        self, name: str, max_concurrent_missions: int | None
+    ) -> bool:
+        """Stage 10.3: admin quota management for one client."""
+        if max_concurrent_missions is not None:
+            max_concurrent_missions = max(1, int(max_concurrent_missions))
+
+        with sqlite3.connect(self.path) as db:
+            cursor = db.execute(
+                """
+                UPDATE api_clients
+                SET max_concurrent_missions=?
+                WHERE name=?
+                """,
+                (max_concurrent_missions, name),
+            )
+            return cursor.rowcount > 0
+
     def list_clients(self) -> list[dict]:
         """Admin listing: never includes key hashes."""
         with sqlite3.connect(self.path) as db:

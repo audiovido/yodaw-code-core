@@ -148,6 +148,11 @@ def resolve_principal(
     )
 
 
+# Compatibility alias: Stage 9 tests import TenantHeader to
+# resolve principals against an explicit Authorization header.
+TenantHeader = Header
+
+
 def require(
     permission: str | None = None,
     *,

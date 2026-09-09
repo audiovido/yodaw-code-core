@@ -65,6 +65,13 @@ class RateLimiter:
     `client_key` may be a client id, admin id, or the literal
     "shared-key" / "local-dev" principal. The backend row is
     updated atomically, so multiple processes share one bucket.
+
+    Stage 10.7: enforcement is profile-aware. The local profile
+    ships with rate limiting disabled (rate_limits: off) so a
+    developer laptop never fights its own tooling; every other
+    profile enforces by default. YODAW_RATE_LIMIT_RPM overrides
+    explicitly (0 disables, any positive value enables with that
+    steady rate).
     """
 
     def __init__(
@@ -72,12 +79,14 @@ class RateLimiter:
         backend,
         clock=None,
         config: RateLimitConfig | None = None,
+        enabled: bool = True,
     ):
         self.backend = backend
         self.clock = clock or (
             lambda: __import__("time").time()
         )
         self.config = config or RateLimitConfig()
+        self.enabled = enabled
         self._lock = threading.Lock()
 
     def check(
@@ -92,8 +101,11 @@ class RateLimiter:
         Try to take tokens from the client's bucket.
 
         Returns (allowed, retry_after_seconds). retry_after is 0.0
-        when allowed.
+        when allowed. Disabled limiters admit everything.
         """
+        if not self.enabled:
+            return True, 0.0
+
         cfg = self.config
         rpm = cfg.requests_per_minute if rpm is None else rpm
         burst = cfg.burst if burst is None else burst

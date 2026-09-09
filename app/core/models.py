@@ -46,6 +46,24 @@ class ClientPriorityUpdate(BaseModel):
     priority: int
 
 
+class ClientQuotaUpdate(BaseModel):
+    max_concurrent_missions: int | None = None
+
+
+class AdminCreate(BaseModel):
+    name: str
+    role: str = "operator"
+
+
+class AdminRoleUpdate(BaseModel):
+    role: str
+
+
+class AuditPruneRequest(BaseModel):
+    keep_days: int
+    archive_path: str | None = None
+
+
 class Mission(BaseModel):
     id: str = Field(default_factory=lambda: f"m_{uuid4().hex[:12]}")
     goal: str
