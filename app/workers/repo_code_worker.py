@@ -38,7 +38,17 @@ def detect_test_commands(worktree: Path):
         or (worktree / "tests").exists()
         or (worktree / "pyproject.toml").exists()
     ):
-        commands.append(["python", "-m", "pytest", "-q"])
+        commands.append(
+            [
+                "python",
+                "-B",
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+            ]
+        )
 
     if (worktree / "package.json").exists():
         commands.append(["npm", "test", "--", "--runInBand"])
