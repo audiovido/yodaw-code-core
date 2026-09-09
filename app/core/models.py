@@ -36,6 +36,16 @@ class MissionCreate(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ClientCreate(BaseModel):
+    name: str
+    priority: int = 5
+    max_concurrent_missions: int | None = None
+
+
+class ClientPriorityUpdate(BaseModel):
+    priority: int
+
+
 class Mission(BaseModel):
     id: str = Field(default_factory=lambda: f"m_{uuid4().hex[:12]}")
     goal: str
@@ -58,3 +68,9 @@ class Mission(BaseModel):
     heartbeat_at: str | None = None
     finished_at: str | None = None
     cancel_requested: bool = False
+
+    # Stage 9 multi-tenancy. Default priority keeps single-tenant
+    # (Stage 8) ordering identical; client_id is None for calls
+    # made without a client identity (local-dev / shared key).
+    client_id: str | None = None
+    priority: int = 5

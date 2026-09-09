@@ -111,7 +111,42 @@ def _migration_1_runtime_columns(db):
     )
 
 
-MIGRATIONS = [_migration_1_runtime_columns]
+def _migration_2_multi_tenant(db):
+    """
+    Stage 9 multi-tenancy: client attribution and queue priority
+    columns on missions, plus the durable outbox used for
+    exactly-once learning-record relay.
+    """
+    _add_column(db, "missions", "client_id", "TEXT")
+    _add_column(db, "missions", "priority", "INTEGER NOT NULL DEFAULT 5")
+
+    # The queue read path: priority first, then submission order.
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missions_queue_order "
+        "ON missions(status, priority, created_at)"
+    )
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mission_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mission_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at TEXT,
+            last_error TEXT
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_pending "
+        "ON mission_outbox(delivered_at, id)"
+    )
+
+
+MIGRATIONS = [_migration_1_runtime_columns, _migration_2_multi_tenant]
 
 
 def _migrate(db: sqlite3.Connection) -> None:
@@ -180,9 +215,10 @@ class MissionStore:
                 INSERT INTO missions(
                     id, payload, status, goal, repo_key,
                     claimed_by, claimed_at, heartbeat_at,
-                    cancel_requested, created_at, updated_at
+                    cancel_requested, created_at, updated_at,
+                    client_id, priority
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     payload=excluded.payload,
                     status=excluded.status,
@@ -194,7 +230,9 @@ class MissionStore:
                     cancel_requested=CASE
                         WHEN missions.cancel_requested=1 THEN 1
                         ELSE excluded.cancel_requested END,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    client_id=COALESCE(excluded.client_id, missions.client_id),
+                    priority=excluded.priority
                 """,
                 (
                     mission.id,
@@ -208,6 +246,8 @@ class MissionStore:
                     int(mission.cancel_requested),
                     mission.created_at,
                     now,
+                    mission.client_id,
+                    mission.priority,
                 ),
             )
 
@@ -257,7 +297,8 @@ class MissionStore:
 
         Single-flight protection: rejects an identical active
         mission (same repo + same goal) so duplicate submissions
-        cannot run the same work item twice.
+        cannot run the same work item twice. Stage 9: carries the
+        submitting client's identity and queue priority.
         """
         repo_key = self._repo_key(mission)
 
@@ -285,9 +326,10 @@ class MissionStore:
                 INSERT INTO missions(
                     id, payload, status, goal, repo_key,
                     claimed_by, claimed_at, heartbeat_at,
-                    cancel_requested, created_at, updated_at
+                    cancel_requested, created_at, updated_at,
+                    client_id, priority
                 )
-                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?)
+                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
                 """,
                 (
                     mission.id,
@@ -296,6 +338,8 @@ class MissionStore:
                     repo_key,
                     mission.created_at,
                     now,
+                    mission.client_id,
+                    mission.priority,
                 ),
             )
 
@@ -310,17 +354,28 @@ class MissionStore:
         self,
         coordinator_id: str,
         skip_repo_keys: set[str] | None = None,
+        client_limits: dict[str, int] | None = None,
     ) -> Mission | None:
         """
-        Atomically claim the oldest QUEUED mission.
+        Atomically claim the next QUEUED mission.
 
         Runs inside one immediate transaction: concurrent claimers
         serialize on the write lock, so a mission is handed out at
         most once per claim. skip_repo_keys lets a coordinator that
         already holds repo locks avoid claiming more work for the
         same repositories (per-repo admission control).
+
+        Stage 9 fairness and quotas:
+        - candidates are ordered by priority (1 = highest), then
+          submission time (FIFO within a priority class)
+        - a candidate whose client is already at its concurrency
+          limit (counting executing missions only) is skipped in
+          the same transaction, so quota enforcement is race-free
+        - quota-blocked candidates do not block lower-priority
+          work: the scan continues to the next candidate
         """
         skip = {str(k) for k in (skip_repo_keys or set())}
+        limits = client_limits or {}
 
         db = connect(self.path)
         try:
@@ -337,52 +392,79 @@ class MissionStore:
                 query += f" AND repo_key NOT IN ({placeholders})"
                 params.extend(sorted(skip))
 
-            query += " ORDER BY created_at ASC, rowid ASC LIMIT 1"
-
-            row = db.execute(query, params).fetchone()
-
-            if not row:
-                db.rollback()
-                return None
-
-            mission_id, payload = row
-            mission = Mission.model_validate_json(payload)
-
-            now = now_ts()
-            mission.status = MissionStatus.running
-            mission.claimed_by = coordinator_id
-            mission.claimed_at = now
-            mission.heartbeat_at = now
-            mission.started_at = mission.started_at or now
-            mission.attempt = mission.attempt + 1
-
-            db.execute(
-                """
-                UPDATE missions SET
-                    payload=?,
-                    status='RUNNING',
-                    claimed_by=?,
-                    claimed_at=?,
-                    heartbeat_at=?,
-                    updated_at=?
-                WHERE id=? AND status='QUEUED'
-                """,
-                (
-                    mission.model_dump_json(),
-                    coordinator_id,
-                    now,
-                    now,
-                    now,
-                    mission_id,
-                ),
+            query += (
+                " ORDER BY priority ASC, created_at ASC, rowid ASC "
+                "LIMIT 25"
             )
 
-            if db.total_changes == 0:
-                db.rollback()
-                return None
+            rows = db.execute(query, params).fetchall()
 
-            db.commit()
-            return mission
+            for mission_id, payload in rows:
+                mission = Mission.model_validate_json(payload)
+
+                # Per-client concurrency quota, evaluated inside
+                # the claim transaction: the quota bounds
+                # simultaneous executions, so only executing
+                # missions count against it (queued candidates are
+                # waiting, not running).
+                limit = (
+                    limits.get(mission.client_id)
+                    if mission.client_id
+                    else None
+                )
+
+                if limit is not None:
+                    others = db.execute(
+                        """
+                        SELECT COUNT(*) FROM missions
+                        WHERE client_id=? AND status IN
+                            ('RUNNING','VERIFYING','REPAIRING',
+                             'RECOVERING')
+                        """,
+                        (mission.client_id,),
+                    ).fetchone()[0]
+
+                    if others >= limit:
+                        continue
+
+                now = now_ts()
+                mission.status = MissionStatus.running
+                mission.claimed_by = coordinator_id
+                mission.claimed_at = now
+                mission.heartbeat_at = now
+                mission.started_at = mission.started_at or now
+                mission.attempt = mission.attempt + 1
+
+                db.execute(
+                    """
+                    UPDATE missions SET
+                        payload=?,
+                        status='RUNNING',
+                        claimed_by=?,
+                        claimed_at=?,
+                        heartbeat_at=?,
+                        updated_at=?
+                    WHERE id=? AND status='QUEUED'
+                    """,
+                    (
+                        mission.model_dump_json(),
+                        coordinator_id,
+                        now,
+                        now,
+                        now,
+                        mission_id,
+                    ),
+                )
+
+                if db.total_changes == 0:
+                    db.rollback()
+                    return None
+
+                db.commit()
+                return mission
+
+            db.rollback()
+            return None
 
         except Exception:
             db.rollback()
@@ -566,7 +648,7 @@ class MissionStore:
         data: dict | None = None,
     ):
         with connect(self.path) as db:
-            db.execute(
+            cursor = db.execute(
                 """
                 INSERT INTO mission_events(
                     mission_id, event_type, attempt, timestamp, data
@@ -581,6 +663,7 @@ class MissionStore:
                     json.dumps(data or {}),
                 ),
             )
+            return cursor.lastrowid
 
     def events(self, mission_id: str) -> list[dict]:
         with connect(self.path) as db:
@@ -604,3 +687,124 @@ class MissionStore:
             }
             for row in rows
         ]
+
+    # -----------------------------------------------------
+    # Stage 9.4: per-client concurrency quota
+    # -----------------------------------------------------
+
+    def executing_count_for_client(self, client_id: str) -> int:
+        """
+        Missions currently executing for one client.
+
+        The concurrency quota bounds simultaneous execution, not
+        queue depth: queued missions wait their turn and execute
+        serially once the limit is reached.
+        """
+        with connect(self.path) as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) FROM missions
+                WHERE client_id=? AND status IN
+                    ('RUNNING','VERIFYING','REPAIRING','RECOVERING')
+                """,
+                (client_id,),
+            ).fetchone()
+
+        return row[0]
+
+    # -----------------------------------------------------
+    # Stage 9.5: exactly-once outbox (learning relay)
+    # -----------------------------------------------------
+
+    def outbox_enqueue(
+        self,
+        *,
+        mission_id: str,
+        kind: str,
+        payload: dict,
+    ) -> int:
+        """Append a message to the durable outbox."""
+        with connect(self.path) as db:
+            cursor = db.execute(
+                """
+                INSERT INTO mission_outbox(
+                    mission_id, kind, payload, created_at
+                )
+                VALUES(?, ?, ?, ?)
+                """,
+                (
+                    mission_id,
+                    kind,
+                    json.dumps(payload),
+                    now_ts(),
+                ),
+            )
+            return cursor.lastrowid
+
+    def outbox_pending(self, limit: int = 100) -> list[dict]:
+        """Undelivered messages, FIFO, with attempt counts."""
+        with connect(self.path) as db:
+            rows = db.execute(
+                """
+                SELECT id, mission_id, kind, payload, created_at,
+                       attempts
+                FROM mission_outbox
+                WHERE delivered_at IS NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "mission_id": row[1],
+                "kind": row[2],
+                "payload": json.loads(row[3]),
+                "created_at": row[4],
+                "attempts": row[5],
+            }
+            for row in rows
+        ]
+
+    def outbox_mark_delivered(self, outbox_id: int) -> None:
+        with connect(self.path) as db:
+            db.execute(
+                """
+                UPDATE mission_outbox
+                SET delivered_at=?, attempts=attempts+1
+                WHERE id=?
+                """,
+                (now_ts(), outbox_id),
+            )
+
+    def outbox_mark_failed(self, outbox_id: int, error: str) -> None:
+        """Record a failed delivery attempt; stays pending for retry."""
+        with connect(self.path) as db:
+            db.execute(
+                """
+                UPDATE mission_outbox
+                SET attempts=attempts+1, last_error=?
+                WHERE id=?
+                """,
+                (error[:500], outbox_id),
+            )
+
+    def outbox_stats(self) -> dict:
+        with connect(self.path) as db:
+            row = db.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN delivered_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END)
+                FROM mission_outbox
+                """
+            ).fetchone()
+
+        return {
+            "total": row[0],
+            "pending": row[1] or 0,
+            "delivered": row[2] or 0,
+        }
