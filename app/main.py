@@ -3,6 +3,7 @@ from fastapi import FastAPI, HTTPException
 from app.core.models import Mission, MissionCreate
 from app.core.orchestrator import run_mission, store
 from app.workers.registry import registry
+from app.learning.engine import store as learning_store
 
 
 app = FastAPI(
@@ -64,3 +65,8 @@ def get_evidence(mission_id: str):
         "mission_id": mission.id,
         "evidence": mission.evidence,
     }
+
+
+@app.get("/api/v1/learning")
+def list_learning():
+    return learning_store.list()
