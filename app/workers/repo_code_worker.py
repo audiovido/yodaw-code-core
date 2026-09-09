@@ -740,11 +740,43 @@ class RepoCodeWorker(Worker):
                     if explicit_edits is not None:
                         edits = explicit_edits
                     else:
-                        llm_plan = generate_edit_plan(
-                            goal,
-                            worktree,
-                            lessons=lessons,
-                        )
+                        try:
+                            llm_plan = generate_edit_plan(
+                                goal,
+                                worktree,
+                                lessons=lessons,
+                            )
+
+                        except Exception as exc:
+                            cleanup_worktree(
+                                worktree,
+                                repo,
+                                keep_worktree,
+                                evidence,
+                                failed=True,
+                            )
+
+                            return WorkerResult(
+                                success=False,
+                                output={
+                                    "goal": goal,
+                                    "repo": str(repo),
+                                    "worktree": str(worktree),
+                                    "branch": branch_name,
+                                    "base_sha": base_sha["stdout"].strip(),
+                                    "tests_passed": False,
+                                    "retries": retries,
+                                    "attempts": 1,
+                                },
+                                evidence=evidence,
+                                error={
+                                    "type": "LLMError",
+                                    "message": str(exc),
+                                    "attempt": 0,
+                                    "retry": retries,
+                                },
+                                retryable=True,
+                            )
 
                         evidence.append(
                             {
@@ -1216,6 +1248,16 @@ class RepoCodeWorker(Worker):
             )
 
         except Exception as exc:
+            # Unhandled worker failure: still record the worktree
+            # lifecycle so cleanup is never silent.
+            cleanup_worktree(
+                worktree,
+                repo,
+                keep_worktree,
+                evidence,
+                failed=True,
+            )
+
             return WorkerResult(
                 success=False,
                 output={

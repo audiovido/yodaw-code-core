@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 from app.llm.provider import LocalLLMProvider, LLMError
@@ -296,7 +297,16 @@ def generate_edit_plan(
     reuse_report = build_full_reuse_intelligence(
         worktree,
         goal,
-        enable_github=True,
+        enable_github=os.environ.get(
+            "YODAW_ENABLE_GITHUB",
+            "true",
+        ).lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        },
     )
 
     user_prompt = f"""

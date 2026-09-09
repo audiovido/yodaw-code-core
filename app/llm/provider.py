@@ -3,6 +3,27 @@ import os
 import httpx
 
 
+def llm_timeout_seconds() -> int:
+    """Hard cap for one LLM request, configurable for slow hosts."""
+    try:
+        return int(
+            os.environ.get(
+                "YODAW_LLM_TIMEOUT_SECONDS",
+                "1200",
+            )
+        )
+    except ValueError:
+        return 1200
+
+
+def llm_keep_alive() -> str:
+    """Ollama model residency window between calls."""
+    return os.environ.get(
+        "YODAW_LLM_KEEP_ALIVE",
+        "5m",
+    )
+
+
 class LLMError(RuntimeError):
     pass
 
@@ -71,6 +92,7 @@ class LocalLLMProvider:
             "model": self.model,
             "stream": False,
             "format": "json",
+            "keep_alive": llm_keep_alive(),
             "messages": [
                 {
                     "role": "system",
@@ -87,7 +109,7 @@ class LocalLLMProvider:
             response = httpx.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
-                timeout=1200,
+                timeout=llm_timeout_seconds(),
             )
             response.raise_for_status()
             data = response.json()
