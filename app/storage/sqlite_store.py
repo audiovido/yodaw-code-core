@@ -391,22 +391,62 @@ class MissionStore:
             db.close()
 
     def heartbeat(self, mission_id: str, coordinator_id: str) -> bool:
-        """Refresh the executor heartbeat; False if no longer ours."""
+        """
+        Refresh the executor heartbeat; False if no longer ours.
+
+        The timestamp is written to BOTH the runtime column and
+        the JSON payload in one immediate transaction. Every
+        reader of mission state (API polling, watchdog staleness,
+        mission listing) consumes the payload, so a heartbeat that
+        only touched the column would be invisible to them and a
+        live mission could be recovered by mistake.
+        """
         now = now_ts()
 
-        with connect(self.path) as db:
-            cursor = db.execute(
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
                 """
-                UPDATE missions
-                SET heartbeat_at=?, updated_at=?
+                SELECT payload, cancel_requested FROM missions
                 WHERE id=? AND claimed_by=? AND status IN
                     ('RUNNING','VERIFYING','REPAIRING')
                 """,
-                (now, now, mission_id, coordinator_id),
-            )
-            committed = cursor.rowcount > 0
+                (mission_id, coordinator_id),
+            ).fetchone()
 
-        return committed
+            if not row:
+                db.rollback()
+                return False
+
+            payload = json.loads(row[0])
+            payload["heartbeat_at"] = now
+
+            # cancel_requested is monotonic: a cancellation that
+            # raced this heartbeat must survive the payload
+            # rewrite (single immediate transaction, so no other
+            # writer can interleave here).
+            if row[1]:
+                payload["cancel_requested"] = True
+
+            db.execute(
+                """
+                UPDATE missions
+                SET payload=?, heartbeat_at=?, updated_at=?
+                WHERE id=? AND claimed_by=?
+                """,
+                (json.dumps(payload), now, now, mission_id, coordinator_id),
+            )
+
+            db.commit()
+            return True
+
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def request_cancel(self, mission_id: str) -> str:
         """

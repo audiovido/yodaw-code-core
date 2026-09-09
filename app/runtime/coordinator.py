@@ -26,8 +26,11 @@ Design notes:
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -35,6 +38,8 @@ from datetime import datetime, timezone
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
 from app.storage.sqlite_store import MissionStore
 from app.runtime.repo_leases import RepoLeaseManager, now_ts
+
+logger = logging.getLogger("yodaw.coordinator")
 
 
 def max_concurrent_missions() -> int:
@@ -104,7 +109,27 @@ class Coordinator:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._hb_thread: threading.Thread | None = None
         self._shutting_down = False
+
+        # Observability for the heartbeat loop: every failure is
+        # counted and logged; a heartbeat loop must never die
+        # silently.
+        self._hb_beats = 0
+        self._hb_failures = 0
+
+    def stats(self) -> dict:
+        """Runtime observability: heartbeat counters and thread state."""
+        return {
+            "coordinator": self.id,
+            "heartbeat_beats": self._hb_beats,
+            "heartbeat_failures": self._hb_failures,
+            "loop_alive": bool(self._thread and self._thread.is_alive()),
+            "heartbeat_thread_alive": bool(
+                self._hb_thread and self._hb_thread.is_alive()
+            ),
+            "inflight": len(self._inflight),
+        }
 
     # -----------------------------------------------------
     # Lifecycle
@@ -116,10 +141,22 @@ class Coordinator:
 
         self._thread = threading.Thread(
             target=self._run_loop,
-            name=self.id,
+            name=f"{self.id}-loop",
             daemon=True,
         )
         self._thread.start()
+
+        # The heartbeat runs on a dedicated thread, independent of
+        # claim dispatch and of worker execution: a long-running
+        # worker or a slow store operation must never stop the
+        # persisted heartbeat from advancing (Stage 8.5 hard
+        # requirement).
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"{self.id}-heartbeat",
+            daemon=True,
+        )
+        self._hb_thread.start()
 
     def stop(self, drain: bool = True, timeout: float = 30.0):
         """
@@ -132,6 +169,9 @@ class Coordinator:
 
         if self._thread:
             self._thread.join(timeout=5)
+
+        if self._hb_thread:
+            self._hb_thread.join(timeout=5)
 
         if drain:
             self._drain(timeout)
@@ -159,26 +199,19 @@ class Coordinator:
     # -----------------------------------------------------
 
     def _run_loop(self):
-        import time
-
-        last_heartbeat = 0.0
-        last_watchdog = 0.0
-
+        """Claim/dispatch loop. Heartbeats and watchdog live elsewhere."""
         while not self._stop.is_set():
-            now = time.monotonic()
-
-            if now - last_heartbeat >= self.heartbeat_interval / 2:
-                self._heartbeat_inflight()
-                last_heartbeat = now
-
-            if now - last_watchdog >= self.heartbeat_interval:
-                try:
-                    self.recover_stale_missions()
-                except Exception:
-                    pass
-                last_watchdog = now
-
-            claimed = self._claim_and_dispatch()
+            try:
+                claimed = self._claim_and_dispatch()
+            except Exception:
+                # An unhandled exception here would silently kill
+                # the loop thread; surface it and keep the loop
+                # alive.
+                logger.error(
+                    "claim/dispatch pass failed\n%s",
+                    traceback.format_exc(),
+                )
+                claimed = False
 
             if not claimed:
                 self._wake.wait(timeout=0.5)
@@ -186,7 +219,60 @@ class Coordinator:
             else:
                 time.sleep(0.05)
 
-    def _heartbeat_inflight(self):
+    def _heartbeat_loop(self):
+        """
+        Dedicated heartbeat loop.
+
+        Persists mission heartbeats and repo-lease heartbeats on
+        its own schedule, independent of worker execution and claim
+        dispatch. Every failure is counted, logged with a full
+        traceback, and never allowed to end the loop. The watchdog
+        shares this cadence: a single owner prevents concurrent
+        double-recovery of the same stale mission.
+        """
+        last_watchdog = 0.0
+
+        while not self._stop.is_set():
+            failures = 0
+
+            try:
+                failures += self._heartbeat_inflight()
+            except Exception:
+                failures += 1
+                logger.error(
+                    "heartbeat pass failed\n%s",
+                    traceback.format_exc(),
+                )
+
+            if failures:
+                self._hb_failures += failures
+
+            self._hb_beats += 1
+
+            now = time.monotonic()
+            if now - last_watchdog >= max(self.heartbeat_interval, 5):
+                last_watchdog = now
+                try:
+                    self.recover_stale_missions()
+                except Exception:
+                    logger.error(
+                        "watchdog pass failed\n%s",
+                        traceback.format_exc(),
+                    )
+
+            self._stop.wait(self.heartbeat_interval / 2)
+
+    def _heartbeat_inflight(self) -> int:
+        """
+        Persist heartbeats for inflight missions and held leases.
+
+        Returns the number of failures. One mission's failure must
+        never prevent the others from being heartbeated, so each
+        item is isolated and its failure is logged with a full
+        traceback instead of being swallowed silently.
+        """
+        failures = 0
+
         with self._inflight_lock:
             items = list(self._inflight)
 
@@ -194,13 +280,25 @@ class Coordinator:
             try:
                 self.store.heartbeat(mission_id, self.id)
             except Exception:
-                pass
+                failures += 1
+                logger.error(
+                    "heartbeat persist failed for mission %s\n%s",
+                    mission_id,
+                    traceback.format_exc(),
+                )
 
         for repo_key in self.leases.held_by(self.id):
             try:
                 self.leases.heartbeat(repo_key, self.id)
             except Exception:
-                pass
+                failures += 1
+                logger.error(
+                    "lease heartbeat failed for %s\n%s",
+                    repo_key,
+                    traceback.format_exc(),
+                )
+
+        return failures
 
     def _claim_and_dispatch(self) -> bool:
         with self._inflight_lock:

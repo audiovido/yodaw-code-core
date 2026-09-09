@@ -696,7 +696,7 @@ class RepoCodeWorker(Worker):
             metadata.get("_event_store"),
         )
         ctx.emit(
-            "mission.started",
+            "worker.started",
             attempt=0,
             goal=goal,
             repo=str(repo) if repo else None,
