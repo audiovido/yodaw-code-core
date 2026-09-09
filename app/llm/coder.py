@@ -31,11 +31,19 @@ Required JSON format:
 
 {
   "action": "edit",
-  "target_file": "relative/path.py",
-  "find": "exact existing text",
-  "replace": "replacement text",
+  "edits": [
+    {
+      "target_file": "relative/path.py",
+      "find": "exact existing text",
+      "replace": "replacement text"
+    }
+  ],
   "reason": "short explanation"
 }
+
+Use multiple edits when the goal genuinely requires multiple files.
+
+Legacy single-edit format is also accepted internally for compatibility.
 
 or:
 
@@ -138,7 +146,11 @@ def parse_plan(raw: str) -> dict:
             f"Unsupported coder action: {action}"
         )
 
-    if action == "edit":
+    if action == "blocked":
+        return plan
+
+    # Backward compatibility with Stage 6 single-edit plans.
+    if "edits" not in plan:
         required = {
             "target_file",
             "find",
@@ -154,6 +166,42 @@ def parse_plan(raw: str) -> dict:
         if missing:
             raise LLMError(
                 f"Coder plan missing: {missing}"
+            )
+
+        plan["edits"] = [
+            {
+                "target_file": plan["target_file"],
+                "find": plan["find"],
+                "replace": plan["replace"],
+            }
+        ]
+
+    edits = plan.get("edits")
+
+    if not isinstance(edits, list) or not edits:
+        raise LLMError(
+            "Coder edit plan must contain a non-empty edits list"
+        )
+
+    for index, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            raise LLMError(
+                f"Edit {index} is not an object"
+            )
+
+        missing = [
+            key
+            for key in (
+                "target_file",
+                "find",
+                "replace",
+            )
+            if key not in edit
+        ]
+
+        if missing:
+            raise LLMError(
+                f"Edit {index} missing: {missing}"
             )
 
     return plan

@@ -71,3 +71,47 @@ def test_generate_plan_with_fake_provider():
         assert plan["action"] == "edit"
         assert plan["target_file"] == "app.py"
         assert plan["replace"] == "return 2"
+
+
+def test_parse_multi_edit_plan():
+    result = parse_plan(
+        '''
+        {
+          "action": "edit",
+          "edits": [
+            {
+              "target_file": "service.py",
+              "find": "return 1",
+              "replace": "return helper()"
+            },
+            {
+              "target_file": "helpers.py",
+              "find": "pass",
+              "replace": "return 1"
+            }
+          ],
+          "reason": "split implementation"
+        }
+        '''
+    )
+
+    assert result["action"] == "edit"
+    assert len(result["edits"]) == 2
+    assert result["edits"][0]["target_file"] == "service.py"
+
+
+def test_legacy_single_edit_is_normalized():
+    result = parse_plan(
+        '''
+        {
+          "action": "edit",
+          "target_file": "app.py",
+          "find": "return 1",
+          "replace": "return 2",
+          "reason": "legacy"
+        }
+        '''
+    )
+
+    assert len(result["edits"]) == 1
+    assert result["edits"][0]["target_file"] == "app.py"
