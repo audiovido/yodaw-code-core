@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from app.workers.base import Worker, WorkerResult
+from app.llm.coder import generate_edit_plan
 
 
 def now_iso():
@@ -185,25 +186,55 @@ class RepoCodeWorker(Worker):
             find_text = metadata.get("find")
             replace_text = metadata.get("replace")
 
-            if not target_file or find_text is None or replace_text is None:
-                return WorkerResult(
-                    success=False,
-                    output={
-                        "goal": goal,
-                        "repo": str(repo),
-                        "worktree": str(worktree),
-                        "branch": branch_name,
-                    },
-                    evidence=evidence,
-                    error={
-                        "type": "EditContractError",
-                        "message": (
-                            "Stage 4 requires metadata.target_file, "
-                            "metadata.find and metadata.replace"
-                        ),
-                    },
-                    retryable=False,
+            # ---------------------------------------------
+            # Stage 5:
+            # If explicit deterministic edit is absent,
+            # ask the local Coder Brain to plan the edit.
+            # ---------------------------------------------
+            llm_plan = None
+
+            if (
+                not target_file
+                or find_text is None
+                or replace_text is None
+            ):
+                llm_plan = generate_edit_plan(
+                    goal,
+                    worktree,
                 )
+
+                evidence.append(
+                    {
+                        "type": "llm_plan",
+                        "plan": llm_plan,
+                        "timestamp": now_iso(),
+                    }
+                )
+
+                if llm_plan.get("action") == "blocked":
+                    return WorkerResult(
+                        success=False,
+                        output={
+                            "goal": goal,
+                            "repo": str(repo),
+                            "worktree": str(worktree),
+                            "branch": branch_name,
+                            "llm_plan": llm_plan,
+                        },
+                        evidence=evidence,
+                        error={
+                            "type": "LLMBlocked",
+                            "message": llm_plan.get(
+                                "reason",
+                                "Coder Brain blocked task",
+                            ),
+                        },
+                        retryable=False,
+                    )
+
+                target_file = llm_plan["target_file"]
+                find_text = llm_plan["find"]
+                replace_text = llm_plan["replace"]
 
             target = (worktree / target_file).resolve()
 
