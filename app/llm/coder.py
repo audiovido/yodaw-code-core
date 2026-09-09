@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from app.llm.provider import LocalLLMProvider, LLMError
+from app.reuse.analyzer import build_reuse_report
 
 
 SYSTEM_PROMPT = """
@@ -17,11 +18,14 @@ Rules:
 3. Do not output shell commands.
 4. Do not change git configuration.
 5. Do not touch files outside the repository.
-6. Prefer existing dependencies and existing project patterns.
-7. Make the smallest change likely to pass tests.
-8. Return JSON only.
-9. Never wrap JSON in markdown.
-10. If information is insufficient, return action="blocked".
+6. Reuse existing project modules before creating duplicates.
+7. Reuse existing installed dependencies before adding or reinventing functionality.
+8. Prefer mature reusable components for common infrastructure.
+9. Do not recommend writing infrastructure from scratch if the repository already contains an equivalent.
+10. Make the smallest change likely to pass tests.
+11. Return JSON only.
+12. Never wrap JSON in markdown.
+13. If information is insufficient, return action="blocked".
 
 Required JSON format:
 
@@ -164,15 +168,28 @@ def generate_edit_plan(
     provider = provider or LocalLLMProvider()
 
     context = build_repo_context(worktree)
+    reuse_report = build_reuse_report(worktree)
 
     user_prompt = f"""
 CODING GOAL:
 
 {goal}
 
+REUSE ANALYSIS:
+
+{json.dumps(reuse_report, indent=2)}
+
 REPOSITORY CONTENT:
 
 {context}
+
+Before proposing new code, check the reuse analysis.
+
+Priority:
+1. existing project code
+2. existing installed dependency
+3. mature reusable external component
+4. only then custom implementation
 
 Return the safest minimal JSON edit plan.
 """.strip()
