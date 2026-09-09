@@ -87,7 +87,7 @@ class LocalLLMProvider:
             response = httpx.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
-                timeout=600,
+                timeout=1200,
             )
             response.raise_for_status()
             data = response.json()
@@ -128,7 +128,7 @@ class LocalLLMProvider:
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
                 headers=headers,
-                timeout=600,
+                timeout=1200,
             )
             response.raise_for_status()
             data = response.json()
