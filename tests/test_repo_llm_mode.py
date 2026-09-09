@@ -22,29 +22,27 @@ def test_repo_worker_can_use_generated_plan(monkeypatch):
         repo.mkdir()
 
         run(["git", "init"], repo)
-        run(
-            ["git", "config", "user.email", "test@example.com"],
-            repo,
-        )
-        run(
-            ["git", "config", "user.name", "Test"],
-            repo,
-        )
+        run(["git", "config", "user.email", "test@example.com"], repo)
+        run(["git", "config", "user.name", "Test"], repo)
 
         (repo / "calc.py").write_text(
-            "def value():\\n"
-            "    return 1\\n"
+            """def value():
+    return 1
+"""
         )
 
         (repo / "test_calc.py").write_text(
-            "from calc import value\\n\\n"
-            "def test_value():\\n"
-            "    assert value() == 2\\n"
+            """from calc import value
+
+def test_value():
+    assert value() == 2
+"""
         )
 
         (repo / "pytest.ini").write_text(
-            "[pytest]\\n"
-            "pythonpath = .\\n"
+            """[pytest]
+pythonpath = .
+"""
         )
 
         run(["git", "add", "."], repo)
@@ -75,6 +73,7 @@ def test_repo_worker_can_use_generated_plan(monkeypatch):
             },
         )
 
-        assert result["success"] is True
+        assert result["success"] is True, result
         assert result["output"]["tests_passed"] is True
         assert result["output"]["commit_sha"]
+        assert result["output"]["working_tree_clean"] is True
