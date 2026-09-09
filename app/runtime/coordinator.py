@@ -374,6 +374,14 @@ class Coordinator:
                 fresh.evidence = list(result.get("evidence", []))
                 fresh.finished_at = now_ts()
                 store.save(fresh)
+
+                store.record_event(
+                    fresh.id,
+                    "mission.cancelled",
+                    attempt=fresh.attempt,
+                    data={"while": "executing"},
+                )
+
                 return
 
             fresh.evidence = list(result.get("evidence", []))
