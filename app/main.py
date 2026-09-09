@@ -80,7 +80,22 @@ def get_coordinator():
         if _coordinator is None:
             from app.runtime.coordinator import Coordinator
 
-            coordinator = Coordinator(store=store)
+            def client_limits() -> dict:
+                """
+                Stage 9: per-client concurrency limits for claim-time
+                enforcement, resolved fresh on every claim pass so
+                admin changes apply immediately.
+                """
+                return {
+                    c["id"]: c["max_concurrent_missions"]
+                    for c in clients.list_clients()
+                    if c["max_concurrent_missions"] is not None
+                }
+
+            coordinator = Coordinator(
+                store=store,
+                client_limits_provider=client_limits,
+            )
             coordinator.start()
             _coordinator = coordinator
 

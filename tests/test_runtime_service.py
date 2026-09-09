@@ -26,11 +26,14 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def http_get(url: str, timeout: float = 2.0):
-    request = urllib.request.Request(url)
+def http_get(url: str, timeout: float = 2.0, headers: dict | None = None):
+    request = urllib.request.Request(url, headers=headers or {})
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.status, json_loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json_loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json_loads(exc.read())
 
 
 def json_loads(raw: bytes):
@@ -39,18 +42,29 @@ def json_loads(raw: bytes):
     return json.loads(raw)
 
 
-def http_post_json(url: str, payload: dict, timeout: float = 5.0):
+def http_post_json(
+    url: str,
+    payload: dict,
+    timeout: float = 5.0,
+    headers: dict | None = None,
+):
     import json
+
+    all_headers = {"Content-Type": "application/json"}
+    all_headers.update(headers or {})
 
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=all_headers,
         method="POST",
     )
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.status, json_loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json_loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json_loads(exc.read())
 
 
 @pytest.fixture()

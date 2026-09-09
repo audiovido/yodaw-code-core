@@ -126,3 +126,28 @@ Stage 8 (Execution Runtime): GRADUATED.
   f0bd860 on yodaw/task-1788983754, learning record lr_5fc52f08e0d0,
   POST latency under one second.
 
+Stage 9 (Multi-Tenant Runtime): GRADUATED.
+
+- API client identities with hashed keys (shown exactly once,
+  never stored raw), revocation that is indistinguishable from an
+  unknown key, and priority classes 1-9 for queue fairness.
+- Queue claims order by priority then FIFO, and per-client
+  concurrency quotas are enforced race-free inside the claim
+  transaction: a saturated client serializes instead of starving
+  or exceeding its limit, under any number of contending
+  coordinators.
+- Client management is reserved for the shared admin key;
+  client keys can never escalate, read the audit trail, or
+  administer clients.
+- An append-only audit trail records tenant-visible mutations
+  with recursive secret redaction; rows are immutable.
+- Learning delivery is exactly-once via a durable outbox in the
+  mission database: a crash between completion and delivery loses
+  nothing, replays are idempotent by deterministic record id,
+  and failures are recorded and retried, never dropped.
+- Multi-tenancy proven end to end through the real runtime
+  process with a fake planner: client creation, attributed
+  priority mission, PASS with a single commit, audit trail,
+  exactly-once learning, runtime status, clean SIGTERM. Full
+  suite at graduation: 118 passed, 0 failed.
+
