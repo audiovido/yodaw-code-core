@@ -212,24 +212,35 @@ class RepoCodeWorker(Worker):
             evidence.append(inspect_result)
 
             # -------------------------------------------------
-            # Deterministic edit contract for Stage 4
+            # Atomic multi-edit contract
             # -------------------------------------------------
-            target_file = metadata.get("target_file")
-            find_text = metadata.get("find")
-            replace_text = metadata.get("replace")
+            explicit_edits = metadata.get("edits")
+
+            if explicit_edits is None:
+                target_file = metadata.get("target_file")
+                find_text = metadata.get("find")
+                replace_text = metadata.get("replace")
+
+                if (
+                    target_file
+                    and find_text is not None
+                    and replace_text is not None
+                ):
+                    explicit_edits = [
+                        {
+                            "target_file": target_file,
+                            "find": find_text,
+                            "replace": replace_text,
+                        }
+                    ]
 
             # ---------------------------------------------
-            # Stage 5:
-            # If explicit deterministic edit is absent,
-            # ask the local Coder Brain to plan the edit.
+            # If deterministic edits are absent,
+            # ask the Coder Brain for a structured plan.
             # ---------------------------------------------
             llm_plan = None
 
-            if (
-                not target_file
-                or find_text is None
-                or replace_text is None
-            ):
+            if explicit_edits is None:
                 llm_plan = generate_edit_plan(
                     goal,
                     worktree,
@@ -264,92 +275,231 @@ class RepoCodeWorker(Worker):
                         retryable=False,
                     )
 
-                target_file = llm_plan["target_file"]
-                find_text = llm_plan["find"]
-                replace_text = llm_plan["replace"]
+                # The Coder Brain may return either the structured
+                # multi-edit plan or the legacy Stage 6 single-edit
+                # shape; normalize the legacy shape at this boundary.
+                edits = llm_plan.get("edits")
 
-            target = (worktree / target_file).resolve()
+                if edits is None:
+                    legacy_target = llm_plan.get("target_file")
+                    legacy_find = llm_plan.get("find")
+                    legacy_replace = llm_plan.get("replace")
 
-            if worktree.resolve() not in target.parents:
+                    if (
+                        legacy_target
+                        and legacy_find is not None
+                        and legacy_replace is not None
+                    ):
+                        edits = [
+                            {
+                                "target_file": legacy_target,
+                                "find": legacy_find,
+                                "replace": legacy_replace,
+                            }
+                        ]
+
+            else:
+                edits = explicit_edits
+
+            if not isinstance(edits, list) or not edits:
                 return WorkerResult(
                     success=False,
                     output={},
                     evidence=evidence,
                     error={
-                        "type": "PathEscapeError",
-                        "message": "target_file escapes isolated worktree",
+                        "type": "InvalidEditPlan",
+                        "message": "edits must be a non-empty list",
                     },
                     retryable=False,
                 )
 
-            if not target.exists():
-                return WorkerResult(
-                    success=False,
-                    output={
-                        "target_file": str(target),
-                    },
-                    evidence=evidence,
-                    error={
-                        "type": "TargetNotFound",
-                        "message": f"{target_file} does not exist",
-                    },
-                    retryable=False,
-                )
+            # -------------------------------------------------
+            # Validate and stage ALL edits in memory first.
+            #
+            # Nothing is written until every path and every
+            # find/replace operation has been validated.
+            # -------------------------------------------------
+            staged_contents = {}
+            original_contents = {}
+            prepared_edits = []
+            touched_files = []
 
-            original = target.read_text()
-
-            actual_find_text = find_text
-
-            if find_text not in original:
-                actual_find_text = find_relaxed_unique_match(
-                    original,
-                    find_text,
-                )
-
-                if actual_find_text is not None:
-                    evidence.append(
-                        {
-                            "type": "relaxed_match",
-                            "file": target_file,
-                            "requested_find": find_text,
-                            "actual_find": actual_find_text,
-                            "timestamp": now_iso(),
-                        }
+            for index, edit in enumerate(edits):
+                if not isinstance(edit, dict):
+                    return WorkerResult(
+                        success=False,
+                        output={"edit_index": index},
+                        evidence=evidence,
+                        error={
+                            "type": "InvalidEditPlan",
+                            "message": f"Edit {index} is not an object",
+                        },
+                        retryable=False,
                     )
 
-            if actual_find_text is None or actual_find_text not in original:
-                return WorkerResult(
-                    success=False,
-                    output={
-                        "target_file": target_file,
-                    },
-                    evidence=evidence,
-                    error={
-                        "type": "FindTextMissing",
-                        "message": (
-                            "Requested source text was not found "
-                            "as an exact or unique relaxed match"
-                        ),
-                    },
-                    retryable=False,
+                required = ("target_file", "find", "replace")
+                missing = [
+                    key
+                    for key in required
+                    if key not in edit
+                ]
+
+                if missing:
+                    return WorkerResult(
+                        success=False,
+                        output={"edit_index": index},
+                        evidence=evidence,
+                        error={
+                            "type": "InvalidEditPlan",
+                            "message": (
+                                f"Edit {index} missing fields: {missing}"
+                            ),
+                        },
+                        retryable=False,
+                    )
+
+                target_file = edit["target_file"]
+                find_text = edit["find"]
+                replace_text = edit["replace"]
+
+                target = (worktree / target_file).resolve()
+
+                if worktree.resolve() not in target.parents:
+                    return WorkerResult(
+                        success=False,
+                        output={
+                            "edit_index": index,
+                            "target_file": target_file,
+                        },
+                        evidence=evidence,
+                        error={
+                            "type": "PathEscapeError",
+                            "message": (
+                                f"{target_file} escapes isolated worktree"
+                            ),
+                        },
+                        retryable=False,
+                    )
+
+                if not target.exists():
+                    return WorkerResult(
+                        success=False,
+                        output={
+                            "edit_index": index,
+                            "target_file": str(target),
+                        },
+                        evidence=evidence,
+                        error={
+                            "type": "TargetNotFound",
+                            "message": f"{target_file} does not exist",
+                        },
+                        retryable=False,
+                    )
+
+                if not target.is_file():
+                    return WorkerResult(
+                        success=False,
+                        output={
+                            "edit_index": index,
+                            "target_file": str(target),
+                        },
+                        evidence=evidence,
+                        error={
+                            "type": "TargetNotFile",
+                            "message": f"{target_file} is not a file",
+                        },
+                        retryable=False,
+                    )
+
+                if target_file not in original_contents:
+                    original_contents[target_file] = target.read_text()
+
+                current = staged_contents.get(
+                    target_file,
+                    original_contents[target_file],
                 )
 
-            modified = original.replace(
-                actual_find_text,
-                replace_text,
-                1,
-            )
-            target.write_text(modified)
+                actual_find_text = find_text
 
-            evidence.append(
-                {
-                    "type": "edit",
-                    "file": target_file,
-                    "find": find_text,
-                    "replace": replace_text,
-                    "timestamp": now_iso(),
-                }
-            )
+                if find_text not in current:
+                    actual_find_text = find_relaxed_unique_match(
+                        current,
+                        find_text,
+                    )
+
+                    if actual_find_text is not None:
+                        evidence.append(
+                            {
+                                "type": "relaxed_match",
+                                "file": target_file,
+                                "requested_find": find_text,
+                                "actual_find": actual_find_text,
+                                "edit_index": index,
+                                "timestamp": now_iso(),
+                            }
+                        )
+
+                if (
+                    actual_find_text is None
+                    or actual_find_text not in current
+                ):
+                    return WorkerResult(
+                        success=False,
+                        output={
+                            "edit_index": index,
+                            "target_file": target_file,
+                        },
+                        evidence=evidence,
+                        error={
+                            "type": "FindTextMissing",
+                            "message": (
+                                "Requested source text was not found "
+                                "as an exact or unique relaxed match"
+                            ),
+                        },
+                        retryable=False,
+                    )
+
+                modified = current.replace(
+                    actual_find_text,
+                    replace_text,
+                    1,
+                )
+
+                staged_contents[target_file] = modified
+
+                if target_file not in touched_files:
+                    touched_files.append(target_file)
+
+                prepared_edits.append(
+                    {
+                        "edit_index": index,
+                        "target_file": target_file,
+                        "find": find_text,
+                        "actual_find": actual_find_text,
+                        "replace": replace_text,
+                    }
+                )
+
+            # -------------------------------------------------
+            # Atomic apply:
+            # every edit is known-valid before first write.
+            # -------------------------------------------------
+            for target_file in touched_files:
+                target = (worktree / target_file).resolve()
+                target.write_text(staged_contents[target_file])
+
+            for item in prepared_edits:
+                evidence.append(
+                    {
+                        "type": "edit",
+                        "edit_index": item["edit_index"],
+                        "file": item["target_file"],
+                        "find": item["find"],
+                        "replace": item["replace"],
+                        "timestamp": now_iso(),
+                    }
+                )
 
             test_commands = detect_test_commands(worktree)
 
@@ -372,30 +522,37 @@ class RepoCodeWorker(Worker):
                 if tests_passed:
                     break
 
-                if retries >= max_retries:
-                    break
-
-                retries += 1
-
                 # Stage 4 recovery:
-                # revert edit if validation failed.
-                target.write_text(original)
+                # revert ALL edits if validation failed by restoring
+                # every touched file's original text. This must run
+                # regardless of the remaining retry budget so no
+                # half-validated change is ever left behind.
+                for edited_file, original_text in original_contents.items():
+                    edited_path = (worktree / edited_file).resolve()
+                    edited_path.write_text(original_text)
 
                 evidence.append(
                     {
                         "type": "recovery",
-                        "action": "revert_failed_edit",
+                        "action": "revert_failed_edits",
+                        "files": list(original_contents.keys()),
                         "retry": retries,
                         "timestamp": now_iso(),
                     }
                 )
 
-                # No autonomous second edit yet.
-                # Stage 5 LLM planner/fixer will handle it.
+                if retries >= max_retries:
+                    break
+
+                retries += 1
+
+                # No autonomous corrective edits yet.
+                # Stage 7.3 will feed failure evidence back to the
+                # LLM for bounded corrective retries.
                 break
 
             diff_result = run(
-                ["git", "diff", "--", target_file],
+                ["git", "diff", "--", *touched_files],
                 cwd=worktree,
             )
             evidence.append(diff_result)
@@ -445,7 +602,7 @@ class RepoCodeWorker(Worker):
                 )
 
             add_result = run(
-                ["git", "add", "--", target_file],
+                ["git", "add", "--", *touched_files],
                 cwd=worktree,
             )
             evidence.append(add_result)
@@ -498,7 +655,14 @@ class RepoCodeWorker(Worker):
                     "branch": branch_name,
                     "base_sha": base_sha["stdout"].strip(),
                     "commit_sha": sha_result["stdout"].strip(),
-                    "target_file": target_file,
+                    # Legacy field retained for compatibility.
+                    "target_file": (
+                        touched_files[0]
+                        if len(touched_files) == 1
+                        else None
+                    ),
+                    "target_files": touched_files,
+                    "edit_count": len(prepared_edits),
                     "tests_detected": len(test_commands),
                     "tests_passed": True,
                     "retries": retries,
