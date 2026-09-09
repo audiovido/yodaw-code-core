@@ -89,6 +89,8 @@ class Coordinator:
         leases: RepoLeaseManager | None = None,
         registry=None,
         id_prefix: str = "coord",
+        relay=None,
+        client_limits_provider=None,
     ):
         import app.workers.registry as registry_module
 
@@ -118,6 +120,15 @@ class Coordinator:
         self._hb_beats = 0
         self._hb_failures = 0
 
+        # Stage 9: optional per-client concurrency limits, resolved
+        # lazily per claim pass so limit changes apply immediately.
+        self.client_limits_provider = client_limits_provider
+
+        # Stage 9: exactly-once outbox relay for learning records.
+        from app.runtime.outbox_relay import OutboxRelay
+
+        self.relay = relay or OutboxRelay(store=self.store)
+
     def stats(self) -> dict:
         """Runtime observability: heartbeat counters and thread state."""
         return {
@@ -145,6 +156,7 @@ class Coordinator:
             daemon=True,
         )
         self._thread.start()
+        self.relay.start()
 
         # The heartbeat runs on a dedicated thread, independent of
         # claim dispatch and of worker execution: a long-running
@@ -172,6 +184,8 @@ class Coordinator:
 
         if self._hb_thread:
             self._hb_thread.join(timeout=5)
+
+        self.relay.stop(timeout=5)
 
         if drain:
             self._drain(timeout)
@@ -308,9 +322,24 @@ class Coordinator:
         if capacity <= 0 or self._shutting_down:
             return False
 
+        limits = None
+
+        if self.client_limits_provider is not None:
+            try:
+                limits = self.client_limits_provider() or {}
+            except Exception:
+                # Quota resolution must never break claiming; a
+                # failed lookup means "no limits known".
+                logger.error(
+                    "client limits lookup failed\n%s",
+                    traceback.format_exc(),
+                )
+                limits = {}
+
         mission = self.store.claim_next(
             self.id,
             skip_repo_keys=held,
+            client_limits=limits,
         )
 
         if mission is None:
@@ -507,17 +536,44 @@ class Coordinator:
                 },
             )
 
-            # Stage 7 learning behavior preserved.
-            from app.learning.engine import learn_from_result
+            # Stage 9.5: learning is produced through the durable
+            # outbox, so a crash between mission completion and
+            # learning delivery loses nothing. The relay drains it
+            # exactly-once (idempotent upsert by record id); the
+            # eager drain below keeps in-process latency at zero
+            # while the relay thread covers crash recovery.
+            from app.learning.engine import record_id_default
 
-            learn_from_result(
-                mission_id=fresh.id,
-                goal=fresh.goal,
-                worker=fresh.worker,
-                success=result.get("success", False),
-                evidence=fresh.evidence,
-                result=fresh.result,
-            )
+            try:
+                self.store.outbox_enqueue(
+                    mission_id=fresh.id,
+                    kind="learning.record",
+                    payload={
+                        "mission_id": fresh.id,
+                        "goal": fresh.goal,
+                        "worker": fresh.worker,
+                        "success": result.get("success", False),
+                        "evidence": fresh.evidence,
+                        "result": fresh.result,
+                        "record_id": record_id_default(fresh.id),
+                    },
+                )
+            except Exception:
+                logger.error(
+                    "outbox enqueue failed for mission %s\n%s",
+                    fresh.id,
+                    traceback.format_exc(),
+                )
+
+            try:
+                self.relay.drain_once()
+            except Exception:
+                # The relay thread retries pending messages; never
+                # fail the mission over learning delivery.
+                logger.error(
+                    "eager outbox drain failed\n%s",
+                    traceback.format_exc(),
+                )
 
         except Exception as exc:
             # Never lose a mission silently.
