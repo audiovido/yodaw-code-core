@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from app.llm.provider import LocalLLMProvider, LLMError
-from app.reuse.analyzer import build_reuse_report
+from app.reuse.service import build_full_reuse_intelligence
 
 
 SYSTEM_PROMPT = """
@@ -168,7 +168,11 @@ def generate_edit_plan(
     provider = provider or LocalLLMProvider()
 
     context = build_repo_context(worktree)
-    reuse_report = build_reuse_report(worktree)
+    reuse_report = build_full_reuse_intelligence(
+        worktree,
+        goal,
+        enable_github=True,
+    )
 
     user_prompt = f"""
 CODING GOAL:

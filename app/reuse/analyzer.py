@@ -164,3 +164,31 @@ def build_reuse_report(root: Path) -> dict:
             "Do not add a dependency unless existing project code and installed dependencies are insufficient.",
         ],
     }
+
+
+def infer_github_search_terms(goal: str, project_type: dict) -> dict:
+    language = None
+
+    if project_type.get("python"):
+        language = "Python"
+    elif project_type.get("node"):
+        language = "TypeScript"
+    elif project_type.get("rust"):
+        language = "Rust"
+    elif project_type.get("go"):
+        language = "Go"
+    elif project_type.get("java"):
+        language = "Java"
+    elif project_type.get("swift"):
+        language = "Swift"
+
+    cleaned = " ".join(
+        part
+        for part in goal.replace("/", " ").split()
+        if len(part) > 2
+    )
+
+    return {
+        "query": cleaned[:120],
+        "language": language,
+    }
