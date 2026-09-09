@@ -1,44 +1,218 @@
+from __future__ import annotations
+
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.core.models import Mission
+from app.core.models import Mission, MissionStatus
+from app.storage.db import DB_PATH, connect
 
 
-DB_PATH = Path("data/yodaw.db")
+def now_ts() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class DuplicateMission(Exception):
+    """An identical active mission already exists for this repo."""
+
+    def __init__(self, message: str, mission_id: str | None = None):
+        super().__init__(message)
+        self.mission_id = mission_id
+
+
+ACTIVE_STATUSES = (
+    "QUEUED",
+    "RUNNING",
+    "VERIFYING",
+    "REPAIRING",
+    "RECOVERING",
+)
+
+EXECUTING_STATUSES = ("RUNNING", "VERIFYING", "REPAIRING")
+
+
+def _add_column(db, table, column, decl):
+    cols = {
+        row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in cols:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _migration_1_runtime_columns(db):
+    """
+    Durable runtime columns, mission events, and indexes.
+
+    Safe on both fresh databases and existing Stage 7 databases:
+    missing columns are added and backfilled from the payload.
+    """
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS missions (
+            id TEXT PRIMARY KEY,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+
+    _add_column(db, "missions", "status", "TEXT NOT NULL DEFAULT 'QUEUED'")
+    _add_column(db, "missions", "goal", "TEXT NOT NULL DEFAULT ''")
+    _add_column(db, "missions", "repo_key", "TEXT")
+    _add_column(db, "missions", "claimed_by", "TEXT")
+    _add_column(db, "missions", "claimed_at", "TEXT")
+    _add_column(db, "missions", "heartbeat_at", "TEXT")
+    _add_column(
+        db, "missions", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"
+    )
+    _add_column(db, "missions", "created_at", "TEXT")
+    _add_column(db, "missions", "updated_at", "TEXT")
+
+    # Backfill structured columns from stored payloads (no-op rows
+    # for fresh inserts going forward, which always set columns).
+    db.execute(
+        """
+        UPDATE missions SET
+            status = COALESCE(json_extract(payload, '$.status'), status),
+            goal = COALESCE(json_extract(payload, '$.goal'), ''),
+            claimed_by = json_extract(payload, '$.claimed_by'),
+            claimed_at = json_extract(payload, '$.claimed_at'),
+            heartbeat_at = json_extract(payload, '$.heartbeat_at'),
+            cancel_requested = CASE
+                WHEN json_extract(payload, '$.cancel_requested') = 1
+                    THEN 1 ELSE cancel_requested END
+        """
+    )
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missions_status_created "
+        "ON missions(status, created_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missions_repo_status "
+        "ON missions(repo_key, status)"
+    )
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mission_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mission_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            timestamp TEXT NOT NULL,
+            data TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_mission "
+        "ON mission_events(mission_id, id)"
+    )
+
+
+MIGRATIONS = [_migration_1_runtime_columns]
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+
+    for index, fn in enumerate(MIGRATIONS, start=1):
+        if index <= version:
+            continue
+
+        fn(db)
+        db.execute(
+            "INSERT OR REPLACE INTO schema_migrations(version, applied_at) "
+            "VALUES(?, ?)",
+            (index, now_ts()),
+        )
+        db.execute(f"PRAGMA user_version = {index}")
 
 
 class MissionStore:
-    def __init__(self, path: Path = DB_PATH):
-        self.path = path
+    """
+    Durable mission store + queue.
+
+    Stage 8 semantics:
+    - missions persist full runtime state (claim, heartbeat,
+      cancellation, attempt counters, timestamps)
+    - claiming is one immediate transaction, so two concurrent
+      coordinators can never receive the same mission
+    - heartbeats identify live executors; stale executing missions
+      are recoverable after a crash
+    - structured mission events persist alongside evidence
+    """
+
+    def __init__(self, path: Path | str = DB_PATH):
+        self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(self.path) as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS missions (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL
-                )
-                """
-            )
+        with connect(self.path) as db:
+            _migrate(db)
+
+    # -----------------------------------------------------
+    # CRUD
+    # -----------------------------------------------------
 
     def save(self, mission: Mission):
-        payload = mission.model_dump_json()
+        """
+        Persist the full mission payload and mirror runtime columns.
 
-        with sqlite3.connect(self.path) as db:
+        cancel_requested is monotonic: a cancellation requested by
+        the API is never un-set by a coordinator save racing it.
+        """
+        payload = mission.model_dump_json()
+        now = now_ts()
+
+        with connect(self.path) as db:
             db.execute(
                 """
-                INSERT INTO missions(id, payload)
-                VALUES(?, ?)
-                ON CONFLICT(id)
-                DO UPDATE SET payload=excluded.payload
+                INSERT INTO missions(
+                    id, payload, status, goal, repo_key,
+                    claimed_by, claimed_at, heartbeat_at,
+                    cancel_requested, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    payload=excluded.payload,
+                    status=excluded.status,
+                    goal=excluded.goal,
+                    repo_key=COALESCE(excluded.repo_key, missions.repo_key),
+                    claimed_by=excluded.claimed_by,
+                    claimed_at=excluded.claimed_at,
+                    heartbeat_at=excluded.heartbeat_at,
+                    cancel_requested=CASE
+                        WHEN missions.cancel_requested=1 THEN 1
+                        ELSE excluded.cancel_requested END,
+                    updated_at=excluded.updated_at
                 """,
-                (mission.id, payload),
+                (
+                    mission.id,
+                    payload,
+                    mission.status.value,
+                    mission.goal,
+                    self._repo_key(mission),
+                    mission.claimed_by,
+                    mission.claimed_at,
+                    mission.heartbeat_at,
+                    int(mission.cancel_requested),
+                    mission.created_at,
+                    now,
+                ),
             )
 
     def get(self, mission_id: str) -> Mission | None:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             row = db.execute(
                 "SELECT payload FROM missions WHERE id=?",
                 (mission_id,),
@@ -50,9 +224,343 @@ class MissionStore:
         return Mission.model_validate_json(row[0])
 
     def list(self) -> list[Mission]:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 "SELECT payload FROM missions ORDER BY rowid DESC"
             ).fetchall()
 
         return [Mission.model_validate_json(row[0]) for row in rows]
+
+    def status_counts(self) -> dict:
+        """Runtime observability: missions per status."""
+        with connect(self.path) as db:
+            rows = db.execute(
+                "SELECT status, COUNT(*) FROM missions GROUP BY status"
+            ).fetchall()
+
+        return {row[0]: row[1] for row in rows}
+
+    # -----------------------------------------------------
+    # Queue operations
+    # -----------------------------------------------------
+
+    @staticmethod
+    def _repo_key(mission: Mission) -> str:
+        repo_path = mission.metadata.get("repo_path")
+        if repo_path:
+            return str(repo_path)
+        return f"capability:{mission.capability}"
+
+    def enqueue(self, mission: Mission) -> None:
+        """
+        Insert a mission in QUEUED state.
+
+        Single-flight protection: rejects an identical active
+        mission (same repo + same goal) so duplicate submissions
+        cannot run the same work item twice.
+        """
+        repo_key = self._repo_key(mission)
+
+        with connect(self.path) as db:
+            row = db.execute(
+                """
+                SELECT id FROM missions
+                WHERE repo_key=? AND goal=? AND id != ? AND status IN
+                    ('QUEUED','RUNNING','VERIFYING','REPAIRING','RECOVERING')
+                """,
+                (repo_key, mission.goal, mission.id),
+            ).fetchone()
+
+            if row:
+                raise DuplicateMission(
+                    f"mission {row[0]} already active "
+                    "for this repo and goal",
+                    mission_id=row[0],
+                )
+
+            now = now_ts()
+
+            db.execute(
+                """
+                INSERT INTO missions(
+                    id, payload, status, goal, repo_key,
+                    claimed_by, claimed_at, heartbeat_at,
+                    cancel_requested, created_at, updated_at
+                )
+                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?)
+                """,
+                (
+                    mission.id,
+                    mission.model_dump_json(),
+                    mission.goal,
+                    repo_key,
+                    mission.created_at,
+                    now,
+                ),
+            )
+
+        self.record_event(
+            mission.id,
+            "mission.queued",
+            attempt=0,
+            data={"goal": mission.goal, "capability": mission.capability},
+        )
+
+    def claim_next(
+        self,
+        coordinator_id: str,
+        skip_repo_keys: set[str] | None = None,
+    ) -> Mission | None:
+        """
+        Atomically claim the oldest QUEUED mission.
+
+        Runs inside one immediate transaction: concurrent claimers
+        serialize on the write lock, so a mission is handed out at
+        most once per claim. skip_repo_keys lets a coordinator that
+        already holds repo locks avoid claiming more work for the
+        same repositories (per-repo admission control).
+        """
+        skip = {str(k) for k in (skip_repo_keys or set())}
+
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
+            placeholders = ",".join("?" for _ in skip)
+            query = (
+                "SELECT id, payload FROM missions "
+                "WHERE status='QUEUED'"
+            )
+            params: list = []
+
+            if skip:
+                query += f" AND repo_key NOT IN ({placeholders})"
+                params.extend(sorted(skip))
+
+            query += " ORDER BY created_at ASC, rowid ASC LIMIT 1"
+
+            row = db.execute(query, params).fetchone()
+
+            if not row:
+                db.rollback()
+                return None
+
+            mission_id, payload = row
+            mission = Mission.model_validate_json(payload)
+
+            now = now_ts()
+            mission.status = MissionStatus.running
+            mission.claimed_by = coordinator_id
+            mission.claimed_at = now
+            mission.heartbeat_at = now
+            mission.started_at = mission.started_at or now
+            mission.attempt = mission.attempt + 1
+
+            db.execute(
+                """
+                UPDATE missions SET
+                    payload=?,
+                    status='RUNNING',
+                    claimed_by=?,
+                    claimed_at=?,
+                    heartbeat_at=?,
+                    updated_at=?
+                WHERE id=? AND status='QUEUED'
+                """,
+                (
+                    mission.model_dump_json(),
+                    coordinator_id,
+                    now,
+                    now,
+                    now,
+                    mission_id,
+                ),
+            )
+
+            if db.total_changes == 0:
+                db.rollback()
+                return None
+
+            db.commit()
+            return mission
+
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def heartbeat(self, mission_id: str, coordinator_id: str) -> bool:
+        """Refresh the executor heartbeat; False if no longer ours."""
+        now = now_ts()
+
+        with connect(self.path) as db:
+            cursor = db.execute(
+                """
+                UPDATE missions
+                SET heartbeat_at=?, updated_at=?
+                WHERE id=? AND claimed_by=? AND status IN
+                    ('RUNNING','VERIFYING','REPAIRING')
+                """,
+                (now, now, mission_id, coordinator_id),
+            )
+            committed = cursor.rowcount > 0
+
+        return committed
+
+    def request_cancel(self, mission_id: str) -> str:
+        """
+        Request cancellation.
+
+        Returns one of:
+        - "cancelled": mission was QUEUED and is now CANCELLED
+        - "requested": executing mission flagged; worker will stop
+          at the next cancellation checkpoint
+        - "terminal": mission already finished
+        - "unknown": no such mission
+        """
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
+            row = db.execute(
+                "SELECT status FROM missions WHERE id=?",
+                (mission_id,),
+            ).fetchone()
+
+            if not row:
+                db.rollback()
+                return "unknown"
+
+            status = row[0]
+
+            if status not in ACTIVE_STATUSES:
+                db.rollback()
+                return "terminal"
+
+            now = now_ts()
+            db.execute(
+                """
+                UPDATE missions SET
+                    cancel_requested=1,
+                    payload=json_set(
+                        payload, '$.cancel_requested', json('true')
+                    ),
+                    updated_at=?
+                WHERE id=?
+                """,
+                (now, mission_id),
+            )
+
+            if status == "QUEUED":
+                db.execute(
+                    """
+                    UPDATE missions SET
+                        status='CANCELLED',
+                        payload=json_set(
+                            payload,
+                            '$.status', 'CANCELLED',
+                            '$.finished_at', ?
+                        ),
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (now, now, mission_id),
+                )
+                db.commit()
+                self.record_event(
+                    mission_id,
+                    "mission.cancelled",
+                    attempt=0,
+                    data={"while": "QUEUED"},
+                )
+                return "cancelled"
+
+            db.commit()
+            self.record_event(
+                mission_id,
+                "mission.cancel_requested",
+                attempt=0,
+                data={"while": status},
+            )
+            return "requested"
+
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def stale_executing(self, stale_after_seconds: int) -> list[Mission]:
+        """
+        Missions stuck in an executing state whose heartbeat is
+        older than the cutoff (or missing entirely). Used by the
+        watchdog to recover missions after a crash.
+        """
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=stale_after_seconds)
+        ).isoformat()
+
+        with connect(self.path) as db:
+            rows = db.execute(
+                """
+                SELECT payload FROM missions
+                WHERE status IN ('RUNNING','VERIFYING','REPAIRING')
+                  AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+                """,
+                (cutoff,),
+            ).fetchall()
+
+        return [Mission.model_validate_json(row[0]) for row in rows]
+
+    # -----------------------------------------------------
+    # Structured mission events
+    # -----------------------------------------------------
+
+    def record_event(
+        self,
+        mission_id: str,
+        event_type: str,
+        attempt: int = 0,
+        data: dict | None = None,
+    ):
+        with connect(self.path) as db:
+            db.execute(
+                """
+                INSERT INTO mission_events(
+                    mission_id, event_type, attempt, timestamp, data
+                )
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    mission_id,
+                    event_type,
+                    attempt,
+                    now_ts(),
+                    json.dumps(data or {}),
+                ),
+            )
+
+    def events(self, mission_id: str) -> list[dict]:
+        with connect(self.path) as db:
+            rows = db.execute(
+                """
+                SELECT mission_id, event_type, attempt, timestamp, data
+                FROM mission_events
+                WHERE mission_id=?
+                ORDER BY id ASC
+                """,
+                (mission_id,),
+            ).fetchall()
+
+        return [
+            {
+                "mission_id": row[0],
+                "event_type": row[1],
+                "attempt": row[2],
+                "timestamp": row[3],
+                "data": json.loads(row[4]),
+            }
+            for row in rows
+        ]

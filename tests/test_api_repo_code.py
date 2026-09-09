@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.helpers import poll_mission
 
 
 client = TestClient(app)
@@ -71,7 +72,11 @@ def test_repo_code_through_single_api():
 
         assert response.status_code == 200
 
-        payload = response.json()
+        queued = response.json()
+
+        assert queued["status"] == "QUEUED"
+
+        payload = poll_mission(client, queued["id"])
 
         assert payload["status"] == "PASS"
         assert payload["worker"] == "repo-code-bud"

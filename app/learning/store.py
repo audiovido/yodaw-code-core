@@ -2,9 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from app.learning.models import LearningRecord
-
-
-DB_PATH = Path("data/yodaw.db")
+from app.storage.db import DB_PATH
 
 
 class LearningStore:

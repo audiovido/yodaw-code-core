@@ -12,6 +12,98 @@ from app.learning.retrieval import (
     format_lessons,
     retrieve_relevant_learnings,
 )
+from app.llm.provider import pop_attempt_log
+
+
+class MissionCancelled(Exception):
+    """Raised at cancellation checkpoints inside the worker."""
+
+
+class CancelContext:
+    """
+    Stage 8.4/8.8: cancellation and event context for one
+    executing mission.
+
+    cancel_check() raises MissionCancelled when cancellation was
+    requested; the worker calls it at every checkpoint (before
+    LLM calls, before applying edits, before validation, between
+    repair attempts, before commit) so a cancelled mission never
+    commits and never keeps running.
+
+    emit() persists structured mission events for observability;
+    it must never break mission execution.
+    """
+
+    def __init__(self, mission_id: str | None, store=None):
+        self.mission_id = mission_id
+        self.store = store
+        self.cancel_requested = False
+
+    def bind(self, store, mission_id: str | None):
+        self.store = store
+
+        if mission_id and mission_id != self.mission_id:
+            self.mission_id = mission_id
+
+            if store is not None:
+                try:
+                    existing = store.get(mission_id)
+                except Exception:
+                    existing = None
+
+                if existing is not None:
+                    self.cancel_requested = bool(
+                        existing.cancel_requested
+                    )
+
+    def refresh(self):
+        if self.store is None or self.mission_id is None:
+            return
+
+        try:
+            mission = self.store.get(self.mission_id)
+        except Exception:
+            return
+
+        if mission is not None:
+            self.cancel_requested = bool(mission.cancel_requested)
+
+    def cancel_check(self, at: str = ""):
+        self.refresh()
+
+        if self.cancel_requested:
+            raise MissionCancelled(at or "checkpoint")
+
+    def emit(self, event_type: str, attempt: int = 0, **data):
+        if self.store is None or self.mission_id is None:
+            return
+
+        try:
+            self.store.record_event(
+                self.mission_id,
+                event_type,
+                attempt=attempt,
+                data=data or None,
+            )
+        except Exception:
+            # Observability must never break execution.
+            pass
+
+
+def provider_attempt_evidence() -> list[dict]:
+    """Stage 8.6: surface provider attempts as evidence."""
+    attempts = pop_attempt_log()
+
+    if not attempts:
+        return []
+
+    return [
+        {
+            "type": "provider_attempts",
+            "attempts": attempts,
+            "timestamp": now_iso(),
+        }
+    ]
 
 
 class ToolMissingError(RuntimeError):
@@ -599,6 +691,23 @@ class RepoCodeWorker(Worker):
         mission_id = metadata.get("mission_id")
         keep_worktree = bool(metadata.get("keep_worktree", False))
 
+        ctx = CancelContext(
+            metadata.get("mission_id"),
+            metadata.get("_event_store"),
+        )
+        ctx.emit(
+            "mission.started",
+            attempt=0,
+            goal=goal,
+            repo=str(repo) if repo else None,
+        )
+
+        try:
+            ctx.cancel_check("before_execution")
+        except MissionCancelled:
+            ctx.emit("mission.cancelled", attempt=0, data={"while": "claimed"})
+            raise
+
         try:
             source_status = run(
                 ["git", "status", "--short"],
@@ -736,10 +845,17 @@ class RepoCodeWorker(Worker):
             repair_error = None
 
             while True:
+                if attempt > 0:
+                    ctx.cancel_check(f"between_attempts_{attempt}")
+
                 if attempt == 0:
                     if explicit_edits is not None:
                         edits = explicit_edits
                     else:
+                        # Stage 8.4 checkpoint: before the LLM
+                        # plan call.
+                        ctx.cancel_check("before_llm_plan")
+
                         try:
                             llm_plan = generate_edit_plan(
                                 goal,
@@ -748,6 +864,44 @@ class RepoCodeWorker(Worker):
                             )
 
                         except Exception as exc:
+                            evidence.extend(provider_attempt_evidence())
+
+                            if isinstance(exc, MissionCancelled):
+                                ctx.emit(
+                                    "mission.cancelled",
+                                    attempt=0,
+                                    at="before_llm_plan",
+                                )
+
+                                cleanup_worktree(
+                                    worktree,
+                                    repo,
+                                    keep_worktree,
+                                    evidence,
+                                    failed=True,
+                                )
+
+                                return WorkerResult(
+                                    success=False,
+                                    output={
+                                        "goal": goal,
+                                        "repo": str(repo),
+                                        "worktree": str(worktree),
+                                        "branch": branch_name,
+                                        "base_sha": base_sha["stdout"].strip(),
+                                        "tests_passed": False,
+                                        "retries": retries,
+                                        "attempts": 1,
+                                    },
+                                    evidence=evidence,
+                                    error={
+                                        "type": "Cancelled",
+                                        "message": str(exc),
+                                        "attempt": 0,
+                                    },
+                                    retryable=False,
+                                )
+
                             cleanup_worktree(
                                 worktree,
                                 repo,
@@ -817,6 +971,11 @@ class RepoCodeWorker(Worker):
 
                         edits = normalize_edits(llm_plan)
 
+                        # Stage 8.4: checkpoint after the LLM
+                        # call finished but before any work is
+                        # prepared or applied.
+                        ctx.cancel_check("after_llm_plan")
+
                         # The initial plan becomes the previous plan
                         # for the first corrective attempt.
                         previous_plan = llm_plan
@@ -826,6 +985,18 @@ class RepoCodeWorker(Worker):
                     # evidence back to the Coder Brain.
                     # -------------------------------------------------
                     try:
+                        try:
+                            ctx.cancel_check(f"before_repair_{attempt}")
+                        except MissionCancelled as exc:
+                            repair_error = {
+                                "type": "Cancelled",
+                                "message": str(exc),
+                                "attempt": attempt,
+                                "retry": retries,
+                            }
+
+                            break
+
                         repair_plan = generate_repair_plan(
                             goal,
                             worktree,
@@ -840,6 +1011,18 @@ class RepoCodeWorker(Worker):
                         )
 
                     except Exception as exc:
+                        evidence.extend(provider_attempt_evidence())
+
+                        if isinstance(exc, MissionCancelled):
+                            repair_error = {
+                                "type": "Cancelled",
+                                "message": str(exc),
+                                "attempt": attempt,
+                                "retry": retries,
+                            }
+
+                            break
+
                         repair_error = {
                             "type": "LLMError",
                             "message": str(exc),
@@ -935,10 +1118,18 @@ class RepoCodeWorker(Worker):
                         retryable=False,
                     )
 
+                ctx.cancel_check(f"before_apply_attempt_{attempt}")
+
                 apply_edits(
                     worktree,
                     staged_contents,
                     touched_files,
+                )
+
+                ctx.emit(
+                    "edit.applied",
+                    attempt=attempt,
+                    files=touched_files,
                 )
 
                 for item in prepared_edits:
@@ -952,6 +1143,9 @@ class RepoCodeWorker(Worker):
                             "timestamp": now_iso(),
                         }
                     )
+
+                ctx.cancel_check(f"before_validation_attempt_{attempt}")
+                ctx.emit("validation.started", attempt=attempt)
 
                 tests_passed, test_results = run_validation(
                     worktree,
@@ -1161,6 +1355,10 @@ class RepoCodeWorker(Worker):
             )
             evidence.append(add_result)
 
+            # Cancellation before commit must leave the source
+            # repository untouched: no commit, no merge, no push.
+            ctx.cancel_check("before_commit")
+
             commit_message = metadata.get(
                 "commit_message",
                 f"yodaw: {goal[:72]}",
@@ -1248,6 +1446,39 @@ class RepoCodeWorker(Worker):
             )
 
         except Exception as exc:
+            evidence.extend(provider_attempt_evidence())
+
+            if isinstance(exc, MissionCancelled):
+                ctx.emit(
+                    "mission.cancelled",
+                    attempt=0,
+                    at="worker_execution",
+                )
+
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
+                return WorkerResult(
+                    success=False,
+                    output={
+                        "goal": goal,
+                        "repo": str(repo),
+                        "worktree": str(worktree),
+                        "branch": branch_name,
+                    },
+                    evidence=evidence,
+                    error={
+                        "type": "Cancelled",
+                        "message": str(exc),
+                    },
+                    retryable=False,
+                )
+
             # Unhandled worker failure: still record the worktree
             # lifecycle so cleanup is never silent.
             cleanup_worktree(

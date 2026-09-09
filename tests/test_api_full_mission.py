@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 import app.workers.repo_code_worker as worker_module
 from app.main import app
+from tests.helpers import poll_mission
 
 
 client = TestClient(app)
@@ -102,7 +103,14 @@ def test_full_api_mission_pipeline_hermetic(monkeypatch):
 
         assert response.status_code == 200, response.text
 
-        mission = response.json()
+        # Stage 8 contract: POST returns QUEUED immediately;
+        # execution completes asynchronously.
+        queued = response.json()
+
+        assert queued["status"] == "QUEUED"
+        assert queued["id"]
+
+        mission = poll_mission(client, queued["id"])
 
         # Mission ends PASS with the repo-code worker selected.
         assert mission["status"] == "PASS"

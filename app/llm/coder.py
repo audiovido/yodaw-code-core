@@ -288,7 +288,11 @@ def generate_edit_plan(
     worktree: Path,
     provider=None,
     lessons: str = "",
+    cancel_check=None,
 ) -> dict:
+
+    if cancel_check:
+        cancel_check()
 
     provider = provider or LocalLLMProvider()
 
@@ -348,7 +352,11 @@ def generate_repair_plan(
     failure_context: dict,
     provider=None,
     lessons: str = "",
+    cancel_check=None,
 ) -> dict:
+
+    if cancel_check:
+        cancel_check()
 
     provider = provider or LocalLLMProvider()
 

@@ -13,9 +13,21 @@ def now_iso() -> str:
 class MissionStatus(str, Enum):
     queued = "QUEUED"
     running = "RUNNING"
+    verifying = "VERIFYING"
+    repairing = "REPAIRING"
+    recovering = "RECOVERING"
     passed = "PASS"
     failed = "FAIL"
     blocked = "BLOCKED"
+    cancelled = "CANCELLED"
+
+
+TERMINAL_STATUSES = {
+    MissionStatus.passed,
+    MissionStatus.failed,
+    MissionStatus.blocked,
+    MissionStatus.cancelled,
+}
 
 
 class MissionCreate(BaseModel):
@@ -35,3 +47,14 @@ class Mission(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
+
+    # Stage 8 runtime fields. All defaulted so Stage 7 payloads
+    # and requests keep loading without migration of stored JSON.
+    attempt: int = 0
+    max_attempts: int = 1
+    claimed_by: str | None = None
+    claimed_at: str | None = None
+    started_at: str | None = None
+    heartbeat_at: str | None = None
+    finished_at: str | None = None
+    cancel_requested: bool = False
