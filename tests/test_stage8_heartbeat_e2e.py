@@ -192,6 +192,27 @@ def test_stage8_heartbeat_runtime_e2e(
 
     mission_id = queued["id"]
 
+    # ----- Bounded QUEUED -> RUNNING transition (slow schedulers may lag) -----
+    transition_deadline = time.monotonic() + 15
+    while True:
+        status, mission = http_get(f"{base}/api/v1/missions/{mission_id}")
+        assert status == 200
+        if mission["status"] == "RUNNING":
+            break
+        if mission["status"] in ("PASS", "FAIL", "BLOCKED", "CANCELLED"):
+            raise AssertionError(
+                "mission reached terminal "
+                f"{mission['status']} without ever observing RUNNING"
+            )
+        assert mission["status"] == "QUEUED", (
+            f"unexpected pre-RUNNING status: {mission['status']}"
+        )
+        assert time.monotonic() < transition_deadline, (
+            "mission never transitioned QUEUED -> RUNNING within 15s; "
+            f"last status={mission['status']}"
+        )
+        time.sleep(0.2)
+
     # ----- While RUNNING, the persisted heartbeat advances -----
     heartbeats = []
     health_latencies = []
