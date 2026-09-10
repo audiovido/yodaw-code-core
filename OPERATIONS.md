@@ -109,20 +109,72 @@ without blocking lower-priority work; per-repo exclusion leases
   with the usual SQLite online-backup procedure.
 - **Secrets:** client keys are stored only as hashes; audit and
   evidence are redacted at the boundary. Never log the shared key.
-- **Known limits (Stage 9):** SQLite single-writer storage —
-  Postgres behind the existing store interfaces is the intended
-  next step for high concurrency; single shared admin key (no
-  per-admin identities); no rate limiting beyond concurrency
-  quotas.
+## Production deployment (Stage 10)
+
+- **Deployment profiles:** `YODAW_PROFILE` selects
+  `local` (default: SQLite, open access, embedded coordinator,
+  rate limiting off), `single-node` (auth required, rate limiting
+  on), `multi-process` (split API + N coordinators; Postgres
+  recommended, SQLite ceiling warned), `production` (Postgres
+  required, auth required, shared-key-only refused unless
+  `YODAW_SHARED_KEY_POLICY=warn`). Unsafe combinations fail fast
+  at startup.
+- **Database:** SQLite via `YODAW_DB_PATH` (default) or Postgres
+  via `YODAW_DATABASE_URL` (psycopg 3). Postgres claims use
+  `FOR UPDATE SKIP LOCKED`; quotas and audit chain semantics are
+  identical across backends.
+- **RBAC:** admin identities (`yodad_...` keys, hashed at rest)
+  with roles `superadmin`, `operator`, `auditor`. Clients
+  (`yodak_...`) are isolation-scoped to their own missions. The
+  Stage 8 `YODAW_API_KEY` shared key remains as a virtual
+  superadmin migration path and is deprecated: create real admin
+  identities (`POST /api/v1/admins`) and stop distributing the
+  shared key.
+- **Governance:** per-client token-bucket rate limits
+  (`YODAW_RATE_LIMIT_RPM`, `YODAW_RATE_LIMIT_BURST`,
+  `YODAW_MISSIONS_PER_MINUTE`; 0 disables), persistence-backed so
+  they hold across processes. Payload limits (goal length,
+  metadata size) reject before any processing. All rejections are
+  audited.
+- **Audit integrity:** every event links
+  `event_hash = SHA-256(prev_hash || canonical_payload)`.
+  `GET /api/v1/audit/verify` or `python -m app.operations
+  audit-verify` reports the first broken seq (exit code 2 on
+  tampering). This is tamper-evident integrity for operational
+  monitoring, not cryptographic non-repudiation.
+- **Retention:** `python -m app.operations audit-prune
+  --keep-days N [--archive path.jsonl] [--yes]` prunes old events
+  with a verifiable chain-anchor boundary; the surviving chain
+  still verifies.
+- **Outbox operations:** generalized message kinds with typed
+  schemas, backoff retries, and dead-letter after 5 attempts.
+  Inspect with `outbox-list [--dead]`, requeue with
+  `outbox-requeue [--id N]`, or the `/api/v1/outbox*` endpoints.
+- **Backup:** `python -m app.operations backup DEST` performs a
+  consistent SQLite online backup; on Postgres use
+  `pg_dump`/WAL archiving.
+- **Status:** `GET /api/v1/runtime/status` (safe, non-secret) or
+  `python -m app.operations status`.
+- **Shutdown:** SIGTERM/SIGINT stop claiming, drain inflight
+  missions, stop the relay, release leases, close storage.
+- **Scale ceiling:** SQLite is single-node (single writer);
+  correctness holds under multi-process load but throughput
+  serializes. Postgres is the scale-out path.
 
 ## Test map
 
 | Area | Tests |
 |---|---|
-| Identity lifecycle, revocation | `tests/test_tenancy.py` |
-| Quotas (submission + race-free claim) | `tests/test_tenancy.py` |
-| Priority/FIFO ordering | `tests/test_tenancy.py` |
-| Audit immutability + redaction | `tests/test_tenancy.py` |
+| Storage adapter contracts | `tests/test_storage_contracts.py` |
+| Postgres adapter (hermetic + integration) | `tests/test_pg_contract.py` |
+| Identity lifecycle, revocation, quotas | `tests/test_tenancy.py` |
+| RBAC matrix, isolation, rotation | `tests/test_rbac.py` |
+| Rate limits, governance, profiles | `tests/test_governance_and_profiles.py` |
+| Audit chain, prune/archive, tamper detection | `tests/test_storage_contracts.py` |
+| Generalized outbox (dead letter, unknown kinds) | `tests/test_outbox_generalized.py` |
 | Outbox exactly-once + crash window | `tests/test_outbox_relay.py` |
-| Multi-tenant runtime E2E | `tests/test_stage9_e2e.py` |
+| Scale-out (two coordinators, one DB) | `tests/test_scaleout.py` |
+| Security/failure audit checklist | `tests/test_stage10_security_audit.py` |
+| Stage 10 runtime E2E | `tests/test_stage10_e2e.py` |
+| Multi-tenant runtime E2E (Stage 9) | `tests/test_stage9_e2e.py` |
 | Stage 7/8 regression | all prior suites |
