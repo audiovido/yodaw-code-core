@@ -3,6 +3,7 @@ Repository fixtures for benchmark evaluation.
 """
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -33,8 +34,22 @@ class FixtureManager:
         # Initialize git if not already initialized
         repo_path = temp_path / "repo"
         if not (repo_path / ".git").exists():
-            os.system(f"cd {repo_path} && git init && git add . && git commit -m 'initial'")
-        
+            subprocess.run(["git", "init"], cwd=repo_path, check=True)
+            subprocess.run(["git", "add", "."], cwd=repo_path, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "YODAW Test"],
+                cwd=repo_path,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "yodaw-test@example.invalid"],
+                cwd=repo_path,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "initial"], cwd=repo_path, check=True
+            )
+
         return repo_path
     
     def cleanup_temp_repo(self, repo_path: Path):

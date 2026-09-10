@@ -77,6 +77,49 @@ def test_fixture_manager_unknown_fixture():
         FixtureManager().create_temp_repo("no_such_fixture")
 
 
+def test_fixture_manager_creates_repo_without_global_git_identity(
+    tmp_path, monkeypatch
+):
+    import subprocess
+
+    isolated_home = tmp_path / "no-git-identity-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated_home / ".config"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(isolated_home / "no-such.gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(isolated_home / "no-such-system.gitconfig"))
+
+    manager = FixtureManager()
+    repo_path = manager.create_temp_repo("python_basic")
+    try:
+        name = subprocess.run(
+            ["git", "config", "user.name"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        email = subprocess.run(
+            ["git", "config", "user.email"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert name == "YODAW Test"
+        assert email == "yodaw-test@example.invalid"
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert head
+    finally:
+        manager.cleanup_temp_repo(repo_path)
+
+
 @pytest.mark.parametrize("fixture", ["python_basic", "node_basic", "go_basic", "mixed_repo"])
 def test_all_text_fixtures_materialize(fixture):
     manager = FixtureManager()
