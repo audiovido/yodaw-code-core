@@ -70,12 +70,20 @@ def _auth_mode() -> str:
     """
     Which authentication surface is configured.
 
-    - identities: admin identities exist (RBAC surface)
+    - identities: admin identities exist in the store (RBAC
+      surface) — derived from actual store state, accurate in the
+      serving process and stable across restarts
     - shared-key: only YODAW_API_KEY is set (legacy surface)
     - open:       nothing is configured (local-dev open mode)
     """
-    if os.environ.get("YODAW_HAS_IDENTITIES") == "1":
-        return "identities"
+    try:
+        from app.tenants.admins import AdminStore
+        from app.storage.db import DB_PATH
+
+        if AdminStore(DB_PATH).count_admins() > 0:
+            return "identities"
+    except Exception:
+        pass
 
     if os.environ.get("YODAW_API_KEY"):
         return "shared-key"

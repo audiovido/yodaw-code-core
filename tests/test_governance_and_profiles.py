@@ -267,10 +267,19 @@ def test_profile_production_rejects_shared_key_only(monkeypatch):
 
 
 def test_profile_production_accepts_identities(monkeypatch):
+    """Identities mode is derived from actual store state: create a
+    real admin identity and production config accepts it."""
+    import uuid
+
+    import app.main as main_module
+
     monkeypatch.setenv("YODAW_PROFILE", "production")
     monkeypatch.setenv("YODAW_DATABASE_URL", "postgresql://u:p@h:5432/db")
-    monkeypatch.setenv("YODAW_HAS_IDENTITIES", "1")
     monkeypatch.delenv("YODAW_API_KEY", raising=False)
+
+    main_module.admins.create_admin(
+        f"prod-root-{uuid.uuid4().hex[:8]}", role="superadmin"
+    )
 
     cfg = load_config("production")
 

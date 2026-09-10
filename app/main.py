@@ -253,8 +253,15 @@ def _bearer(authorization: str | None) -> str:
 
 
 def auth_mode() -> str:
-    """Open local-dev, shared-key, or identity-based RBAC mode."""
-    if os.environ.get("YODAW_HAS_IDENTITIES") == "1":
+    """
+    Open local-dev, shared-key, or identity-based RBAC mode.
+
+    RBAC mode is derived from actual admin-identity state (never
+    from a mutable process-global flag), so it is accurate in the
+    serving process and cannot leak across test sessions or
+    worker restarts.
+    """
+    if admins.count_admins() > 0:
         return "rbac"
     return "key" if os.environ.get("YODAW_API_KEY") else "local-dev"
 
@@ -744,9 +751,6 @@ def create_admin(
         "admins.created",
         {"name": created["name"], "role": created["role"]},
     )
-
-    if auth_mode() != "rbac":
-        os.environ["YODAW_HAS_IDENTITIES"] = "1"
 
     return created
 
