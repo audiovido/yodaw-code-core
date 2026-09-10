@@ -1,8 +1,47 @@
-# YODAW Release Acceptance Report (Worker O, Black-Box)
+# YODAW Release Acceptance Report (final-coder-release-v2)
 
-Base: `yodaw/worker-o-blackbox-acceptance`
+Base: `yodaw/final-coder-release-v2` (from `yodaw/final-coder-release@2fac2bd`
++ Worker N `eef54db` + Worker O `14af881`)
 Suite: `python3.12 -m pytest tests/acceptance -q`
-Result: **19 passed, 4 failed** — all 4 failures reproduce one real product bug (below). No `app/**` changes were made.
+Result: **23 passed, 0 failed** on the final release line.
+
+## Scope
+
+| Area | File | Tests |
+|---|---|---|
+| CLI | `tests/acceptance/test_cli_acceptance.py` | 6 passed |
+| Mission API | `tests/acceptance/test_mission_api_acceptance.py` | 7 passed |
+| Failure classification | `tests/acceptance/test_failure_acceptance.py` | 5 passed |
+| Router | `tests/acceptance/test_router_acceptance.py` | 3 passed |
+| Computer | `tests/acceptance/test_computer_acceptance.py` | 2 passed |
+
+## Bugs found and fixed on this line
+
+### BUG-1 (fixed in base): `CodeWorker` shelled out to bare `python`
+- Worker O observed all 4 failures tracing to `FileNotFoundError: 'python'`
+  on its older base. The final release line already runs code missions under
+  `sys.executable`; this V2 line additionally centralizes resolution in
+  `app/workers/python_runtime.py` (`sys.executable` → `YODAW_PYTHON` →
+  `python3` → `python`) with `tests/test_portable_python_runtime.py`.
+- Failing-then-passing tests: `test_code_mission_passes_with_evidence`,
+  `test_router_dispatches_code_to_code_bud`,
+  `test_code_worker_leaves_filesystem_evidence`,
+  `test_code_worker_reports_workspace_and_commit`.
+
+### BUG-2 (fixed in V2): `/api/v1/workers` leaked worker health shape
+- Full-suite ordering appended test workers whose `health()` returned only
+  `{"status": "READY"}`; the endpoint returned that raw shape, so acceptance
+  tests reading `w["capabilities"]` raised `KeyError`.
+- Fix: `app/workers/registry.py::status()` normalizes every entry to
+  `{name, status, capabilities}` without touching routing or dispatch.
+- Locked by `tests/test_workers_registry_shape.py`.
+- Failing-then-passing tests: `test_workers_advertise_code_capability`,
+  `test_router_registry_lists_supported_capabilities`.
+
+## Worker O history (for context, not current state)
+
+On Worker O's own older base (`c6e7d82`), the suite reported
+**19 passed, 4 failed**, all 4 tracing to BUG-1 above.
 
 ## Scope
 
