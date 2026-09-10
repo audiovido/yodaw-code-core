@@ -3,7 +3,9 @@ Benchmark runner and orchestration.
 """
 import time
 import os
+import shutil
 import subprocess
+import tempfile
 import json
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -228,11 +230,64 @@ class BenchmarkRunner:
 
 
 class ComparisonRunner:
-    """Compare two YODAW revisions."""
-    
-    def __init__(self, runner: BenchmarkRunner):
+    """Compare two YODAW revisions using isolated git worktrees."""
+
+    def __init__(self, runner: BenchmarkRunner, repo_root=None):
         self.runner = runner
-    
+        self.repo_root = Path(repo_root) if repo_root else self._find_repo_root()
+
+    @staticmethod
+    def _find_repo_root() -> Path:
+        here = Path(__file__).resolve()
+        for parent in [here] + list(here.parents):
+            if (parent / ".git").exists():
+                return parent
+        return here.parents[3]
+
+    def _run_git(self, *args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            cwd=str(cwd or self.repo_root),
+        )
+
+    def _resolve_sha(self, sha: str) -> str:
+        result = self._run_git("rev-parse", "--verify", sha)
+        if result.returncode != 0:
+            raise ValueError(f"Unknown revision: {sha}")
+        return result.stdout.strip()
+
+    def _make_worktree(self, sha: str) -> Path:
+        resolved = self._resolve_sha(sha)
+        work_dir = Path(tempfile.mkdtemp(prefix="yodaw_eval_cmp_"))
+        result = self._run_git("worktree", "add", "--detach", str(work_dir), resolved)
+        if result.returncode != 0:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise RuntimeError(f"git worktree add failed for {sha}: {result.stderr.strip()}")
+        return work_dir
+
+    def _remove_worktree(self, work_dir: Path) -> None:
+        self._run_git("worktree", "remove", "--force", str(work_dir))
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _run_suite_in(self, work_dir: Path, cases: List[BenchmarkCase]) -> BenchmarkReport:
+        revision = self._run_git("rev-parse", "HEAD", cwd=work_dir)
+        report = self.runner.run_suite(cases)
+        report.revision = revision.stdout.strip() if revision.returncode == 0 else "unknown"
+        return report
+
+    def _summarize(self, report: BenchmarkReport) -> Dict:
+        return {
+            "revision": report.revision,
+            "total_cases": report.total_cases,
+            "passed": report.passed,
+            "failed": report.failed,
+            "blocked": report.blocked,
+            "overall_score": report.overall_score,
+            "passed_ids": sorted(r.case_id for r in report.results if r.result_class == ResultClass.PASS),
+        }
+
     def compare_revisions(
         self,
         base_sha: str,
@@ -241,25 +296,45 @@ class ComparisonRunner:
     ) -> Dict:
         """
         Compare two revisions on benchmark suite.
-        
+
+        Each revision is checked out in an isolated git worktree so the
+        comparison never mutates the caller's working tree.
+
         Returns comparison report.
         """
-        # This would:
-        # 1. Checkout base_sha in temp worktree
-        # 2. Run benchmarks
-        # 3. Checkout candidate_sha in temp worktree
-        # 4. Run benchmarks
-        # 5. Compare results
-        
-        # For now, placeholder
+        base_dir = None
+        candidate_dir = None
+        try:
+            base_dir = self._make_worktree(base_sha)
+            candidate_dir = self._make_worktree(candidate_sha)
+            base_report = self._run_suite_in(base_dir, cases)
+            candidate_report = self._run_suite_in(candidate_dir, cases)
+        finally:
+            if base_dir is not None:
+                self._remove_worktree(base_dir)
+            if candidate_dir is not None:
+                self._remove_worktree(candidate_dir)
+
+        base_passed = {r.case_id for r in base_report.results if r.result_class == ResultClass.PASS}
+        candidate_passed = {r.case_id for r in candidate_report.results if r.result_class == ResultClass.PASS}
+        not_blocked = (ResultClass.PASS, ResultClass.BLOCKED_EXTERNAL, ResultClass.BLOCKED_AMBIGUOUS)
+        base_failed = {r.case_id for r in base_report.results if r.result_class not in not_blocked}
+        candidate_failed = {r.case_id for r in candidate_report.results if r.result_class not in (ResultClass.PASS, ResultClass.BLOCKED_EXTERNAL, ResultClass.BLOCKED_AMBIGUOUS)}
+
         return {
-            "base_sha": base_sha,
-            "candidate_sha": candidate_sha,
-            "score_delta": 0.0,
-            "newly_passed": [],
-            "newly_failed": [],
-            "unchanged_failures": [],
-            "performance_delta": {},
+            "base_sha": base_report.revision,
+            "candidate_sha": candidate_report.revision,
+            "base": self._summarize(base_report),
+            "candidate": self._summarize(candidate_report),
+            "score_delta": candidate_report.overall_score - base_report.overall_score,
+            "newly_passed": sorted(candidate_passed - base_passed),
+            "newly_failed": sorted(base_passed - candidate_passed),
+            "unchanged_failures": sorted(base_failed & candidate_failed),
+            "performance_delta": {
+                "base_avg_runtime": base_report.average_runtime,
+                "candidate_avg_runtime": candidate_report.average_runtime,
+                "runtime_delta": candidate_report.average_runtime - base_report.average_runtime,
+            },
         }
 
 
