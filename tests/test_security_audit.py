@@ -38,24 +38,32 @@ from app.tenants.clients import ClientStore
 
 @pytest.fixture()
 def isolated_api(monkeypatch, tmp_path):
-    """Point the API stores at temp databases for this test."""
+    """Point the API stores at temp databases for this test.
+
+    Module state is swapped via monkeypatch.setattr so the
+    session-shared stores are restored after each test; a plain
+    assignment would leak the temp stores (and the disabled rate
+    limiter) into every test running later in the session.
+    """
     monkeypatch.delenv("YODAW_API_KEY", raising=False)
     monkeypatch.delenv("YODAW_PROFILE", raising=False)
     monkeypatch.setenv("YODAW_RATE_LIMIT_RPM", "0")
     monkeypatch.setenv("YODAW_EMBED_COORDINATOR", "0")
 
     db = tmp_path / "api.db"
-    main_module.store = MissionStore(db)
-    main_module.clients = ClientStore(db)
-    main_module.admins = AdminStore(db)
-    main_module.audit = AuditStore(db)
+    monkeypatch.setattr(main_module, "store", MissionStore(db))
+    monkeypatch.setattr(main_module, "clients", ClientStore(db))
+    monkeypatch.setattr(main_module, "admins", AdminStore(db))
+    monkeypatch.setattr(main_module, "audit", AuditStore(db))
 
     import app.api.auth as auth_module
     from app.api.governance import RateLimiter
     from app.main import _rate_backend
 
-    main_module.rate_limiter = RateLimiter(
-        _rate_backend, enabled_provider=lambda: False
+    monkeypatch.setattr(
+        main_module,
+        "rate_limiter",
+        RateLimiter(_rate_backend, enabled_provider=lambda: False),
     )
 
     yield main_module
