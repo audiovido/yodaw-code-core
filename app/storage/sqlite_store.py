@@ -31,13 +31,23 @@ class DuplicateMission(Exception):
 
 ACTIVE_STATUSES = (
     "QUEUED",
+    "OBSERVING",
+    "PLANNING",
     "RUNNING",
+    "EXECUTING",
     "VERIFYING",
     "REPAIRING",
     "RECOVERING",
 )
 
-EXECUTING_STATUSES = ("RUNNING", "VERIFYING", "REPAIRING")
+EXECUTING_STATUSES = (
+    "OBSERVING",
+    "PLANNING",
+    "RUNNING",
+    "EXECUTING",
+    "VERIFYING",
+    "REPAIRING",
+)
 
 
 def _add_column(db, table, column, decl):
@@ -221,10 +231,30 @@ def _migration_3_stage10_governance(db):
         prev = digest
 
 
+def _migration_4_worker_i_product(db):
+    """Worker I: product idempotency keys for exactly-once submit."""
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mission_idempotency (
+            tenant_scope TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_scope, idempotency_key)
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_idem_mission "
+        "ON mission_idempotency(mission_id)"
+    )
+
+
 MIGRATIONS = [
     _migration_1_runtime_columns,
     _migration_2_multi_tenant,
     _migration_3_stage10_governance,
+    _migration_4_worker_i_product,
 ]
 
 
@@ -282,8 +312,10 @@ class MissionStore:
         """
         Persist the full mission payload and mirror runtime columns.
 
-        cancel_requested is monotonic: a cancellation requested by
-        the API is never un-set by a coordinator save racing it.
+        cancel_requested is monotonic end to end: a cancellation
+        requested by the API is never un-set by a coordinator save
+        racing it — neither in the runtime column nor inside the
+        JSON payload that every reader consumes.
         """
         payload = mission.model_dump_json()
         now = now_ts()
@@ -299,7 +331,13 @@ class MissionStore:
                 )
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    payload=excluded.payload,
+                    payload=CASE
+                        WHEN missions.cancel_requested=1
+                        THEN json_set(
+                            excluded.payload,
+                            '$.cancel_requested', json('true')
+                        )
+                        ELSE excluded.payload END,
                     status=excluded.status,
                     goal=excluded.goal,
                     repo_key=COALESCE(excluded.repo_key, missions.repo_key),
@@ -376,22 +414,31 @@ class MissionStore:
 
         Single-flight protection: rejects an identical active
         mission (same repo + same goal) so duplicate submissions
-        cannot run the same work item twice. Stage 9: carries the
+        cannot run the same work item twice. The check and the
+        insert run in one immediate transaction (mirroring the
+        Postgres FOR UPDATE form), so concurrent duplicate
+        submissions serialize: exactly one insert wins and the
+        losers see the winner's row. Stage 9: carries the
         submitting client's identity and queue priority.
         """
         repo_key = self._repo_key(mission)
 
-        with connect(self.path) as db:
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
             row = db.execute(
                 """
                 SELECT id FROM missions
                 WHERE repo_key=? AND goal=? AND id != ? AND status IN
-                    ('QUEUED','RUNNING','VERIFYING','REPAIRING','RECOVERING')
+                    ('QUEUED','OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
                 """,
                 (repo_key, mission.goal, mission.id),
             ).fetchone()
 
             if row:
+                db.rollback()
                 raise DuplicateMission(
                     f"mission {row[0]} already active "
                     "for this repo and goal",
@@ -400,27 +447,57 @@ class MissionStore:
 
             now = now_ts()
 
-            db.execute(
-                """
-                INSERT INTO missions(
-                    id, payload, status, goal, repo_key,
-                    claimed_by, claimed_at, heartbeat_at,
-                    cancel_requested, created_at, updated_at,
-                    client_id, priority
+            try:
+                db.execute(
+                    """
+                    INSERT INTO missions(
+                        id, payload, status, goal, repo_key,
+                        claimed_by, claimed_at, heartbeat_at,
+                        cancel_requested, created_at, updated_at,
+                        client_id, priority
+                    )
+                    VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        mission.id,
+                        mission.model_dump_json(),
+                        mission.goal,
+                        repo_key,
+                        mission.created_at,
+                        now,
+                        mission.client_id,
+                        mission.priority,
+                    ),
                 )
-                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
-                """,
-                (
-                    mission.id,
-                    mission.model_dump_json(),
-                    mission.goal,
-                    repo_key,
-                    mission.created_at,
-                    now,
-                    mission.client_id,
-                    mission.priority,
-                ),
-            )
+            except sqlite3.IntegrityError:
+                # Lost a concurrent-insert race against an
+                # identical submission: report the winner instead
+                # of surfacing a raw constraint violation.
+                winner = db.execute(
+                    """
+                    SELECT id FROM missions
+                    WHERE repo_key=? AND goal=? AND id != ?
+                      AND status IN
+                        ('QUEUED','RUNNING','VERIFYING','REPAIRING',
+                         'RECOVERING')
+                    """,
+                    (repo_key, mission.goal, mission.id),
+                ).fetchone()
+                db.rollback()
+                raise DuplicateMission(
+                    f"mission {winner[0] if winner else '?'} already active "
+                    "for this repo and goal",
+                    mission_id=winner[0] if winner else None,
+                )
+
+            db.commit()
+        except DuplicateMission:
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
         self.record_event(
             mission.id,
@@ -479,7 +556,13 @@ class MissionStore:
             rows = db.execute(query, params).fetchall()
 
             for mission_id, payload in rows:
-                mission = Mission.model_validate_json(payload)
+                try:
+                    mission = Mission.model_validate_json(payload)
+                except Exception:
+                    # One corrupt payload must not wedge the queue:
+                    # leave the row for operator inspection and keep
+                    # scanning for healthy candidates.
+                    continue
 
                 # Per-client concurrency quota, evaluated inside
                 # the claim transaction: the quota bounds
@@ -497,8 +580,8 @@ class MissionStore:
                         """
                         SELECT COUNT(*) FROM missions
                         WHERE client_id=? AND status IN
-                            ('RUNNING','VERIFYING','REPAIRING',
-                             'RECOVERING')
+                            ('OBSERVING','PLANNING','RUNNING','EXECUTING',
+                             'VERIFYING','REPAIRING','RECOVERING')
                         """,
                         (mission.client_id,),
                     ).fetchone()[0]
@@ -572,7 +655,8 @@ class MissionStore:
                 """
                 SELECT payload, cancel_requested FROM missions
                 WHERE id=? AND claimed_by=? AND status IN
-                    ('RUNNING','VERIFYING','REPAIRING')
+                    ('OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
                 """,
                 (mission_id, coordinator_id),
             ).fetchone()
@@ -707,13 +791,23 @@ class MissionStore:
             rows = db.execute(
                 """
                 SELECT payload FROM missions
-                WHERE status IN ('RUNNING','VERIFYING','REPAIRING')
+                WHERE status IN ('OBSERVING','PLANNING','RUNNING',
+                                 'EXECUTING','VERIFYING','REPAIRING',
+                                 'RECOVERING')
                   AND (heartbeat_at IS NULL OR heartbeat_at < ?)
                 """,
                 (cutoff,),
             ).fetchall()
 
-        return [Mission.model_validate_json(row[0]) for row in rows]
+        stale = []
+        for row in rows:
+            try:
+                stale.append(Mission.model_validate_json(row[0]))
+            except Exception:
+                # Corrupt rows stay for operator inspection; the
+                # watchdog keeps recovering the healthy ones.
+                continue
+        return stale
 
     # -----------------------------------------------------
     # Structured mission events
@@ -784,7 +878,8 @@ class MissionStore:
                 """
                 SELECT COUNT(*) FROM missions
                 WHERE client_id=? AND status IN
-                    ('RUNNING','VERIFYING','REPAIRING','RECOVERING')
+                    ('OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
                 """,
                 (client_id,),
             ).fetchone()
@@ -1172,13 +1267,56 @@ class MissionStore:
             "dead_lettered_at": row[10],
         }
 
+    # -----------------------------------------------------
+    # Worker I: product idempotency (exactly-once mission submit)
+    # -----------------------------------------------------
+
+    def idempotency_lookup(
+        self, tenant_scope: str, idempotency_key: str
+    ) -> str | None:
+        with connect(self.path) as db:
+            row = db.execute(
+                "SELECT mission_id FROM mission_idempotency "
+                "WHERE tenant_scope=? AND idempotency_key=?",
+                (tenant_scope, idempotency_key),
+            ).fetchone()
+        return row[0] if row else None
+
+    def idempotency_claim(
+        self, tenant_scope: str, idempotency_key: str, mission_id: str
+    ) -> str:
+        """Claim one key; the winner's mission id wins every replay."""
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT mission_id FROM mission_idempotency "
+                "WHERE tenant_scope=? AND idempotency_key=?",
+                (tenant_scope, idempotency_key),
+            ).fetchone()
+            if row:
+                db.rollback()
+                return row[0]
+            db.execute(
+                "INSERT INTO mission_idempotency("
+                "tenant_scope, idempotency_key, mission_id, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (tenant_scope, idempotency_key, mission_id, now_ts()),
+            )
+            db.commit()
+            return mission_id
+
     def outbox_stats(self) -> dict:
+        # Pending means deliverable work: undelivered AND not
+        # dead-lettered. A dead-lettered message is quarantined for
+        # operator review and must never read as queued work.
         with connect(self.path) as db:
             row = db.execute(
                 """
                 SELECT
                     COUNT(*),
-                    SUM(CASE WHEN delivered_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN delivered_at IS NULL
+                              AND dead_lettered_at IS NULL
+                             THEN 1 ELSE 0 END),
                     SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END),
                     SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END)
                 FROM mission_outbox

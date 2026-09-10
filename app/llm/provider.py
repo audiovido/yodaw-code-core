@@ -103,9 +103,10 @@ def _is_retryable(exc: Exception) -> bool:
     Stage 8.6 retry classification.
 
     Retry transient provider faults: timeouts, connection
-    failures, temporary HTTP 5xx and 429. Never retry
-    deterministic errors: authentication, missing/unsupported
-    model, bad request, malformed responses.
+    failures, temporary HTTP 5xx, 429, and 408 (a request timeout
+    means the call never ran to completion, so retrying is safe).
+    Never retry deterministic errors: authentication, missing/
+    unsupported model, bad request, malformed responses.
     """
     if isinstance(exc, httpx.TimeoutException):
         return True
@@ -115,7 +116,7 @@ def _is_retryable(exc: Exception) -> bool:
 
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
-        return status >= 500 or status == 429
+        return status >= 500 or status in (429, 408)
 
     # Malformed payloads and everything else: not retryable.
     return False

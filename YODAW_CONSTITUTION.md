@@ -151,3 +151,36 @@ Stage 9 (Multi-Tenant Runtime): GRADUATED.
   exactly-once learning, runtime status, clean SIGTERM. Full
   suite at graduation: 118 passed, 0 failed.
 
+Stage 10 (Production Scale & Governance): GRADUATED.
+
+- Verified baseline: 211 passed, 0 failed, 7 skipped,
+  2 warnings.
+- Storage abstraction with a SQLite backend and a PostgreSQL
+  adapter sharing one contract suite, so both backends carry
+  identical claim, quota, and audit semantics.
+- RBAC identities (superadmin/operator/auditor admin roles,
+  isolation-scoped clients) with revocation and rotation.
+- Quotas and rate limiting: per-client concurrency quotas
+  enforced race-free in the claim transaction plus
+  persistence-backed token-bucket rate limits and
+  per-minute submission budgets.
+- Payload governance: goal length and metadata size limits
+  reject before any processing; all rejections are audited.
+- Tamper-evident audit chain: every event links
+  event_hash = SHA-256(prev_hash || canonical_payload), with a
+  verify endpoint/CLI and prune-with-anchor retention.
+- Generalized durable outbox: typed message kinds, backoff
+  retries, dead-letter after 5 attempts, list/requeue
+  operations.
+- Deployment profiles (local/single-node/multi-process/
+  production) that fail fast on unsafe combinations.
+- Multi-coordinator scale-out: one API process plus N
+  coordinator processes with transaction-atomic claims across
+  processes (Postgres FOR UPDATE SKIP LOCKED).
+- Real runtime E2E through the production entrypoint plus a
+  security/failure audit checklist suite.
+- Real PostgreSQL host E2E was BLOCKED_EXTERNAL: no
+  PostgreSQL/Docker host was available, so host-backed Postgres
+  behavior is NOT claimed as tested. Postgres coverage at
+  graduation is hermetic/contract-level only.
+

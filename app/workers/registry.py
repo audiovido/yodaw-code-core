@@ -16,7 +16,28 @@ class WorkerRegistry:
         return None
 
     def status(self):
-        return [worker.health() for worker in self.workers]
+        # Normalize every worker entry so the API shape never depends
+        # on what a worker's health() happens to include.
+        items = []
+        for worker in self.workers:
+            try:
+                health = worker.health() or {}
+            except Exception:
+                health = {}
+            caps = getattr(worker, "capabilities", None)
+            if caps is None:
+                caps = health.get("capabilities") or []
+            items.append(
+                {
+                    **health,
+                    "name": getattr(worker, "name", None)
+                    or health.get("name")
+                    or type(worker).__name__,
+                    "status": health.get("status", "UNKNOWN"),
+                    "capabilities": sorted(caps or []),
+                }
+            )
+        return items
 
 
 registry = WorkerRegistry()

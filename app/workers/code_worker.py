@@ -1,11 +1,11 @@
 import json
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
 from app.workers.base import Worker, WorkerResult
+from app.workers.python_runtime import resolve_python_executable
 
 
 def now_iso():
@@ -119,7 +119,7 @@ class CodeWorker(Worker):
             # 4) Run tests
             # -------------------------------------------------
             test_result = run(
-                ["python", "-m", "pytest", "-q"],
+                [resolve_python_executable(), "-m", "pytest", "-q"],
                 cwd=workdir,
             )
             evidence.append(test_result)

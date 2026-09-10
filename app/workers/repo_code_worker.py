@@ -1,12 +1,12 @@
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
 from app.workers.base import Worker, WorkerResult
+from app.workers.python_runtime import resolve_python_executable
 from app.llm.coder import generate_edit_plan, generate_repair_plan
 from app.learning.retrieval import (
     format_lessons,
@@ -197,7 +197,7 @@ def detect_test_commands(worktree: Path):
         # hardcoding a user-specific environment path.
         commands.append(
             [
-                sys.executable or "python",
+                resolve_python_executable(),
                 "-B",
                 "-m",
                 "pytest",
