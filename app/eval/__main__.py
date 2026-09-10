@@ -51,6 +51,61 @@ def main():
         help="Output comparison report to file",
     )
     
+    # Live command (real provider)
+    live_parser = subparsers.add_parser(
+        "live",
+        help="Run live benchmark with a real provider",
+    )
+    live_parser.add_argument(
+        "--provider",
+        default="openai-compatible",
+        choices=["openai-compatible", "ollama"],
+        help="Provider kind",
+    )
+    live_parser.add_argument("--model", required=True, help="Model name")
+    live_parser.add_argument(
+        "--base-url", required=True, help="Provider base URL"
+    )
+    live_parser.add_argument(
+        "--api-key-env",
+        default="YODAW_EVAL_API_KEY",
+        help="Environment variable holding the API key",
+    )
+    live_parser.add_argument(
+        "--case",
+        type=str,
+        help="Run specific benchmark case by ID",
+    )
+    live_parser.add_argument(
+        "--suite",
+        type=str,
+        default="all",
+        help="Tag filter for benchmark cases, or 'all'",
+    )
+    live_parser.add_argument(
+        "--output",
+        type=str,
+        help="Output JSON report to file",
+    )
+    live_parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=60.0,
+        help="Per-request timeout in seconds",
+    )
+    live_parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Bounded provider retries",
+    )
+    live_parser.add_argument(
+        "--artifact-dir",
+        type=str,
+        default=None,
+        help="Directory to preserve failed case worktrees",
+    )
+
     # List command
     list_parser = subparsers.add_parser("list", help="List available benchmarks")
     list_parser.add_argument(
@@ -63,6 +118,8 @@ def main():
     
     if args.command == "run":
         return run_benchmarks(args)
+    elif args.command == "live":
+        return run_live(args)
     elif args.command == "compare":
         return compare_revisions(args)
     elif args.command == "list":
@@ -102,6 +159,28 @@ def run_benchmarks(args):
     if report.failed > 0:
         return 1
     return 0
+
+
+def run_live(args):
+    """Execute live benchmark run via the live CLI module."""
+    from app.eval.live.cli import main as live_main
+
+    argv = [
+        "--provider", args.provider,
+        "--model", args.model,
+        "--base-url", args.base_url,
+        "--api-key-env", args.api_key_env,
+        "--suite", args.suite or "all",
+        "--timeout-s", str(args.timeout_s),
+        "--max-retries", str(args.max_retries),
+    ]
+    if args.case:
+        argv += ["--case", args.case]
+    if args.output:
+        argv += ["--output", args.output]
+    if args.artifact_dir:
+        argv += ["--artifact-dir", args.artifact_dir]
+    return live_main(argv)
 
 
 def compare_revisions(args):
