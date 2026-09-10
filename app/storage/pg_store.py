@@ -394,28 +394,50 @@ class PostgresMissionStore:
                     )
 
                 now = now_ts()
-                cur.execute(
-                    """
-                    INSERT INTO missions(
-                        id, payload, status, goal, repo_key,
-                        claimed_by, claimed_at, heartbeat_at,
-                        cancel_requested, created_at, updated_at,
-                        client_id, priority
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO missions(
+                            id, payload, status, goal, repo_key,
+                            claimed_by, claimed_at, heartbeat_at,
+                            cancel_requested, created_at, updated_at,
+                            client_id, priority
+                        )
+                        VALUES(%s, %s, 'QUEUED', %s, %s, NULL, NULL,
+                               NULL, FALSE, %s, %s, %s, %s)
+                        """,
+                        (
+                            mission.id,
+                            mission.model_dump_json(),
+                            mission.goal,
+                            repo_key,
+                            mission.created_at,
+                            now,
+                            mission.client_id,
+                            mission.priority,
+                        ),
                     )
-                    VALUES(%s, %s, 'QUEUED', %s, %s, NULL, NULL,
-                           NULL, FALSE, %s, %s, %s, %s)
-                    """,
-                    (
-                        mission.id,
-                        mission.model_dump_json(),
-                        mission.goal,
-                        repo_key,
-                        mission.created_at,
-                        now,
-                        mission.client_id,
-                        mission.priority,
-                    ),
-                )
+                except Exception:
+                    # Lost a concurrent-insert race against an
+                    # identical submission: report the winner
+                    # instead of a raw constraint violation.
+                    db.rollback()
+                    with db.cursor() as retry:
+                        retry.execute(
+                            """
+                            SELECT id FROM missions
+                            WHERE repo_key=%s AND goal=%s AND id != %s
+                              AND status IN ('QUEUED','RUNNING',
+                                'VERIFYING','REPAIRING','RECOVERING')
+                            """,
+                            (repo_key, mission.goal, mission.id),
+                        )
+                        winner = retry.fetchone()
+                    raise DuplicateMission(
+                        f"mission {winner[0] if winner else '?'} "
+                        "already active for this repo and goal",
+                        mission_id=winner[0] if winner else None,
+                    )
 
             db.commit()
 
@@ -471,11 +493,16 @@ class PostgresMissionStore:
                 now = now_ts()
 
                 for mission_id, payload in rows:
-                    mission = (
-                        Mission.model_validate_json(payload)
-                        if isinstance(payload, str)
-                        else Mission.model_validate(payload)
-                    )
+                    try:
+                        mission = (
+                            Mission.model_validate_json(payload)
+                            if isinstance(payload, str)
+                            else Mission.model_validate(payload)
+                        )
+                    except Exception:
+                        # One corrupt payload must not wedge the
+                        # queue; the row stays for inspection.
+                        continue
 
                     limit = (
                         limits.get(mission.client_id)
@@ -673,14 +700,18 @@ class PostgresMissionStore:
                 )
                 rows = cur.fetchall()
 
-        return [
-            (
-                Mission.model_validate_json(r[0])
-                if isinstance(r[0], str)
-                else Mission.model_validate(r[0])
-            )
-            for r in rows
-        ]
+        stale = []
+        for r in rows:
+            try:
+                stale.append(
+                    Mission.model_validate_json(r[0])
+                    if isinstance(r[0], str)
+                    else Mission.model_validate(r[0])
+                )
+            except Exception:
+                # Corrupt rows stay for operator inspection.
+                continue
+        return stale
 
     # -----------------------------------------------------
     # Events
@@ -1081,12 +1112,15 @@ class PostgresMissionStore:
         ]
 
     def outbox_stats(self) -> dict:
+        # Pending means deliverable work: undelivered AND not
+        # dead-lettered (mirrors the SQLite adapter).
         with self._connect() as db:
             with db.cursor() as cur:
                 cur.execute(
                     """
                     SELECT COUNT(*),
-                           COUNT(*) FILTER (WHERE delivered_at IS NULL),
+                           COUNT(*) FILTER (WHERE delivered_at IS NULL
+                             AND dead_lettered_at IS NULL),
                            COUNT(*) FILTER (WHERE delivered_at IS NOT NULL),
                            COUNT(*) FILTER (
                                WHERE dead_lettered_at IS NOT NULL)

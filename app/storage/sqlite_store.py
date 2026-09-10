@@ -376,12 +376,19 @@ class MissionStore:
 
         Single-flight protection: rejects an identical active
         mission (same repo + same goal) so duplicate submissions
-        cannot run the same work item twice. Stage 9: carries the
+        cannot run the same work item twice. The check and the
+        insert run in one immediate transaction (mirroring the
+        Postgres FOR UPDATE form), so concurrent duplicate
+        submissions serialize: exactly one insert wins and the
+        losers see the winner's row. Stage 9: carries the
         submitting client's identity and queue priority.
         """
         repo_key = self._repo_key(mission)
 
-        with connect(self.path) as db:
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
             row = db.execute(
                 """
                 SELECT id FROM missions
@@ -392,6 +399,7 @@ class MissionStore:
             ).fetchone()
 
             if row:
+                db.rollback()
                 raise DuplicateMission(
                     f"mission {row[0]} already active "
                     "for this repo and goal",
@@ -400,27 +408,57 @@ class MissionStore:
 
             now = now_ts()
 
-            db.execute(
-                """
-                INSERT INTO missions(
-                    id, payload, status, goal, repo_key,
-                    claimed_by, claimed_at, heartbeat_at,
-                    cancel_requested, created_at, updated_at,
-                    client_id, priority
+            try:
+                db.execute(
+                    """
+                    INSERT INTO missions(
+                        id, payload, status, goal, repo_key,
+                        claimed_by, claimed_at, heartbeat_at,
+                        cancel_requested, created_at, updated_at,
+                        client_id, priority
+                    )
+                    VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        mission.id,
+                        mission.model_dump_json(),
+                        mission.goal,
+                        repo_key,
+                        mission.created_at,
+                        now,
+                        mission.client_id,
+                        mission.priority,
+                    ),
                 )
-                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
-                """,
-                (
-                    mission.id,
-                    mission.model_dump_json(),
-                    mission.goal,
-                    repo_key,
-                    mission.created_at,
-                    now,
-                    mission.client_id,
-                    mission.priority,
-                ),
-            )
+            except sqlite3.IntegrityError:
+                # Lost a concurrent-insert race against an
+                # identical submission: report the winner instead
+                # of surfacing a raw constraint violation.
+                winner = db.execute(
+                    """
+                    SELECT id FROM missions
+                    WHERE repo_key=? AND goal=? AND id != ?
+                      AND status IN
+                        ('QUEUED','RUNNING','VERIFYING','REPAIRING',
+                         'RECOVERING')
+                    """,
+                    (repo_key, mission.goal, mission.id),
+                ).fetchone()
+                db.rollback()
+                raise DuplicateMission(
+                    f"mission {winner[0] if winner else '?'} already active "
+                    "for this repo and goal",
+                    mission_id=winner[0] if winner else None,
+                )
+
+            db.commit()
+        except DuplicateMission:
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
         self.record_event(
             mission.id,
@@ -479,7 +517,13 @@ class MissionStore:
             rows = db.execute(query, params).fetchall()
 
             for mission_id, payload in rows:
-                mission = Mission.model_validate_json(payload)
+                try:
+                    mission = Mission.model_validate_json(payload)
+                except Exception:
+                    # One corrupt payload must not wedge the queue:
+                    # leave the row for operator inspection and keep
+                    # scanning for healthy candidates.
+                    continue
 
                 # Per-client concurrency quota, evaluated inside
                 # the claim transaction: the quota bounds
@@ -713,7 +757,15 @@ class MissionStore:
                 (cutoff,),
             ).fetchall()
 
-        return [Mission.model_validate_json(row[0]) for row in rows]
+        stale = []
+        for row in rows:
+            try:
+                stale.append(Mission.model_validate_json(row[0]))
+            except Exception:
+                # Corrupt rows stay for operator inspection; the
+                # watchdog keeps recovering the healthy ones.
+                continue
+        return stale
 
     # -----------------------------------------------------
     # Structured mission events
@@ -1173,12 +1225,17 @@ class MissionStore:
         }
 
     def outbox_stats(self) -> dict:
+        # Pending means deliverable work: undelivered AND not
+        # dead-lettered. A dead-lettered message is quarantined for
+        # operator review and must never read as queued work.
         with connect(self.path) as db:
             row = db.execute(
                 """
                 SELECT
                     COUNT(*),
-                    SUM(CASE WHEN delivered_at IS NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN delivered_at IS NULL
+                              AND dead_lettered_at IS NULL
+                             THEN 1 ELSE 0 END),
                     SUM(CASE WHEN delivered_at IS NOT NULL THEN 1 ELSE 0 END),
                     SUM(CASE WHEN dead_lettered_at IS NOT NULL THEN 1 ELSE 0 END)
                 FROM mission_outbox
