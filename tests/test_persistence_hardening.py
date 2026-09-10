@@ -10,6 +10,7 @@ Stage 8.9: persistence hardening.
 import json
 import sqlite3
 import threading
+import time
 
 from app.core.models import Mission
 from app.storage.db import connect
@@ -199,11 +200,15 @@ def test_concurrent_readers_and_writers_under_wal(tmp_path):
     db_path = tmp_path / "concurrent.sqlite"
     store = MissionStore(db_path)
 
+    EXPECTED_MISSIONS = 4 * 4
     errors = []
     claimed = []
     lock = threading.Lock()
+    writers_finished = 0
+    writers_done = threading.Event()
 
     def writer(i):
+        nonlocal writers_finished
         try:
             for j in range(4):
                 store.enqueue(
@@ -215,17 +220,32 @@ def test_concurrent_readers_and_writers_under_wal(tmp_path):
                 )
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
+        finally:
+            with lock:
+                writers_finished += 1
+                if writers_finished == 4:
+                    writers_done.set()
 
     def claimer():
         try:
-            for _ in range(50):
+            # Claim until every enqueued mission is drained; the
+            # monotonic deadline only fires if claiming stalls.
+            deadline = time.monotonic() + 30
+            while True:
+                with lock:
+                    done = len(claimed)
+                if writers_done.is_set() and done >= EXPECTED_MISSIONS:
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        f"claimer timed out with {done}/{EXPECTED_MISSIONS} claimed"
+                    )
                 mission = store.claim_next(f"coord-{threading.get_ident()}")
 
                 if mission:
                     with lock:
                         claimed.append(mission.id)
                     store.heartbeat(mission.id, f"coord-{threading.get_ident()}")
-                    mission.status = mission.status  # no-op
                     from app.core.models import MissionStatus
 
                     mission.status = MissionStatus.passed
@@ -254,5 +274,8 @@ def test_concurrent_readers_and_writers_under_wal(tmp_path):
         t.join(timeout=30)
 
     assert errors == []
-    assert len(claimed) == 16
-    assert len(set(claimed)) == 16
+    assert not any(t.is_alive() for t in threads), "worker thread deadlocked"
+    assert len(claimed) == EXPECTED_MISSIONS, (
+        f"expected {EXPECTED_MISSIONS} claimed, got {len(claimed)}"
+    )
+    assert len(set(claimed)) == EXPECTED_MISSIONS, "mission double-claimed"
