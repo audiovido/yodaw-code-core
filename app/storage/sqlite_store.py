@@ -31,13 +31,23 @@ class DuplicateMission(Exception):
 
 ACTIVE_STATUSES = (
     "QUEUED",
+    "OBSERVING",
+    "PLANNING",
     "RUNNING",
+    "EXECUTING",
     "VERIFYING",
     "REPAIRING",
     "RECOVERING",
 )
 
-EXECUTING_STATUSES = ("RUNNING", "VERIFYING", "REPAIRING")
+EXECUTING_STATUSES = (
+    "OBSERVING",
+    "PLANNING",
+    "RUNNING",
+    "EXECUTING",
+    "VERIFYING",
+    "REPAIRING",
+)
 
 
 def _add_column(db, table, column, decl):
@@ -221,10 +231,30 @@ def _migration_3_stage10_governance(db):
         prev = digest
 
 
+def _migration_4_worker_i_product(db):
+    """Worker I: product idempotency keys for exactly-once submit."""
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mission_idempotency (
+            tenant_scope TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_scope, idempotency_key)
+        )
+        """
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_idem_mission "
+        "ON mission_idempotency(mission_id)"
+    )
+
+
 MIGRATIONS = [
     _migration_1_runtime_columns,
     _migration_2_multi_tenant,
     _migration_3_stage10_governance,
+    _migration_4_worker_i_product,
 ]
 
 
@@ -282,8 +312,10 @@ class MissionStore:
         """
         Persist the full mission payload and mirror runtime columns.
 
-        cancel_requested is monotonic: a cancellation requested by
-        the API is never un-set by a coordinator save racing it.
+        cancel_requested is monotonic end to end: a cancellation
+        requested by the API is never un-set by a coordinator save
+        racing it — neither in the runtime column nor inside the
+        JSON payload that every reader consumes.
         """
         payload = mission.model_dump_json()
         now = now_ts()
@@ -299,7 +331,13 @@ class MissionStore:
                 )
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    payload=excluded.payload,
+                    payload=CASE
+                        WHEN missions.cancel_requested=1
+                        THEN json_set(
+                            excluded.payload,
+                            '$.cancel_requested', json('true')
+                        )
+                        ELSE excluded.payload END,
                     status=excluded.status,
                     goal=excluded.goal,
                     repo_key=COALESCE(excluded.repo_key, missions.repo_key),
@@ -393,7 +431,8 @@ class MissionStore:
                 """
                 SELECT id FROM missions
                 WHERE repo_key=? AND goal=? AND id != ? AND status IN
-                    ('QUEUED','RUNNING','VERIFYING','REPAIRING','RECOVERING')
+                    ('QUEUED','OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
                 """,
                 (repo_key, mission.goal, mission.id),
             ).fetchone()
@@ -541,8 +580,8 @@ class MissionStore:
                         """
                         SELECT COUNT(*) FROM missions
                         WHERE client_id=? AND status IN
-                            ('RUNNING','VERIFYING','REPAIRING',
-                             'RECOVERING')
+                            ('OBSERVING','PLANNING','RUNNING','EXECUTING',
+                             'VERIFYING','REPAIRING','RECOVERING')
                         """,
                         (mission.client_id,),
                     ).fetchone()[0]
@@ -616,7 +655,8 @@ class MissionStore:
                 """
                 SELECT payload, cancel_requested FROM missions
                 WHERE id=? AND claimed_by=? AND status IN
-                    ('RUNNING','VERIFYING','REPAIRING')
+                    ('OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
                 """,
                 (mission_id, coordinator_id),
             ).fetchone()
@@ -751,7 +791,9 @@ class MissionStore:
             rows = db.execute(
                 """
                 SELECT payload FROM missions
-                WHERE status IN ('RUNNING','VERIFYING','REPAIRING')
+                WHERE status IN ('OBSERVING','PLANNING','RUNNING',
+                                 'EXECUTING','VERIFYING','REPAIRING',
+                                 'RECOVERING')
                   AND (heartbeat_at IS NULL OR heartbeat_at < ?)
                 """,
                 (cutoff,),
@@ -836,7 +878,8 @@ class MissionStore:
                 """
                 SELECT COUNT(*) FROM missions
                 WHERE client_id=? AND status IN
-                    ('RUNNING','VERIFYING','REPAIRING','RECOVERING')
+                    ('OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
                 """,
                 (client_id,),
             ).fetchone()
@@ -1223,6 +1266,44 @@ class MissionStore:
             "next_attempt_at": row[9],
             "dead_lettered_at": row[10],
         }
+
+    # -----------------------------------------------------
+    # Worker I: product idempotency (exactly-once mission submit)
+    # -----------------------------------------------------
+
+    def idempotency_lookup(
+        self, tenant_scope: str, idempotency_key: str
+    ) -> str | None:
+        with connect(self.path) as db:
+            row = db.execute(
+                "SELECT mission_id FROM mission_idempotency "
+                "WHERE tenant_scope=? AND idempotency_key=?",
+                (tenant_scope, idempotency_key),
+            ).fetchone()
+        return row[0] if row else None
+
+    def idempotency_claim(
+        self, tenant_scope: str, idempotency_key: str, mission_id: str
+    ) -> str:
+        """Claim one key; the winner's mission id wins every replay."""
+        with connect(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT mission_id FROM mission_idempotency "
+                "WHERE tenant_scope=? AND idempotency_key=?",
+                (tenant_scope, idempotency_key),
+            ).fetchone()
+            if row:
+                db.rollback()
+                return row[0]
+            db.execute(
+                "INSERT INTO mission_idempotency("
+                "tenant_scope, idempotency_key, mission_id, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (tenant_scope, idempotency_key, mission_id, now_ts()),
+            )
+            db.commit()
+            return mission_id
 
     def outbox_stats(self) -> dict:
         # Pending means deliverable work: undelivered AND not

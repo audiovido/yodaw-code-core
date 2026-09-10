@@ -12,13 +12,17 @@ def now_iso() -> str:
 
 class MissionStatus(str, Enum):
     queued = "QUEUED"
+    observing = "OBSERVING"
+    planning = "PLANNING"
     running = "RUNNING"
+    executing = "EXECUTING"
     verifying = "VERIFYING"
     repairing = "REPAIRING"
     recovering = "RECOVERING"
     passed = "PASS"
     failed = "FAIL"
     blocked = "BLOCKED"
+    blocked_external = "BLOCKED_EXTERNAL"
     cancelled = "CANCELLED"
 
 
@@ -26,6 +30,7 @@ TERMINAL_STATUSES = {
     MissionStatus.passed,
     MissionStatus.failed,
     MissionStatus.blocked,
+    MissionStatus.blocked_external,
     MissionStatus.cancelled,
 }
 
@@ -34,6 +39,14 @@ class MissionCreate(BaseModel):
     goal: str
     capability: str = "code"
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Worker I product surface (all optional; legacy callers omit).
+    repo_path: str | None = None
+    repo_ref: str | None = None
+    constraints: dict[str, Any] | None = None
+    model: dict[str, Any] | None = None
+    provider: dict[str, Any] | None = None
+    dry_run: bool = False
+    idempotency_key: str | None = None
 
 
 class ClientCreate(BaseModel):
@@ -75,6 +88,15 @@ class Mission(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
+    # Worker I product lifecycle fields (defaulted; old payloads load).
+    # attempt_lineage records mission ids retried from this mission.
+    # retried_from_id records the mission this one retried.
+    # idempotency_key makes resubmission exactly-once per tenant.
+    # error_class is task | provider | blocked_external | cancelled.
+    attempt_lineage: list[str] = Field(default_factory=list)
+    retried_from_id: str | None = None
+    idempotency_key: str | None = None
+    error_class: str | None = None
 
     # Stage 8 runtime fields. All defaulted so Stage 7 payloads
     # and requests keep loading without migration of stored JSON.
