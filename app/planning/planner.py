@@ -174,7 +174,7 @@ class AdvancedPlanner:
         )
         
         plan.revision += 1
-        plan.updated_at = plan.__fields__["updated_at"].default_factory()
+        plan.updated_at = Plan.model_fields["updated_at"].get_default(call_default_factory=True)
         
         self.revisions[plan.id].append(revision)
         return revision
