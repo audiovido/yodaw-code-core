@@ -281,7 +281,14 @@ class PostgresMissionStore:
                     VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s,
                            %s, %s, %s, %s)
                     ON CONFLICT(id) DO UPDATE SET
-                        payload = EXCLUDED.payload,
+                        payload = CASE
+                            WHEN missions.cancel_requested THEN
+                                jsonb_set(
+                                    EXCLUDED.payload,
+                                    '{cancel_requested}',
+                                    'true'::jsonb
+                                )
+                            ELSE EXCLUDED.payload END,
                         status = EXCLUDED.status,
                         goal = EXCLUDED.goal,
                         repo_key = COALESCE(EXCLUDED.repo_key,

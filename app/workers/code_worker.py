@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
@@ -119,7 +120,7 @@ class CodeWorker(Worker):
             # 4) Run tests
             # -------------------------------------------------
             test_result = run(
-                ["python", "-m", "pytest", "-q"],
+                [sys.executable or "python", "-m", "pytest", "-q"],
                 cwd=workdir,
             )
             evidence.append(test_result)

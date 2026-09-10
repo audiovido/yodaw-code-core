@@ -432,6 +432,60 @@ class Coordinator:
                 return
 
             fresh.worker = worker.name
+            store.save(fresh)
+
+            # Worker I product lifecycle: observe/plan/skills context is
+            # recorded through the facade before the existing worker
+            # executes. Stages are events only: the stored status stays
+            # RUNNING until a terminal state, so internal readers that
+            # poll for RUNNING keep working. Dry-run missions finish
+            # here without execution.
+            try:
+                from app.mission.facade import run_product_lifecycle
+
+                if fresh.metadata.get("dry_run"):
+                    run_product_lifecycle(store, fresh, dry_run=True)
+                    return
+                store.record_event(
+                    fresh.id, "mission.observing", attempt=fresh.attempt, data={}
+                )
+                store.record_event(
+                    fresh.id, "mission.planning", attempt=fresh.attempt, data={}
+                )
+                repo_path = fresh.metadata.get("repo_path")
+                if repo_path:
+                    try:
+                        from app.mission.facade import observe_repo
+
+                        repo_context = observe_repo(repo_path)
+                    except Exception:
+                        repo_context = {"observed": False}
+                else:
+                    repo_context = {"observed": False}
+                try:
+                    from app.mission.facade import build_plan, select_skills
+
+                    plan_info = build_plan(fresh.goal, repo_context)
+                    skill_info = select_skills(fresh.goal, repo_context)
+                except Exception:
+                    plan_info, skill_info = {}, {}
+                fresh = store.get(fresh.id) or fresh
+                evidence = list(fresh.evidence)
+                evidence.append(
+                    {
+                        "type": "product_context",
+                        "repo": repo_context,
+                        "plan": plan_info,
+                        "skills": skill_info,
+                    }
+                )
+                fresh.evidence = evidence
+                store.save(fresh)
+                store.record_event(
+                    fresh.id, "mission.executing", attempt=fresh.attempt, data={}
+                )
+            except Exception:
+                fresh = store.get(fresh.id) or fresh
 
             metadata = dict(fresh.metadata)
             metadata["mission_id"] = fresh.id
@@ -517,11 +571,28 @@ class Coordinator:
             if result.get("error"):
                 fresh.result["error"] = result["error"]
 
-            fresh.status = (
-                MissionStatus.passed
-                if result.get("success")
-                else MissionStatus.failed
-            )
+            # Worker I: verify stage, then classify so provider faults
+            # surface as BLOCKED_EXTERNAL instead of task FAIL.
+            fresh.status = MissionStatus.verifying
+            store.save(fresh)
+            try:
+                from app.mission.facade import classify_error
+
+                error_class = (
+                    None
+                    if result.get("success")
+                    else classify_error(result.get("error"))
+                )
+            except Exception:
+                error_class = None if result.get("success") else "task"
+            if result.get("success"):
+                fresh.status = MissionStatus.passed
+            elif error_class == "provider":
+                fresh.status = MissionStatus.blocked_external
+                fresh.error_class = "provider"
+            else:
+                fresh.status = MissionStatus.failed
+                fresh.error_class = "task"
             fresh.finished_at = now_ts()
 
             store.save(fresh)

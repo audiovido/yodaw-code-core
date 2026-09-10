@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>YODAW Mission Operator</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 24px; max-width: 760px; }
+textarea { width: 100%; min-height: 88px; }
+button { margin: 6px 6px 6px 0; }
+#status { font-weight: bold; }
+pre { background: #f4f4f4; padding: 12px; white-space: pre-wrap; }
+.row { margin: 12px 0; }
+</style>
+</head>
+<body>
+<h1>YODAW Mission Operator</h1>
+<div class="row">
+<label for="goal">Mission goal</label><br />
+<textarea id="goal" placeholder="Describe the coding mission goal"></textarea>
+</div>
+<div class="row">
+<label for="repo">Repo path (optional)</label><br />
+<input id="repo" type="text" style="width:100%" placeholder="/path/to/repo" />
+</div>
+<div class="row">
+<button id="submit">Submit mission</button>
+<button id="cancel" disabled>Cancel</button>
+<button id="retry" disabled>Retry</button>
+<button id="copy" disabled>Copy result</button>
+</div>
+<div class="row">Mission: <span id="missionId">none</span></div>
+<div class="row">Status: <span id="status">idle</span></div>
+<h2>Evidence / log</h2>
+<pre id="log">No mission submitted.</pre>
+<h2>Final result</h2>
+<pre id="result">None yet.</pre>
+<script>
+const goalEl = document.getElementById('goal');
+const repoEl = document.getElementById('repo');
+const missionEl = document.getElementById('missionId');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const resultEl = document.getElementById('result');
+const submitBtn = document.getElementById('submit');
+const cancelBtn = document.getElementById('cancel');
+const retryBtn = document.getElementById('retry');
+const copyBtn = document.getElementById('copy');
+let missionId = null;
+let timer = null;
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch (e) { body = {raw: text}; }
+  if (!res.ok) throw new Error((body && (body.detail || body.error)) || res.statusText);
+  return body;
+}
+
+async function poll() {
+  if (!missionId) return;
+  const mission = await fetchJSON('/api/v1/missions/' + missionId);
+  statusEl.textContent = mission.status;
+  resultEl.textContent = JSON.stringify(mission.result || {}, null, 2);
+  const ev = await fetchJSON('/api/v1/missions/' + missionId + '/evidence');
+  logEl.textContent = JSON.stringify(ev.evidence || [], null, 2).slice(0, 20000);
+  const terminal = ['PASS', 'FAIL', 'BLOCKED', 'BLOCKED_EXTERNAL', 'CANCELLED'];
+  const done = terminal.includes(mission.status);
+  cancelBtn.disabled = done || !missionId;
+  retryBtn.disabled = !done;
+  copyBtn.disabled = !done;
+  if (done && timer) { clearInterval(timer); timer = null; }
+}
+
+submitBtn.onclick = async () => {
+  const goal = goalEl.value.trim();
+  if (!goal) { alert('Enter a mission goal'); return; }
+  const body = {goal: goal, capability: 'repo-code', metadata: {dry_run: false}};
+  if (repoEl.value.trim()) body.repo_path = repoEl.value.trim();
+  const created = await fetchJSON('/api/v1/missions', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  missionId = created.mission_id || created.id;
+  missionEl.textContent = missionId;
+  statusEl.textContent = created.status;
+  cancelBtn.disabled = false;
+  retryBtn.disabled = true;
+  copyBtn.disabled = true;
+  if (timer) clearInterval(timer);
+  timer = setInterval(poll, 1500);
+  poll();
+};
+
+cancelBtn.onclick = async () => {
+  if (!missionId) return;
+  await fetchJSON('/api/v1/missions/' + missionId + '/cancel', {method: 'POST'});
+  poll();
+};
+
+retryBtn.onclick = async () => {
+  if (!missionId) return;
+  const retried = await fetchJSON('/api/v1/missions/' + missionId + '/retry', {method: 'POST'});
+  missionId = retried.mission_id;
+  missionEl.textContent = missionId;
+  if (timer) clearInterval(timer);
+  timer = setInterval(poll, 1500);
+  poll();
+};
+
+copyBtn.onclick = async () => {
+  await navigator.clipboard.writeText(resultEl.textContent);
+};
+</script>
+</body>
+</html>

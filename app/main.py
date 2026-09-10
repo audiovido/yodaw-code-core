@@ -64,6 +64,13 @@ from app.tenants.audit import AuditStore
 from app.tenants.clients import ClientStore
 from app.workers.registry import registry
 from app.learning.engine import store as learning_store
+from app.api.v1.missions import (
+    ProductMissionSubmit,
+    capabilities_view,
+    product_view,
+    retry_product_mission,
+    submit_product_mission,
+)
 
 
 store = MissionStore()
@@ -405,9 +412,31 @@ def _load_mission_for(principal: Principal, mission_id: str) -> Mission:
 
 @app.post("/api/v1/missions")
 def create_mission(
-    request: MissionCreate,
+    request: ProductMissionSubmit,
     authorization: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    # Canonical product submit (superset of the legacy shape): top-level
+    # repo/model/provider/dry-run/idempotency fields are first-class,
+    # and legacy callers that nest them under metadata keep working.
+    metadata = dict(request.metadata or {})
+    dry_run = bool(request.dry_run or metadata.pop("dry_run", False))
+    body_key = request.idempotency_key or metadata.pop("idempotency_key", None)
+    for alias in ("repo_path", "repo_ref", "repo"):
+        if metadata.get(alias) and "repo_path" not in metadata:
+            metadata["repo_path"] = metadata[alias]
+    product_request = ProductMissionSubmit(
+        goal=request.goal,
+        repo_path=request.repo_path or metadata.get("repo_path"),
+        repo_ref=request.repo_ref or metadata.get("repo_ref"),
+        capability=request.capability,
+        constraints=request.constraints or metadata.get("constraints"),
+        model=request.model or metadata.get("preferred_model") or metadata.get("model"),
+        provider=request.provider or metadata.get("preferred_provider") or metadata.get("provider"),
+        metadata=metadata,
+        dry_run=dry_run,
+        idempotency_key=body_key,
+    )
     principal = resolve_principal(authorization)
 
     if not principal.can("missions.create"):
@@ -419,8 +448,8 @@ def create_mission(
 
     # Governance before any expensive processing (Stage 10.4).
     ok, reason = check_payload_governance(
-        goal=request.goal,
-        metadata=request.metadata,
+        goal=product_request.goal,
+        metadata=product_request.metadata,
         config=_governance_config_for(principal),
     )
 
@@ -473,19 +502,21 @@ def create_mission(
         )
 
     # Validate capability before persisting.
-    worker = registry.find(request.capability)
+    worker = registry.find(product_request.capability)
 
     if worker is None:
         mission = Mission(
-            goal=request.goal,
-            capability=request.capability,
-            metadata=request.metadata,
+            goal=product_request.goal,
+            capability=product_request.capability,
+            metadata=dict(product_request.metadata or {}),
             client_id=principal.client_id,
             priority=principal.priority,
+            idempotency_key=product_request.idempotency_key,
         )
         mission.status = MissionStatus.blocked
+        mission.error_class = "task"
         mission.result = {
-            "error": f"No worker for capability: {request.capability}"
+            "error": f"No worker for capability: {product_request.capability}"
         }
         mission.finished_at = mission.updated_at
         store.save(mission)
@@ -497,14 +528,22 @@ def create_mission(
             mission_id=mission.id,
             data={
                 "reason": "no_worker",
-                "capability": request.capability,
+                "capability": product_request.capability,
                 "client": principal.name,
             },
         )
 
         return {
             "id": mission.id,
+            "mission_id": mission.id,
             "status": mission.status.value,
+            "created_at": mission.created_at,
+            "links": {
+                "self": f"/api/v1/missions/{mission.id}",
+                "evidence": f"/api/v1/missions/{mission.id}/evidence",
+                "cancel": f"/api/v1/missions/{mission.id}/cancel",
+                "retry": f"/api/v1/missions/{mission.id}/retry",
+            },
             "detail": "no worker for capability; mission blocked",
         }
 
@@ -536,45 +575,29 @@ def create_mission(
             ),
         )
 
-    mission = Mission(
-        goal=request.goal,
-        capability=request.capability,
-        metadata=request.metadata,
-        client_id=principal.client_id,
-        priority=principal.priority,
-    )
-
-    try:
+    def _enqueue(mission):
         store.enqueue(mission)
-    except DuplicateMission as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=str(exc),
-            headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
-        )
+        return mission
 
-    audit.append(
-        client_id=principal.client_id,
-        actor=principal.name,
-        action="mission.created",
-        mission_id=mission.id,
-        data={
-            "goal": mission.goal,
-            "capability": mission.capability,
-            "priority": mission.priority,
-            "client": principal.name,
-        },
+    def _wake():
+        coordinator = get_coordinator()
+        if coordinator is not None:
+            coordinator.wake()
+
+    mission, replayed = submit_product_mission(
+        store=store,
+        audit=audit,
+        principal=principal,
+        request=product_request,
+        header_key=idempotency_key,
+        enqueue=_enqueue,
+        wake=_wake,
     )
-
-    coordinator = get_coordinator()
-
-    if coordinator is not None:
-        coordinator.wake()
-
-    return {
-        "id": mission.id,
-        "status": mission.status.value,
-    }
+    view = product_view(mission)
+    # Legacy keys stay for backward compatibility with Stage 8/9/10.
+    view["id"] = mission.id
+    view["replayed"] = replayed
+    return view
 
 
 @app.get("/api/v1/missions")
@@ -1212,3 +1235,146 @@ def dead_letter_outbox(
     )
 
     return {"dead_lettered": outbox_id}
+
+# ---------------------------------------------------------
+# Worker I: canonical product mission surface
+# ---------------------------------------------------------
+
+@app.get("/api/v1/status")
+def product_status(authorization: str | None = Header(default=None)):
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+    return {
+        "service": "YODAW",
+        "status": "READY",
+        "auth": auth_mode(),
+        "missions": store.status_counts(),
+        "workers": registry.status(),
+    }
+
+
+@app.get("/api/v1/capabilities")
+def product_capabilities(
+    authorization: str | None = Header(default=None),
+):
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+    return capabilities_view(registry)
+
+
+@app.post("/api/v1/missions/{mission_id}/retry")
+def retry_mission(
+    mission_id: str,
+    authorization: str | None = Header(default=None),
+):
+    principal = resolve_principal(authorization)
+    if principal.kind == "client":
+        probe = store.get(mission_id)
+        if not probe or probe.client_id != principal.client_id:
+            raise HTTPException(404, "Mission not found")
+    if not (
+        principal.can("missions.retry")
+        or principal.can("missions.create")
+        or principal.can("missions.cancel.own")
+    ):
+        raise HTTPException(403, detail="missing permission: missions.retry")
+    _enforce_rate_limit(principal)
+    mission = _load_mission_for(principal, mission_id)
+
+    def _wake():
+        coordinator = get_coordinator()
+        if coordinator is not None:
+            coordinator.wake()
+
+    retried = retry_product_mission(
+        store=store, audit=audit, principal=principal, mission=mission
+    )
+    _wake()
+    return {
+        "mission_id": retried.id,
+        "retried_from": mission_id,
+        "status": retried.status.value,
+        "links": {
+            "self": f"/api/v1/missions/{retried.id}",
+            "evidence": f"/api/v1/missions/{retried.id}/evidence",
+        },
+    }
+
+
+@app.post("/api/v1/product/missions")
+def create_product_mission_alias(
+    request: ProductMissionSubmit,
+    authorization: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    return create_product_mission(request, authorization, idempotency_key)
+
+
+def _create_product_mission_impl(
+    request: ProductMissionSubmit,
+    authorization: str | None,
+    idempotency_key: str | None,
+):
+    principal = resolve_principal(authorization)
+    if not principal.can("missions.create"):
+        raise HTTPException(403, detail="missing permission: missions.create")
+    _enforce_rate_limit(principal)
+    ok, reason = check_payload_governance(
+        goal=request.goal,
+        metadata={**(request.metadata or {}), "repo": request.repo_path or request.repo_ref},
+        config=_governance_config_for(principal),
+    )
+    if not ok:
+        raise HTTPException(413, detail=reason)
+
+    def _enqueue(mission):
+        worker = registry.find(mission.capability)
+        if worker is None:
+            mission.status = MissionStatus.blocked
+            mission.error_class = "task"
+            mission.result = {
+                "error": f"No worker for capability: {mission.capability}"
+            }
+            mission.finished_at = mission.updated_at
+            store.save(mission)
+            return mission
+        store.enqueue(mission)
+        return mission
+
+    def _wake():
+        coordinator = get_coordinator()
+        if coordinator is not None:
+            coordinator.wake()
+
+    mission, replayed = submit_product_mission(
+        store=store,
+        audit=audit,
+        principal=principal,
+        request=request,
+        header_key=idempotency_key,
+        enqueue=_enqueue,
+        wake=_wake,
+    )
+    view = product_view(mission)
+    view["replayed"] = replayed
+    return view
+
+
+@app.post("/api/v1/product-missions")
+def create_product_mission(
+    request: ProductMissionSubmit,
+    authorization: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    return _create_product_mission_impl(request, authorization, idempotency_key)
+
+
+try:
+    from fastapi.staticfiles import StaticFiles
+    from pathlib import Path as _Path
+
+    _product_static = _Path(__file__).resolve().parent / "product" / "static"
+    _product_static.mkdir(parents=True, exist_ok=True)
+    app.mount("/product", StaticFiles(directory=str(_product_static), html=True), name="product")
+except Exception:
+    pass
