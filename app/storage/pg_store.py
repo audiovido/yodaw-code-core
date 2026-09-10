@@ -900,6 +900,29 @@ class PostgresMissionStore:
                 )
             db.commit()
 
+    def outbox_mark_delivered_if_pending(self, outbox_id: int) -> bool:
+        """
+        Atomic claim of the delivery acknowledgment (see the SQLite
+        adapter for the contract). One winner; losers delivered a
+        replay that idempotent handlers absorb.
+        """
+        with self._connect() as db:
+            with db.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE mission_outbox
+                    SET delivered_at=%s, attempts=attempts+1,
+                        next_attempt_at=NULL
+                    WHERE id=%s AND delivered_at IS NULL
+                      AND dead_lettered_at IS NULL
+                    """,
+                    (now_ts(), outbox_id),
+                )
+                won = cur.rowcount > 0
+
+            db.commit()
+            return won
+
     def outbox_mark_failed(self, outbox_id: int, error: str) -> None:
         now = now_ts()
 

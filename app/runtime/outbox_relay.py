@@ -262,10 +262,18 @@ class OutboxRelay:
 
         for message in messages:
             try:
+                # Handler first, then an atomic acknowledgment: two
+                # relays may both run the handler (at-least-once
+                # transport), but exactly one wins the mark and a
+                # replay is absorbed by the handler's idempotency
+                # (deterministic record id / upsert).
                 self._handle(message)
-                self.store.outbox_mark_delivered(message["id"])
-                delivered += 1
-                self._delivered += 1
+
+                if self.store.outbox_mark_delivered_if_pending(
+                    message["id"]
+                ):
+                    delivered += 1
+                    self._delivered += 1
             except Exception as exc:
                 self._failures += 1
                 self.store.outbox_mark_failed(

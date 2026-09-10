@@ -113,6 +113,20 @@ def _ensure_table(db) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_seq_hash "
         "ON audit_events(seq, event_hash)"
     )
+    # Retention boundaries: after a prune, the first surviving row
+    # still links (prev_hash) to the pruned segment's head. The
+    # anchor row records that head so verify() can confirm the
+    # linkage instead of reporting a false break.
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_chain_anchors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            up_to_seq INTEGER NOT NULL,
+            head_hash TEXT NOT NULL,
+            pruned_at TEXT NOT NULL
+        )
+        """
+    )
 
 
 class AuditStore:
@@ -316,12 +330,32 @@ class AuditStore:
                 """
             ).fetchall()
 
+        anchors = self._anchors()
+        anchor_hashes = {a["head_hash"] for a in anchors}
+
         prev = None
         verified_through = None
 
         for row in rows:
             seq, ts, actor, client_id, action, mission_id, data, \
                 stored_prev, stored_hash = row
+
+            if prev is None and stored_prev is not None:
+                # First surviving row links to pruned history;
+                # accept only when a recorded retention boundary
+                # anchors that link, then resume the chain from
+                # the anchor hash. A missing or forged anchor
+                # fails verification.
+                if stored_prev not in anchor_hashes:
+                    return {
+                        "intact": False,
+                        "events": len(rows),
+                        "verified_through": None,
+                        "broken_at": seq,
+                        "reason": "first row links to unknown history",
+                    }
+
+                prev = stored_prev
 
             canonical = canonical_event_payload(
                 seq=seq,
@@ -353,6 +387,25 @@ class AuditStore:
             "broken_at": None,
             "reason": None,
         }
+
+    def _anchors(self) -> list[dict]:
+        with sqlite3.connect(self.path) as db:
+            rows = db.execute(
+                """
+                SELECT up_to_seq, head_hash, pruned_at
+                FROM audit_chain_anchors
+                ORDER BY up_to_seq ASC
+                """
+            ).fetchall()
+
+        return [
+            {
+                "up_to_seq": row[0],
+                "head_hash": row[1],
+                "pruned_at": row[2],
+            }
+            for row in rows
+        ]
 
     # -----------------------------------------------------
     # Retention (10.5)
@@ -454,6 +507,15 @@ class AuditStore:
 
             db.execute(
                 "DELETE FROM audit_events WHERE ts < ?", (cutoff,)
+            )
+            db.execute(
+                """
+                INSERT INTO audit_chain_anchors(
+                    up_to_seq, head_hash, pruned_at
+                )
+                VALUES(?, ?, ?)
+                """,
+                (head_seq, head_hash, now_ts()),
             )
             db.commit()
 

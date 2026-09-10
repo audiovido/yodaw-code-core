@@ -105,16 +105,25 @@ def _rate_limit_enabled() -> bool:
 _rate_backend = MissionStore(store.path)
 rate_limiter = RateLimiter(
     _rate_backend,
-    enabled=_rate_limit_enabled(),
-    config=RateLimitConfig(
-        requests_per_minute=int(
-            os.environ.get("YODAW_RATE_LIMIT_RPM", "60") or 60
-        ) or 60,
-        missions_per_minute=int(
-            os.environ.get("YODAW_MISSIONS_PER_MINUTE", "10") or 10
-        ) or 10,
-    ),
+    enabled_provider=_rate_limit_enabled,
 )
+
+
+def _rate_limits_now() -> tuple[int, int, int]:
+    """Live (rpm, burst, missions_per_minute) from the environment,
+    so configuration changes apply without a process restart."""
+    def _int(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)) or default)
+        except ValueError:
+            value = default
+        return value if value > 0 else default
+
+    return (
+        _int("YODAW_RATE_LIMIT_RPM", 60),
+        _int("YODAW_RATE_LIMIT_BURST", 10),
+        _int("YODAW_MISSIONS_PER_MINUTE", 10),
+    )
 
 
 def _governance_config_for(principal: Principal):
@@ -135,7 +144,11 @@ def _enforce_rate_limit(principal: Principal) -> None:
         f"{principal.kind}:{principal.name}"
     )
 
-    allowed, retry_after = rate_limiter.check(bucket_key)
+    rpm, burst, _ = _rate_limits_now()
+
+    allowed, retry_after = rate_limiter.check(
+        bucket_key, rpm=rpm, burst=burst
+    )
 
     if not allowed:
         audit.append(
@@ -154,7 +167,7 @@ def _enforce_rate_limit(principal: Principal) -> None:
             detail="rate limit exceeded",
             headers={
                 "Retry-After": str(max(1, int(retry_after) + 1)),
-                "X-RateLimit-Limit": str(DEFAULT_RATE.requests_per_minute),
+                "X-RateLimit-Limit": str(rpm),
                 "X-RateLimit-Remaining": "0",
             },
         )
@@ -423,10 +436,12 @@ def create_mission(
         f"{principal.kind}:{principal.name}"
     )
 
+    _, _, missions_per_minute = _rate_limits_now()
+
     allowed, retry_after = rate_limiter.check(
         f"missions:{bucket_key}",
-        rpm=DEFAULT_RATE.missions_per_minute,
-        burst=DEFAULT_RATE.missions_per_minute,
+        rpm=missions_per_minute,
+        burst=missions_per_minute,
     )
 
     if not allowed:
@@ -632,19 +647,25 @@ def cancel_mission(
 ):
     principal = resolve_principal(authorization)
 
-    if not principal.can("missions.cancel"):
+    # Isolation first: a client may only ever touch its own
+    # mission, so the existence check happens before RBAC. This
+    # also lets the missions.cancel.own permission serve client
+    # self-service cancellation without widening RBAC.
+    if principal.kind == "client":
+        mission = store.get(mission_id)
+
+        if not mission or mission.client_id != principal.client_id:
+            raise HTTPException(404, "Mission not found")
+
+    if not (
+        principal.can("missions.cancel")
+        or principal.can("missions.cancel.own")
+    ):
         raise HTTPException(
             403, detail="missing permission: missions.cancel"
         )
 
     _enforce_rate_limit(principal)
-
-    if principal.kind == "client":
-        # Clients cancel only their own missions.
-        mission = store.get(mission_id)
-
-        if not mission or mission.client_id != principal.client_id:
-            raise HTTPException(404, "Mission not found")
 
     outcome = store.request_cancel(mission_id)
 

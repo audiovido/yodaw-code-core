@@ -1000,6 +1000,29 @@ class MissionStore:
                 (now_ts(), outbox_id),
             )
 
+    def outbox_mark_delivered_if_pending(self, outbox_id: int) -> bool:
+        """
+        Atomic claim of the delivery acknowledgment.
+
+        Exactly one concurrent relay wins the mark; the loser has
+        delivered a replay (at-least-once transport), which
+        idempotent handlers absorb. Crash between handler and mark
+        leaves the message pending for safe redelivery.
+        """
+        with connect(self.path) as db:
+            cursor = db.execute(
+                """
+                UPDATE mission_outbox
+                SET delivered_at=?, attempts=attempts+1,
+                    next_attempt_at=NULL
+                WHERE id=? AND delivered_at IS NULL
+                  AND dead_lettered_at IS NULL
+                """,
+                (now_ts(), outbox_id),
+            )
+
+            return cursor.rowcount > 0
+
     def outbox_mark_failed(self, outbox_id: int, error: str) -> None:
         """
         Record a failed delivery attempt.
@@ -1061,6 +1084,33 @@ class MissionStore:
                 """,
                 (now_ts(), outbox_id),
             )
+
+    def outbox_list_dead(self, limit: int = 200) -> list[dict]:
+        """Dead-lettered messages, oldest first, for inspection."""
+        with connect(self.path) as db:
+            rows = db.execute(
+                """
+                SELECT id, mission_id, kind, attempts, last_error,
+                       dead_lettered_at
+                FROM mission_outbox
+                WHERE dead_lettered_at IS NOT NULL
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "mission_id": row[1],
+                "kind": row[2],
+                "attempts": row[3],
+                "last_error": row[4],
+                "dead_lettered_at": row[5],
+            }
+            for row in rows
+        ]
 
     def outbox_requeue_dead(self, outbox_id: int | None = None) -> int:
         """

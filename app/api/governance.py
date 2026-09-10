@@ -79,15 +79,25 @@ class RateLimiter:
         backend,
         clock=None,
         config: RateLimitConfig | None = None,
-        enabled: bool = True,
+        enabled: bool | None = None,
+        enabled_provider=None,
     ):
         self.backend = backend
         self.clock = clock or (
             lambda: __import__("time").time()
         )
         self.config = config or RateLimitConfig()
-        self.enabled = enabled
+        self.enabled = enabled if enabled is not None else True
+        self.enabled_provider = enabled_provider
         self._lock = threading.Lock()
+
+    @property
+    def active(self) -> bool:
+        """Whether enforcement is on right now (provider wins)."""
+        if self.enabled_provider is not None:
+            return bool(self.enabled_provider())
+
+        return self.enabled
 
     def check(
         self,
@@ -103,7 +113,7 @@ class RateLimiter:
         Returns (allowed, retry_after_seconds). retry_after is 0.0
         when allowed. Disabled limiters admit everything.
         """
-        if not self.enabled:
+        if not self.active:
             return True, 0.0
 
         cfg = self.config

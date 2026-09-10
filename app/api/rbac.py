@@ -45,6 +45,7 @@ PERMISSIONS = {
         # isolation: client reads are scoped to own missions in
         # the API layer; this role has no administrative surface
         "missions.create",
+        "missions.cancel.own",  # own missions only (isolation-scoped)
     },
 }
 
