@@ -13,6 +13,7 @@ imported, so:
 import os
 import sys
 import tempfile
+import pytest
 from pathlib import Path
 
 _TMPDIR = tempfile.mkdtemp(prefix="yodaw_test_")
@@ -25,3 +26,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Make project-root imports work regardless of invocation dir.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _clean_admin_table():
+    """Clean admin table before each test module for isolation."""
+    from app.tenants.admins import AdminStore
+    from pathlib import Path
+
+    db_path = Path(os.environ["YODAW_DB_PATH"])
+    # Ensure table exists and clean it
+    store = AdminStore(db_path)
+    # Delete all admins by truncating the table
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM api_admins")
+        conn.commit()
+    yield
+    # Clean up after module too
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM api_admins")
+        conn.commit()
