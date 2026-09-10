@@ -208,7 +208,11 @@ def submit_product_mission(
         },
     )
     wake()
-    return store.get(mission.id) or mission, False
+    # Return the enqueue-time snapshot, not a re-read: the coordinator
+    # may legitimately claim the mission between enqueue and response,
+    # and POST must report the submission outcome (QUEUED), never a
+    # concurrently-advanced execution state.
+    return mission, False
 
 
 def retry_product_mission(*, store, audit, principal, mission: Mission) -> Mission:
