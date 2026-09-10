@@ -1,0 +1,114 @@
+name: coder-regression
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  fast-gates:
+    name: fast-gates (skills / repo-intelligence / planning / eval)
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure python resolves to Python 3.12
+        run: |
+          python --version
+          test "$(python -c 'import sys; print(sys.version_info[0], sys.version_info[1])')" = "3 12"
+
+      - name: Raise open file limit (where supported)
+        run: ulimit -n 4096 || ulimit -Sn 4096 || true
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Gate 1 - skills tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_skills_*.py -q 2>&1 | tee pytest-gate-skills.log
+
+      - name: Gate 2 - repo intelligence tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_repo_*.py -q 2>&1 | tee pytest-gate-repo-intelligence.log
+
+      - name: Gate 3 - planning tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_planning.py -q 2>&1 | tee pytest-gate-planning.log
+
+      - name: Gate 4 - eval tests
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_eval_*.py -q 2>&1 | tee pytest-gate-eval.log
+
+      - name: Upload gate evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-gates-logs
+          path: pytest-gate-*.log
+          if-no-files-found: ignore
+
+  full-regression:
+    name: full-regression (python 3.12, ${{ matrix.os }})
+    needs:
+      - fast-gates
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure python resolves to Python 3.12
+        run: |
+          python --version
+          test "$(python -c 'import sys; print(sys.version_info[0], sys.version_info[1])')" = "3 12"
+
+      - name: Raise open file limit (where supported)
+        run: ulimit -n 4096 || ulimit -Sn 4096 || true
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run full pytest suite
+        run: |
+          set -o pipefail
+          python -m pytest tests/ -q 2>&1 | tee pytest-full.log
+
+      - name: Upload test evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-regression-logs-${{ matrix.os }}
+          path: pytest-full.log
+          if-no-files-found: ignore
