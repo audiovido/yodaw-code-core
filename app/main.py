@@ -290,6 +290,21 @@ def get_coordinator():
     return _coordinator
 
 
+def instantiated_backend() -> str:
+    """
+    The storage backend this process is actually running on.
+
+    Derived from the live store object rather than from configuration,
+    so readiness can never report Postgres while the process is
+    serving from SQLite.
+    """
+    from app.storage.pg_store import PostgresMissionStore
+
+    return (
+        "postgres" if isinstance(store, PostgresMissionStore) else "sqlite"
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app):
     """
@@ -297,10 +312,29 @@ async def lifespan(_app):
     unsafe production combinations (Stage 10.7).
     """
     try:
-        load_config()
+        cfg = load_config()
     except Exception as exc:
         # Surface the ConfigError message in the failure.
         raise RuntimeError(f"configuration rejected: {exc}") from exc
+
+    # Deployment truth: refuse to start when the profile demands a
+    # backend this process did not instantiate. Otherwise a production
+    # config with YODAW_DATABASE_URL set would load cleanly, claim
+    # Postgres in /health and /runtime/status, and silently serve from
+    # a local SQLite file.
+    actual_backend = instantiated_backend()
+
+    if cfg.backend != actual_backend:
+        raise RuntimeError(
+            "configuration rejected: profile "
+            f"{cfg.profile!r} requires the {cfg.backend!r} storage "
+            f"backend, but this process instantiated {actual_backend!r}. "
+            f"The {cfg.backend!r} backend is not wired into the API "
+            "process, so starting would silently serve from the wrong "
+            "database. Run the supported trusted single-node deployment "
+            "(YODAW_PROFILE=single-node with no YODAW_DATABASE_URL), or "
+            "unset YODAW_DATABASE_URL."
+        )
 
     get_coordinator()
     yield
@@ -571,6 +605,7 @@ def health():
         "config_ok": config_ok,
         "config_error": config_error,
         "profile": cfg.profile if cfg else None,
+        "storage_backend": instantiated_backend(),
         "repository_bound": repo_roots_report(),
     }
 
@@ -634,7 +669,11 @@ def runtime_status(
         cfg = load_config()
         profile_state = {
             "profile": cfg.profile,
+            # `backend` is what configuration asks for;
+            # `instantiated_backend` is what this process is really
+            # running on. They must agree or startup refuses.
             "backend": cfg.backend,
+            "instantiated_backend": instantiated_backend(),
             "auth_mode": cfg.auth_mode,
             "require_auth": cfg.require_auth,
             "embed_coordinator": cfg.embed_coordinator,
@@ -644,6 +683,8 @@ def runtime_status(
     except Exception as exc:
         profile_state = {
             "profile": None,
+            "backend": None,
+            "instantiated_backend": instantiated_backend(),
             "config_error": str(exc),
         }
 
