@@ -308,6 +308,73 @@ class MissionStore:
     # CRUD
     # -----------------------------------------------------
 
+    # ------------------------------------------------- transactions
+    def transact_mission(self, mission_id: str, fn):
+        """Apply fn(current) atomically; None from fn means no write.
+
+        The read-modify-write runs in one immediate transaction so
+        concurrent writers never lose each other's updates.
+        """
+        import json
+
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT payload FROM missions WHERE id=?",
+                (mission_id,),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                return None
+            mission = Mission.model_validate_json(row[0])
+            updated = fn(mission)
+            if updated is None:
+                db.rollback()
+                return None
+            payload = updated.model_dump_json()
+            now = now_ts()
+            db.execute(
+                """
+                UPDATE missions SET
+                    payload=?,
+                    status=?,
+                    goal=?,
+                    repo_key=COALESCE(?, repo_key),
+                    claimed_by=?,
+                    claimed_at=?,
+                    heartbeat_at=?,
+                    cancel_requested=CASE
+                        WHEN missions.cancel_requested=1 THEN 1
+                        ELSE ? END,
+                    updated_at=?,
+                    client_id=COALESCE(?, client_id),
+                    priority=?
+                WHERE id=?
+                """,
+                (
+                    payload,
+                    updated.status.value,
+                    updated.goal,
+                    self._repo_key(updated),
+                    updated.claimed_by,
+                    updated.claimed_at,
+                    updated.heartbeat_at,
+                    int(updated.cancel_requested),
+                    now,
+                    updated.client_id,
+                    updated.priority,
+                    mission_id,
+                ),
+            )
+            db.commit()
+            return updated
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     def save(self, mission: Mission):
         """
         Persist the full mission payload and mirror runtime columns.
