@@ -31,6 +31,7 @@ class ProductMissionSubmit(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     dry_run: bool = False
     idempotency_key: str | None = None
+    dependencies: list[str] | None = None
 
 
 def tenant_scope(principal: Principal) -> str:
@@ -127,6 +128,9 @@ def build_metadata(request: ProductMissionSubmit) -> dict:
     metadata["max_retries"] = metadata.get(
         "max_retries", MAX_RETRY_ATTEMPTS - 1
     )
+    if request.dependencies is not None:
+        metadata["dependencies"] = request.dependencies
+        print(f"DEBUG: Added dependencies {request.dependencies} to metadata")
     return metadata
 
 
@@ -167,6 +171,7 @@ def submit_product_mission(
         if replay is not None:
             return replay, True
     metadata = build_metadata(request)
+    print(f"DEBUG: submit_product_mission: creating mission with goal={request.goal}, capability={request.capability}", flush=True)
     mission = Mission(
         goal=request.goal,
         capability=request.capability,
@@ -175,6 +180,7 @@ def submit_product_mission(
         priority=principal.priority,
         idempotency_key=key,
     )
+    print(f"DEBUG: submit_product_mission: mission created with id={mission.id}, status={mission.status}", flush=True)
     claimed_id = mission.id
     if key and hasattr(store, "submit_idempotent_mission"):
         if request.dry_run:

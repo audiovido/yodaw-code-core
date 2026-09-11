@@ -31,6 +31,7 @@ def poll_mission(
         assert response.status_code == 200
 
         mission = response.json()
+        print(f"DEBUG poll_mission: mission {mission_id} status={mission['status']}", flush=True)
 
         if mission["status"] in TERMINAL:
             return mission

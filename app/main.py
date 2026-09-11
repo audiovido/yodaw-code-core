@@ -853,6 +853,7 @@ def create_mission(
     authorization: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
+    print(f"DEBUG: create_mission called with request: {request}", flush=True)
     # Canonical product submit (superset of the legacy shape): top-level
     # repo/model/provider/dry-run/idempotency fields are first-class,
     # and legacy callers that nest them under metadata keep working.
