@@ -1427,12 +1427,19 @@ class MissionStore:
                     "SELECT payload FROM missions WHERE id=?",
                     (row[0],),
                 ).fetchone()
-                db.rollback()
-                if not winner:
-                    # Crash window row with no mission: treat as
-                    # missing so the resubmit claims fresh.
-                    return mission, False
-                return Mission.model_validate_json(winner[0]), True
+                if winner:
+                    db.rollback()
+                    return Mission.model_validate_json(winner[0]), True
+                # Legacy dangling mapping (pre-atomic crash row):
+                # heal it by pointing at this submission inside
+                # the same transaction, then fall through to the
+                # mission insert below so both rows commit once.
+                db.execute(
+                    "UPDATE mission_idempotency SET mission_id=?, "
+                    "created_at=? WHERE tenant_scope=? "
+                    "AND idempotency_key=?",
+                    (mission.id, now_ts(), tenant_scope, idempotency_key),
+                )
             repo_key = self._repo_key(mission)
             dup = db.execute(
                 """
@@ -1459,11 +1466,12 @@ class MissionStore:
                     cancel_requested, created_at, updated_at,
                     client_id, priority
                 )
-                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
                 """,
                 (
                     mission.id,
                     mission.model_dump_json(),
+                    mission.status.value,
                     mission.goal,
                     repo_key,
                     mission.created_at,
@@ -1475,7 +1483,10 @@ class MissionStore:
             db.execute(
                 "INSERT INTO mission_idempotency("
                 "tenant_scope, idempotency_key, mission_id, created_at) "
-                "VALUES(?, ?, ?, ?)",
+                "VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(tenant_scope, idempotency_key) DO UPDATE "
+                "SET mission_id=excluded.mission_id, "
+                "created_at=excluded.created_at",
                 (tenant_scope, idempotency_key, mission.id, now_ts()),
             )
             db.commit()
