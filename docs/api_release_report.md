@@ -36,7 +36,7 @@ Plus: readiness probe fixed to read real coordinator liveness keys
   (`test_api_contract`, `test_auth_fail_closed`, `test_repo_boundary`,
   `test_body_limit`, `test_deployment_truth`, `test_rbac`,
   `test_governance_and_profiles`, `test_stage10_security_audit`).
-- Full regression: **839 passed, 7 skipped**, 0 failures.
+- Full regression: **857 passed, 7 skipped**, 0 failures.
 - Real HTTP graduation E2E (public API only, single-node, API key,
   `YODAW_REPO_ROOTS` set, disposable temp git repo): **27/27 passed** —
   start, readiness, auth (missing/invalid/tenant denial), real repo-code
