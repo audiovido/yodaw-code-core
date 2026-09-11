@@ -614,7 +614,11 @@ def health():
 def readiness():
     """Readiness probe: returns 200 when coordinator is healthy and can accept work."""
     coordinator = _coordinator
-    coordinator_ready = coordinator is None or coordinator.stats().get("running", False)
+    stats = coordinator.stats() if coordinator is not None else {}
+    coordinator_ready = coordinator is None or (
+        stats.get("loop_alive", False)
+        and stats.get("heartbeat_thread_alive", False)
+    )
     try:
         cfg = load_config()
         config_ok = True
