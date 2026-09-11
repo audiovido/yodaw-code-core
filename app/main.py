@@ -382,10 +382,8 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------
-# Safe defaults: body-size guard (header check now; received-byte
-# hardening lands with the security fixes)
+# Safe defaults: body-size guard on bytes actually received
 # ---------------------------------------------------------
-from starlette.responses import JSONResponse
 
 def _declared_content_length(scope) -> int | None:
     for name, value in scope.get("headers", ()):
