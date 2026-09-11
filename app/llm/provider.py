@@ -6,6 +6,7 @@ import random
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
@@ -198,7 +199,7 @@ class LocalLLMProvider:
         self,
         url: str,
         payload: dict,
-        headers: dict | None = None,
+        headers: Optional[dict] = None,
     ) -> dict:
         """
         Stage 8.6: bounded retries with exponential backoff and

@@ -1,6 +1,7 @@
 """Hermetic tests for routing failover and the agent runtime router."""
 
 import pytest
+from typing import Optional
 
 from app.providers import (
     ANTHROPIC_COMPATIBLE,
@@ -23,7 +24,7 @@ from app.runtime.router import AgentRouteRequest, AgentRuntimeRouter
 
 
 class ScriptedError(Exception):
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
 

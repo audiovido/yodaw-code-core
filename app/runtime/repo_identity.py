@@ -34,6 +34,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional, Union
+from typing import Optional, Union
+from typing import Optional, Union
 
 ENV_REPO_ROOTS = "YODAW_REPO_ROOTS"
 
@@ -43,8 +46,8 @@ class RepoNotAllowed(Exception):
 
 
 def canonical_repo_path(
-    repo_path: str | os.PathLike | None,
-) -> str | None:
+    repo_path: Optional[Union[str, os.PathLike]],
+) -> Optional[str]:
     """
     Canonical, alias-free identity for one target repository.
 

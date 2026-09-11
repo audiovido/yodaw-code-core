@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from typing import Optional
 
 from app.llm.provider import LocalLLMProvider, LLMError
 
@@ -348,7 +349,7 @@ Return the safest minimal JSON edit plan.
 def generate_repair_plan(
     goal: str,
     worktree: Path,
-    previous_plan: dict | None,
+    previous_plan: Optional[dict],
     failure_context: dict,
     provider=None,
     lessons: str = "",

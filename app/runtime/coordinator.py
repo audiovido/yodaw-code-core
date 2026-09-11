@@ -35,6 +35,7 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
 from app.storage.sqlite_store import (
@@ -90,8 +91,8 @@ class Coordinator:
 
     def __init__(
         self,
-        store: MissionStore | None = None,
-        leases: RepoLeaseManager | None = None,
+        store: Optional[MissionStore] = None,
+        leases: Optional[RepoLeaseManager] = None,
         registry=None,
         id_prefix: str = "coord",
         relay=None,
@@ -115,8 +116,8 @@ class Coordinator:
         self._inflight_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._hb_thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
+        self._hb_thread: Optional[threading.Thread] = None
         self._shutting_down = False
 
         # Observability for the heartbeat loop: every failure is
@@ -375,7 +376,7 @@ class Coordinator:
         """Atomically requeue a mission that couldn't acquire repo lease."""
         self.store.transact_mission(mission.id, lambda m: self._requeue_inner(m))
 
-    def _requeue_inner(self, mission: Mission) -> Mission | None:
+    def _requeue_inner(self, mission: Mission) -> Optional[Mission]:
         if mission.status not in (MissionStatus.running, MissionStatus.observing, MissionStatus.planning, MissionStatus.executing, MissionStatus.verifying, MissionStatus.repairing, MissionStatus.recovering):
             return None
         mission.status = MissionStatus.queued
@@ -748,7 +749,7 @@ class Coordinator:
         )
 
     @staticmethod
-    def _merged_evidence(prior: list | None, new: list | None) -> list:
+    def _merged_evidence(prior: Optional[list], new: Optional[list]) -> list:
         """Preserve prior evidence, append new items, skip dups."""
         merged = list(prior or [])
         seen = set()
@@ -774,10 +775,10 @@ class Coordinator:
         *,
         status: MissionStatus,
         result: dict,
-        evidence: list | None,
-        error_class: str | None = None,
+        evidence: Optional[list],
+        error_class: Optional[str] = None,
         event_type: str = "mission.completed",
-        event_data: dict | None = None,
+        event_data: Optional[dict] = None,
         success: bool = False,
     ) -> Mission:
         """One atomic commit: mission + event + learning outbox."""

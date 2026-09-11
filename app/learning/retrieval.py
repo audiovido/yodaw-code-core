@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 from app.learning.store import LearningStore
 
 
@@ -60,7 +61,7 @@ def format_lessons(records) -> list[str]:
 def retrieve_relevant_learnings(
     goal: str,
     limit: int = 3,
-    store: LearningStore | None = None,
+    store: Optional[LearningStore] = None,
 ):
     """
     Deterministic lexical-overlap ranking over prior learning

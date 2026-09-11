@@ -15,13 +15,14 @@ coordinator, workers, or API.
 import os
 import sqlite3
 from pathlib import Path
+from typing import Union
 
 DB_PATH = Path(os.environ.get("YODAW_DB_PATH", "data/yodaw.db"))
 
 BUSY_TIMEOUT_MS = 30000
 
 
-def connect(path: Path | str = DB_PATH) -> sqlite3.Connection:
+def connect(path: Union[Path, str] = DB_PATH) -> sqlite3.Connection:
     """Open a hardened SQLite connection."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

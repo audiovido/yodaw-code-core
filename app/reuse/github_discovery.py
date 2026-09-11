@@ -1,6 +1,6 @@
 import os
 import httpx
-
+from typing import Optional
 
 GITHUB_API = "https://api.github.com"
 
@@ -26,7 +26,7 @@ def _headers():
 def search_repositories(
     query: str,
     *,
-    language: str | None = None,
+    language: Optional[str] = None,
     limit: int = 5,
 ) -> list[dict]:
     q = query

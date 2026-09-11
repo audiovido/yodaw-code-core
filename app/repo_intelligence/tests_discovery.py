@@ -1,6 +1,7 @@
 """Test file discovery and source<->test mapping per language."""
 
 from pathlib import PurePosixPath
+from typing import Optional
 
 # Naming conventions per language family.
 PY_TEST_PREFIXES = ("test_",)
@@ -54,7 +55,7 @@ def discover_tests(files: list[str]) -> list[str]:
     return sorted(p for p in files if is_test_file(p))
 
 
-def map_source_to_test(files: list[str]) -> dict[str, str | None]:
+def map_source_to_test(files: list[str]) -> dict[str, Optional[str]]:
     """Map each non-test source file to its likely test file (or None)."""
     tests = discover_tests(files)
     by_stem: dict[str, list[str]] = {}
@@ -64,7 +65,7 @@ def map_source_to_test(files: list[str]) -> dict[str, str | None]:
         by_stem.setdefault(key, []).append(t)
     for key in by_stem:
         by_stem[key].sort()
-    result: dict[str, str | None] = {}
+    result: dict[str, Optional[str]] = {}
     for path in sorted(files):
         if is_test_file(path):
             continue
@@ -75,7 +76,7 @@ def map_source_to_test(files: list[str]) -> dict[str, str | None]:
         cands = by_stem.get(stem, [])
         # Prefer a test in a sibling tests/ dir or same dir.
         src_dir = path.rsplit("/", 1)[0] if "/" in path else ""
-        best: str | None = cands[0] if cands else None
+        best: Optional[str] = cands[0] if cands else None
         for cand in cands:
             cand_dir = cand.rsplit("/", 1)[0] if "/" in cand else ""
             if cand_dir == src_dir or cand_dir.rstrip("s") == src_dir or "test" in cand_dir:

@@ -32,7 +32,7 @@ import logging
 import threading
 import time
 import traceback
-from typing import Callable
+from typing import Callable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -54,27 +54,27 @@ logger = logging.getLogger("yodaw.outbox")
 
 
 class LearningRecordPayload(BaseModel):
-    mission_id: str | None = None
+    mission_id: Optional[str] = None
     goal: str
-    worker: str | None = None
+    worker: Optional[str] = None
     success: bool
     evidence: list[dict] = Field(default_factory=list)
     result: dict = Field(default_factory=dict)
-    record_id: str | None = None
+    record_id: Optional[str] = None
 
 
 class AuditExportRequestedPayload(BaseModel):
     requested_by: str
-    mission_id: str | None = None
-    client_id: str | None = None
-    reason: str | None = None
-    export_id: str | None = None
+    mission_id: Optional[str] = None
+    client_id: Optional[str] = None
+    reason: Optional[str] = None
+    export_id: Optional[str] = None
 
 
 class WebhookDeliveryPayload(BaseModel):
     url: str
     event: str
-    mission_id: str | None = None
+    mission_id: Optional[str] = None
     body: dict = Field(default_factory=dict)
 
 
@@ -195,14 +195,14 @@ class OutboxRelay:
         self,
         store: MissionStore,
         poll_seconds: float = 0.5,
-        kinds: list[str] | None = None,
+        kinds: Optional[list[str]] = None,
     ):
         self.store = store
         self.poll_seconds = poll_seconds
         self.kinds = kinds
         self.learning_sink = _learning_sink_for(store)
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._delivered = 0
         self._failures = 0
         self._dead = 0

@@ -49,7 +49,7 @@ class ProviderDescriptor:
             return True
         return self.auth_configured
 
-    def to_capability(self, model: str | None = None):
+    def to_capability(self, model: Optional[str] = None):
         """Project this descriptor into registry metadata."""
         from app.routing.capabilities import ModelCapability
 

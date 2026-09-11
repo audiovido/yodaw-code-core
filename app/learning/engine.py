@@ -1,11 +1,12 @@
 from app.learning.models import LearningRecord
 from app.learning.store import LearningStore
+from typing import Optional
 
 
 store = LearningStore()
 
 
-def record_id_default(mission_id: str | None) -> str:
+def record_id_default(mission_id: Optional[str]) -> str:
     """Deterministic learning-record id derived from the mission."""
     import hashlib
 
@@ -23,13 +24,13 @@ TOOL_LABELS = {
 
 def build_learning_record(
     *,
-    mission_id: str | None,
+    mission_id: Optional[str],
     goal: str,
-    worker: str | None,
+    worker: Optional[str],
     success: bool,
     evidence: list[dict],
     result: dict,
-    record_id: str | None = None,
+    record_id: Optional[str] = None,
 ) -> LearningRecord:
     """
     Construct a learning record without persisting it.
@@ -110,13 +111,13 @@ def build_learning_record(
 
 def learn_from_result(
     *,
-    mission_id: str | None,
+    mission_id: Optional[str],
     goal: str,
-    worker: str | None,
+    worker: Optional[str],
     success: bool,
     evidence: list[dict],
     result: dict,
-    record_id: str | None = None,
+    record_id: Optional[str] = None,
 ) -> LearningRecord:
     """Build and persist a learning record (Stage 7 contract)."""
     record = build_learning_record(

@@ -1,5 +1,6 @@
 """Hermetic tests for failure mining and root-cause clustering."""
 import pytest
+from typing import Optional
 
 from app.eval.models import (
     EvaluationResult,
@@ -23,9 +24,9 @@ def _perf() -> PerformanceMetrics:
 def _result(
     case_id: str,
     kind: ResultClass,
-    modes: list[FailureMode] | None = None,
+    modes: Optional[list[FailureMode]] = None,
     score: float = 50.0,
-    evidence: dict | None = None,
+    evidence: Optional[dict] = None,
 ) -> EvaluationResult:
     return EvaluationResult(
         case_id=case_id,
