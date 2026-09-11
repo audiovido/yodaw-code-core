@@ -182,7 +182,9 @@ def test_coordinator_writes_learning_through_outbox(tmp_path):
 
     relay = OutboxRelay(store=store)
     coord = Coordinator(store=store, relay=relay)
-    coord._execute(mission, "capability:outbox-cap")
+    claimed = store.claim_next(coord.id)
+    assert claimed is not None
+    coord._execute(claimed, "capability:outbox-cap")
 
     assert store.get(mission.id).status.value == "PASS"
     assert relay.stats()["delivered"] == 1
