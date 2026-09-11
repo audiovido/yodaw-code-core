@@ -38,6 +38,7 @@ DEFAULT_HEADERS = {"Content-Type": "application/json"}
 class Config:
     base_url: str
     profile: str
+    api_key: str | None = None
     timeout: float = 5.0
     poll_interval: float = 0.5
     poll_timeout: float = 120.0
@@ -57,15 +58,18 @@ class APIError(Exception):
 class SmokeClient:
     """JSON-only HTTP client for the YODAW public API."""
 
-    def __init__(self, base_url: str, timeout: float = 5.0):
+    def __init__(self, base_url: str, timeout: float = 5.0, api_key: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.headers = dict(DEFAULT_HEADERS)
+        if api_key:
+            self.headers["Authorization"] = f"Bearer {api_key}"
 
     def _req(self, method: str, path: str, payload: dict | None = None) -> tuple[int, Any]:
         url = f"{self.base_url}{path}"
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(
-            url, data=data, headers=DEFAULT_HEADERS, method=method
+            url, data=data, headers=self.headers, method=method
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -165,7 +169,7 @@ def wait_for_ready(client: SmokeClient, timeout: float) -> dict:
 
 def run_lifecycle_test(config: Config) -> int:
     """Execute the full lifecycle against an already-running server."""
-    client = SmokeClient(config.base_url, config.timeout)
+    client = SmokeClient(config.base_url, config.timeout, config.api_key)
 
     # 1. READINESS
     print("== READINESS ==")
@@ -292,6 +296,14 @@ def start_server(config: Config) -> subprocess.Popen:
             "YODAW_PORT": port,
         }
     )
+    if config.api_key:
+        env["YODAW_API_KEY"] = config.api_key
+    # Smoke hammers the API rapidly; keep governance on but raise the
+    # ceiling unless the operator already set one explicitly.
+    if "YODAW_RATE_LIMIT_RPM" not in env:
+        env["YODAW_RATE_LIMIT_RPM"] = "1000"
+    if "YODAW_RATE_LIMIT_BURST" not in env:
+        env["YODAW_RATE_LIMIT_BURST"] = "100"
     # DB path for isolation
     import tempfile
     db_fd, db_path = tempfile.mkstemp(prefix="yodaw_smoke_", suffix=".db")
@@ -319,10 +331,12 @@ def parse_args() -> Config:
     p.add_argument("--startup-timeout", type=float, default=20.0, help="server startup timeout")
     p.add_argument("--start-server", action="store_true", help="start server via python -m app.runtime")
     p.add_argument("--shutdown-timeout", type=float, default=25.0, help="server shutdown timeout")
+    p.add_argument("--api-key", default=None, help="bearer key (also YODAW_API_KEY); required for single-node profile")
     args = p.parse_args()
     return Config(
         base_url=args.base_url,
         profile=args.profile,
+        api_key=args.api_key or os.environ.get("YODAW_API_KEY"),
         timeout=args.timeout,
         poll_interval=args.poll_interval,
         poll_timeout=args.poll_timeout,
