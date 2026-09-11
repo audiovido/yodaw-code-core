@@ -353,24 +353,105 @@ app = FastAPI(
 # ---------------------------------------------------------
 from starlette.responses import JSONResponse
 
-class BodyLimitMiddleware(BaseHTTPMiddleware):
-    """Enforce max request body size before payload reaches handlers."""
+def _declared_content_length(scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+    return None
+
+
+class BodyLimitMiddleware:
+    """
+    Reject an oversized request body on the bytes actually received.
+
+    The declared `Content-Length` is advisory: a client can omit it
+    (chunked transfer) or understate it, so enforcing only the header
+    leaves the real bound unbounded. This measures the received
+    stream and rejects the request as soon as it crosses the limit,
+    stopping the handler from draining the rest. An honestly oversized
+    declaration is still refused up front without reading a byte.
+
+    Implemented as raw ASGI rather than `BaseHTTPMiddleware` so the
+    receive channel is what gets bounded, and so a rejected request
+    cannot leave a half-sent handler response behind.
+    """
+
+    TOO_LARGE_BODY = b'{"detail":"request body too large"}'
+
     def __init__(self, app, max_bytes: int = 256 * 1024):
-        super().__init__(app)
+        self.app = app
         self.max_bytes = max_bytes
 
-    async def dispatch(self, request, call_next):
-        cl = request.headers.get("content-length")
-        if cl is not None:
-            try:
-                if int(cl) > self.max_bytes:
-                    return JSONResponse(
-                        status_code=413,
-                        content={"detail": "request body too large"},
-                    )
-            except ValueError:
-                pass
-        return await call_next(request)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared = _declared_content_length(scope)
+
+        if declared is not None and declared > self.max_bytes:
+            await self._reject(send)
+            return
+
+        state = {"received": 0, "exceeded": False, "responded": False}
+
+        async def limited_receive():
+            message = await receive()
+
+            if message["type"] == "http.request":
+                body = message.get("body") or b""
+                state["received"] += len(body)
+
+                if state["received"] > self.max_bytes:
+                    state["exceeded"] = True
+                    # End the stream so the handler cannot buffer the
+                    # rest of an unbounded payload.
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+
+            return message
+
+        async def guarded_send(message):
+            if state["exceeded"]:
+                # The handler is reacting to a truncated body; the
+                # size decision, not its response, is authoritative.
+                if not state["responded"]:
+                    state["responded"] = True
+                    await self._reject(send)
+                return
+
+            await send(message)
+
+        await self.app(scope, limited_receive, guarded_send)
+
+        if state["exceeded"] and not state["responded"]:
+            state["responded"] = True
+            await self._reject(send)
+
+    async def _reject(self, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (
+                        b"content-length",
+                        str(len(self.TOO_LARGE_BODY)).encode(),
+                    ),
+                ],
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": self.TOO_LARGE_BODY}
+        )
 
 app.add_middleware(BodyLimitMiddleware, max_bytes=256 * 1024)
 # Correlation IDs wrap the body guard so rejected requests stay traceable.
