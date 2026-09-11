@@ -1371,6 +1371,16 @@ class MissionStore:
             if row:
                 db.rollback()
                 return row[0]
+            # A bare claim leaves a dangling pointer if the caller
+            # dies before inserting the mission row. New code must
+            # use submit_idempotent_mission; this path inserts the
+            # mapping only when the mission row already exists.
+            target = db.execute(
+                "SELECT id FROM missions WHERE id=?", (mission_id,)
+            ).fetchone()
+            if not target:
+                db.rollback()
+                return mission_id
             db.execute(
                 "INSERT INTO mission_idempotency("
                 "tenant_scope, idempotency_key, mission_id, created_at) "
@@ -1379,6 +1389,127 @@ class MissionStore:
             )
             db.commit()
             return mission_id
+
+    def submit_idempotent_mission(
+        self,
+        mission: Mission,
+        *,
+        tenant_scope: str,
+        idempotency_key: str | None,
+    ) -> tuple[Mission, bool]:
+        """Claim idempotency key and insert mission in one tx.
+
+        Returns (mission, replayed). Either both rows exist or
+        neither does; concurrent same-key submits yield exactly
+        one mission row. Raises DuplicateMission on single-flight
+        duplicate (no idempotency row written).
+        """
+        if not idempotency_key:
+            self.enqueue(mission)
+            stored = self.get(mission.id)
+            return (stored or mission), False
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT mission_id FROM mission_idempotency "
+                "WHERE tenant_scope=? AND idempotency_key=?",
+                (tenant_scope, idempotency_key),
+            ).fetchone()
+            if row:
+                winner = db.execute(
+                    "SELECT payload FROM missions WHERE id=?",
+                    (row[0],),
+                ).fetchone()
+                db.rollback()
+                if not winner:
+                    # Crash window row with no mission: treat as
+                    # missing so the resubmit claims fresh.
+                    return mission, False
+                return Mission.model_validate_json(winner[0]), True
+            repo_key = self._repo_key(mission)
+            dup = db.execute(
+                """
+                SELECT id FROM missions
+                WHERE repo_key=? AND goal=? AND id != ? AND status IN
+                    ('QUEUED','OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
+                """,
+                (repo_key, mission.goal, mission.id),
+            ).fetchone()
+            if dup:
+                db.rollback()
+                raise DuplicateMission(
+                    f"mission {dup[0]} already active "
+                    "for this repo and goal",
+                    mission_id=dup[0],
+                )
+            now = now_ts()
+            db.execute(
+                """
+                INSERT INTO missions(
+                    id, payload, status, goal, repo_key,
+                    claimed_by, claimed_at, heartbeat_at,
+                    cancel_requested, created_at, updated_at,
+                    client_id, priority
+                )
+                VALUES(?, ?, 'QUEUED', ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
+                """,
+                (
+                    mission.id,
+                    mission.model_dump_json(),
+                    mission.goal,
+                    repo_key,
+                    mission.created_at,
+                    now,
+                    mission.client_id,
+                    mission.priority,
+                ),
+            )
+            db.execute(
+                "INSERT INTO mission_idempotency("
+                "tenant_scope, idempotency_key, mission_id, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (tenant_scope, idempotency_key, mission.id, now_ts()),
+            )
+            db.commit()
+        except DuplicateMission:
+            raise
+        except sqlite3.IntegrityError:
+            db.rollback()
+            row = self.idempotency_lookup(tenant_scope, idempotency_key)
+            if row:
+                winner = self.get(row)
+                if winner is not None:
+                    return winner, True
+            # Same-id replay (e.g. dry-run resubmit): mission row
+            # already exists, mapping missing -> recreate mapping.
+            existing = self.get(mission.id)
+            if existing is not None:
+                self.idempotency_claim(
+                    tenant_scope, idempotency_key, mission.id
+                )
+                return existing, True
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        stored = self.get(mission.id)
+        event_ok = True
+        try:
+            self.record_event(
+                mission.id,
+                "mission.queued",
+                attempt=0,
+                data={"goal": mission.goal, "capability": mission.capability},
+            )
+        except Exception:
+            event_ok = False
+        if stored is None:
+            raise RuntimeError("mission insert committed but row missing")
+        return stored, False
 
     def outbox_stats(self) -> dict:
         # Pending means deliverable work: undelivered AND not

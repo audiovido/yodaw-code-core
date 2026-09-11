@@ -8,7 +8,6 @@ prior attempt evidence with traceable lineage.
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from fastapi import Header, HTTPException
@@ -139,16 +138,11 @@ def check_idempotent_replay(
     mission_id = store.idempotency_lookup(scope, key)
     if not mission_id:
         return None
-    # A concurrent loser can observe the winner's claim before the
-    # winner's mission row is saved. Wait briefly for the row so a
-    # duplicate submit replays the winner instead of 409ing.
-    mission = None
-    deadline = time.monotonic() + 5.0
-    while mission is None and time.monotonic() < deadline:
-        mission = store.get(mission_id)
-        if mission is None:
-            time.sleep(0.02)
+    mission = store.get(mission_id)
     if mission is None:
+        # No dangling pointers: claim+insert is one tx, so a
+        # missing row means a legacy/crashed mapping. Resubmit
+        # fresh instead of 409ing.
         return None
     if principal.kind == "client" and mission.client_id != principal.client_id:
         raise HTTPException(404, "Mission not found")
@@ -182,17 +176,79 @@ def submit_product_mission(
         idempotency_key=key,
     )
     claimed_id = mission.id
+    if key and hasattr(store, "submit_idempotent_mission"):
+        if request.dry_run:
+            mission.status = MissionStatus.passed
+            mission.result = {"dry_run": True, "goal": request.goal}
+            mission.error_class = "task"
+            mission.finished_at = mission.updated_at
+            try:
+                stored, replayed = store.submit_idempotent_mission(
+                    mission, tenant_scope=scope, idempotency_key=key
+                )
+            except DuplicateMission as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=str(exc),
+                    headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
+                )
+            if not replayed and stored.id == mission.id:
+                try:
+                    store.save(mission)
+                except Exception:
+                    pass
+                stored = store.get(mission.id) or mission
+            mission = stored
+            audit.append(
+                client_id=principal.client_id,
+                actor=principal.name,
+                action="mission.created",
+                mission_id=mission.id,
+                data={
+                    "goal": mission.goal,
+                    "capability": mission.capability,
+                    "product": True,
+                    "dry_run": request.dry_run,
+                },
+            )
+            wake()
+            return mission, replayed
+        try:
+            stored, replayed = store.submit_idempotent_mission(
+                mission, tenant_scope=scope, idempotency_key=key
+            )
+        except DuplicateMission as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+                headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
+            )
+        if replayed:
+            if (
+                principal.kind == "client"
+                and stored.client_id != principal.client_id
+            ):
+                raise HTTPException(404, "Mission not found")
+            return stored, True
+        mission = stored
+        audit.append(
+            client_id=principal.client_id,
+            actor=principal.name,
+            action="mission.created",
+            mission_id=mission.id,
+            data={
+                "goal": mission.goal,
+                "capability": mission.capability,
+                "product": True,
+                "dry_run": request.dry_run,
+            },
+        )
+        wake()
+        return mission, False
     if key:
         claimed_id = store.idempotency_claim(scope, key, mission.id)
         if claimed_id != mission.id:
-            # Lost the claim race: replay the winner's mission.
-            # The winner may still be saving its row, so wait for it.
-            existing = None
-            deadline = time.monotonic() + 5.0
-            while existing is None and time.monotonic() < deadline:
-                existing = store.get(claimed_id)
-                if existing is None:
-                    time.sleep(0.02)
+            existing = store.get(claimed_id)
             if existing is None:
                 raise HTTPException(409, "idempotency conflict without mission")
             if (
