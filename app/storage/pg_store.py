@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.core.models import Mission, MissionStatus
+from app.runtime.repo_identity import repo_identity
 from app.storage.sqlite_store import (
     ACTIVE_STATUSES,
     DuplicateMission,
@@ -57,10 +58,10 @@ def now_ts() -> str:
 
 
 def _repo_key(mission: Mission) -> str:
-    repo_path = mission.metadata.get("repo_path")
-    if repo_path:
-        return str(repo_path)
-    return f"capability:{mission.capability}"
+    """Canonical single-flight + lease key, shared with SQLite."""
+    return repo_identity(
+        mission.metadata.get("repo_path"), mission.capability
+    )
 
 
 def _require_psycopg():

@@ -18,13 +18,14 @@ from app.api.auth import Principal, resolve_principal
 from app.core.models import Mission, MissionStatus
 from app.mission.facade import MAX_RETRY_ATTEMPTS, retry_allowed
 from app.storage.sqlite_store import DuplicateMission
+from app.tenants.redact import redact
 
 
 class ProductMissionSubmit(BaseModel):
-    goal: str
+    goal: str = Field(min_length=1, pattern=r"\S")
     repo_path: str | None = None
     repo_ref: str | None = None
-    capability: str = "repo-code"
+    capability: str = Field(default="repo-code", min_length=1)
     constraints: dict[str, Any] | None = None
     model: dict[str, Any] | None = None
     provider: dict[str, Any] | None = None
@@ -61,7 +62,7 @@ def to_product_status(status: MissionStatus) -> str:
         MissionStatus.recovering: "RECOVERING",
         MissionStatus.passed: "PASS",
         MissionStatus.failed: "FAIL",
-        MissionStatus.blocked: "FAIL",
+        MissionStatus.blocked: "BLOCKED",
         MissionStatus.blocked_external: "BLOCKED_EXTERNAL",
         MissionStatus.cancelled: "CANCELLED",
     }
@@ -69,15 +70,35 @@ def to_product_status(status: MissionStatus) -> str:
 
 
 def product_view(mission: Mission) -> dict:
+    """Unified mission record with all observable state."""
+    # Redact secrets from evidence and result for API visibility
+    safe_evidence = redact(mission.evidence) if mission.evidence else []
+    safe_result = redact(mission.result) if mission.result else {}
+    
     return {
+        "id": mission.id,
         "mission_id": mission.id,
         "status": to_product_status(mission.status),
         "created_at": mission.created_at,
         "updated_at": mission.updated_at,
+        "finished_at": mission.finished_at,
         "attempt": mission.attempt,
+        "max_attempts": mission.max_attempts,
         "attempts": mission.metadata.get("product_attempts", 1),
+        "attempt_lineage": mission.attempt_lineage,
+        "retried_from_id": mission.retried_from_id,
         "error_class": mission.error_class,
-        "result": mission.result,
+        "result": safe_result,
+        "evidence": safe_evidence,
+        "claimed_by": mission.claimed_by,
+        "claimed_at": mission.claimed_at,
+        "started_at": mission.started_at,
+        "heartbeat_at": mission.heartbeat_at,
+        "cancel_requested": mission.cancel_requested,
+        "worker": mission.worker,
+        "priority": mission.priority,
+        "client_id": mission.client_id,
+        "idempotency_key": mission.idempotency_key,
         "links": mission_links(mission.id),
     }
 

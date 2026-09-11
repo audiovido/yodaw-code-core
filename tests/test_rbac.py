@@ -479,6 +479,26 @@ def test_admin_endpoint_authorization_matrix(isolated_env):
                 f"!= {expected}"
             )
 
+            if path == "/api/v1/admins/matrix-root/rotate" and (
+                role == "superadmin"
+            ):
+                # Rotation mints a new key and must invalidate the old
+                # one. Every later request in this matrix has to use
+                # the replacement, and the retired key must no longer
+                # authenticate at all.
+                rotated = response.json()
+
+                assert rotated["api_key"] != keys["superadmin"]
+                assert (
+                    client.get(
+                        "/api/v1/admins",
+                        headers=_auth(keys["superadmin"]),
+                    ).status_code
+                    == 401
+                )
+
+                keys["superadmin"] = rotated["api_key"]
+
 
 def test_admin_listing_and_audit_never_leak_keys(isolated_env):
     client = TestClient(app)

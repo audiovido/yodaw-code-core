@@ -8,9 +8,20 @@ Resolution order for the Authorization: Bearer key:
 3. shared environment key      -> SharedKeyPrincipal
                                   (virtual superadmin; Stage 8
                                   migration path, deprecated)
-4. no key configured at all    -> LocalDevPrincipal
-                                  (local-dev open mode; refused
-                                  under the production profile)
+4. no credential configured    -> LocalDevPrincipal
+                                  (local-open development mode)
+
+Authentication fails closed:
+
+- The local-open development principal is issued only when the
+  `local` profile is active AND no credential surface exists at
+  all (no admin identity, no client identity, no shared key).
+  The moment one identity is configured, an anonymous caller is
+  denied 401 instead of silently becoming a superadmin.
+- A missing, empty, malformed, unknown, or revoked credential is
+  always denied 401.
+- If the identity stores cannot be read, the request is denied
+  503 rather than falling through to an anonymous principal.
 
 Principals expose `role` and `permissions`; endpoint guards check
 RBAC permissions, and mission reads apply client isolation based
@@ -77,8 +88,85 @@ def _stores(
     )
 
 
+# The only profile that may ever serve an anonymous caller.
+LOCAL_OPEN_PROFILE = "local"
+
+# Denial used whenever the identity stores cannot be consulted: an
+# unreadable credential store must never widen access.
+_AUTH_UNAVAILABLE = "authentication unavailable"
+
+
 def shared_api_key() -> str:
     return os.environ.get("YODAW_API_KEY", "")
+
+
+def current_profile() -> str:
+    """Active deployment profile; unset means the `local` profile."""
+    profile = (os.environ.get("YODAW_PROFILE") or LOCAL_OPEN_PROFILE).strip()
+    return profile or LOCAL_OPEN_PROFILE
+
+
+def _count(ctx: AuthContext, surface: str) -> int:
+    """Count identities in one store; unknown stores count as zero."""
+    store = getattr(ctx, surface, None)
+    counter = getattr(store, f"count_{surface}", None)
+
+    if not callable(counter):
+        return 0
+
+    return int(counter())
+
+
+def admin_credential_surfaces(ctx: AuthContext) -> tuple[str, ...]:
+    """
+    Which *administrative* credential surfaces are configured.
+
+    The admin surface is exactly what the project documents it to
+    be: registered admin identities, or the legacy shared key.
+    Client (tenant) keys deliberately do **not** count — they are
+    not an admin credential, and there is no CLI path that could
+    create the first admin identity. Treating a tenant key as
+    "authentication enabled" would lock an operator out of the
+    admin surface permanently on a fresh local deployment.
+
+    Reads live store state (never a cached process flag), so a
+    deployment closes the anonymous path the instant its first
+    admin identity is created. Raises HTTPException 503 when the
+    store cannot be read — the caller must deny, not fall through.
+    """
+    surfaces: list[str] = []
+
+    if shared_api_key():
+        surfaces.append("shared-key")
+
+    try:
+        if _count(ctx, "admins") > 0:
+            surfaces.append("admins")
+    except HTTPException:
+        raise
+    except Exception as exc:  # unreadable store -> fail closed
+        raise HTTPException(
+            status_code=503, detail=_AUTH_UNAVAILABLE
+        ) from exc
+
+    return tuple(surfaces)
+
+
+def open_dev_mode(ctx: AuthContext) -> bool:
+    """
+    True only for genuinely unauthenticated local development:
+    the `local` profile with no administrative credential surface
+    configured.
+
+    Every other profile denies the anonymous caller outright, and
+    so does the `local` profile once an admin identity or shared
+    key exists. This is the *only* path that can mint an
+    anonymous superadmin.
+    """
+    if current_profile() != LOCAL_OPEN_PROFILE:
+        return False
+
+    return not admin_credential_surfaces(ctx)
 
 
 def resolve_principal(
@@ -94,7 +182,12 @@ def resolve_principal(
         provided = authorization[len("Bearer "):]
 
     if provided:
-        admin = ctx.admins.authenticate(provided)
+        try:
+            admin = ctx.admins.authenticate(provided)
+        except Exception as exc:  # unreadable store -> fail closed
+            raise HTTPException(
+                status_code=503, detail=_AUTH_UNAVAILABLE
+            ) from exc
 
         if admin is not None:
             return Principal(
@@ -105,7 +198,12 @@ def resolve_principal(
                 _permissions=set(PERMISSIONS.get(admin.role, set())),
             )
 
-        client = ctx.clients.authenticate(provided)
+        try:
+            client = ctx.clients.authenticate(provided)
+        except Exception as exc:  # unreadable store -> fail closed
+            raise HTTPException(
+                status_code=503, detail=_AUTH_UNAVAILABLE
+            ) from exc
 
         if client is not None:
             return Principal(
@@ -122,22 +220,23 @@ def resolve_principal(
 
     expected = shared_api_key()
 
-    if not expected:
-        # Local dev mode: open access without an identity.
-        return Principal(
-            kind="local-dev",
-            name="local-dev",
-            role="superadmin",
-            _permissions=set(PERMISSIONS["superadmin"]),
-        )
-
-    if provided and hmac.compare_digest(provided, expected):
+    if provided and expected and hmac.compare_digest(provided, expected):
         # Stage 8 shared key maps to a virtual superadmin. The
         # identity is not in the admin table and cannot be listed
         # or rotated there; migration path is admin identities.
         return Principal(
             kind="shared-key",
             name="shared-key",
+            role="superadmin",
+            _permissions=set(PERMISSIONS["superadmin"]),
+        )
+
+    # No credential resolved. Anonymous superadmin is available only
+    # in explicit local-open development mode.
+    if open_dev_mode(ctx):
+        return Principal(
+            kind="local-dev",
+            name="local-dev",
             role="superadmin",
             _permissions=set(PERMISSIONS["superadmin"]),
         )

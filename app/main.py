@@ -32,12 +32,69 @@ Governance (Stage 10.4):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import uuid
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
+# ============================================================
+# Standardized error envelope (RFC 7807 Problem Details)
+# ============================================================
+
+class ErrorEnvelope(BaseModel):
+    """RFC 7807-compatible error envelope."""
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: Optional[str] = None
+    instance: Optional[str] = None
+    trace_id: Optional[str] = None
+    errors: Optional[list[dict]] = None  # For validation errors
+
+class ValidationErrorDetail(BaseModel):
+    """Single validation error detail."""
+    loc: list
+    msg: str
+    type: str
+
+# ============================================================
+# Versioning / API metadata
+# ============================================================
+
+API_VERSION = "v1"
+API_TITLE = "YODAW Public API"
+
+# ============================================================
+# Standard exception handlers
+# ============================================================
+
+def _error_response(request: Request, exc: Exception, status: int, title: str, detail: str | None = None, headers: dict | None = None) -> JSONResponse:
+    """Build a standardized error response."""
+    from uuid import uuid4
+    envelope = ErrorEnvelope(
+        type=f"https://yodaw.ai/errors/{title.lower().replace(' ', '-')}",
+        title=title,
+        status=status,
+        detail=detail or str(exc),
+        instance=str(request.url.path),
+        trace_id=f"trc_{uuid4().hex[:12]}",
+    )
+    return JSONResponse(
+        status_code=status,
+        content=envelope.model_dump(exclude_none=True),
+        headers=headers,
+    )
+
+# ============================================================
+# App & config
+# ============================================================
 from app.api.auth import Principal, require, resolve_principal
 from app.api.governance import (
     DEFAULT_GOVERNANCE,
@@ -56,12 +113,20 @@ from app.core.models import (
     Mission,
     MissionCreate,
     MissionStatus,
+    AuditPruneRequest,
+)
+from app.runtime.repo_identity import (
+    RepoNotAllowed,
+    canonical_repo_path,
+    ensure_authorized,
+    repo_roots_report,
 )
 from app.runtime.repo_leases import RepoLeaseManager
 from app.storage.sqlite_store import MissionStore, DuplicateMission
 from app.tenants.admins import AdminStore
 from app.tenants.audit import AuditStore
 from app.tenants.clients import ClientStore
+from app.tenants.redact import redact
 from app.workers.registry import registry
 from app.learning.engine import store as learning_store
 from app.api.v1.missions import (
@@ -71,6 +136,7 @@ from app.api.v1.missions import (
     retry_product_mission,
     submit_product_mission,
 )
+from app.mission.facade import select_skills
 
 
 store = MissionStore()
@@ -224,6 +290,21 @@ def get_coordinator():
     return _coordinator
 
 
+def instantiated_backend() -> str:
+    """
+    The storage backend this process is actually running on.
+
+    Derived from the live store object rather than from configuration,
+    so readiness can never report Postgres while the process is
+    serving from SQLite.
+    """
+    from app.storage.pg_store import PostgresMissionStore
+
+    return (
+        "postgres" if isinstance(store, PostgresMissionStore) else "sqlite"
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app):
     """
@@ -231,10 +312,29 @@ async def lifespan(_app):
     unsafe production combinations (Stage 10.7).
     """
     try:
-        load_config()
+        cfg = load_config()
     except Exception as exc:
         # Surface the ConfigError message in the failure.
         raise RuntimeError(f"configuration rejected: {exc}") from exc
+
+    # Deployment truth: refuse to start when the profile demands a
+    # backend this process did not instantiate. Otherwise a production
+    # config with YODAW_DATABASE_URL set would load cleanly, claim
+    # Postgres in /health and /runtime/status, and silently serve from
+    # a local SQLite file.
+    actual_backend = instantiated_backend()
+
+    if cfg.backend != actual_backend:
+        raise RuntimeError(
+            "configuration rejected: profile "
+            f"{cfg.profile!r} requires the {cfg.backend!r} storage "
+            f"backend, but this process instantiated {actual_backend!r}. "
+            f"The {cfg.backend!r} backend is not wired into the API "
+            "process, so starting would silently serve from the wrong "
+            "database. Run the supported trusted single-node deployment "
+            "(YODAW_PROFILE=single-node with no YODAW_DATABASE_URL), or "
+            "unset YODAW_DATABASE_URL."
+        )
 
     get_coordinator()
     yield
@@ -245,11 +345,193 @@ async def lifespan(_app):
         coordinator.stop(drain=True, timeout=20)
 
 
+import contextvars
+
+_request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
+
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """Attach and propagate a correlation ID (X-Request-ID) per request."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request.state.request_id = request_id
+        token = _request_id_var.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            _request_id_var.reset(token)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+class RequestIdLogFilter(logging.Filter):
+    """Inject request_id from contextvar into log records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = _request_id_var.get()
+        if request_id:
+            record.request_id = request_id
+        return True
+
+
 app = FastAPI(
     title="YODAW Code Core",
     version="0.3.0",
     lifespan=lifespan,
 )
+
+# ---------------------------------------------------------
+# Safe defaults: body-size guard on bytes actually received
+# ---------------------------------------------------------
+
+def _declared_content_length(scope) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+    return None
+
+
+class BodyLimitMiddleware:
+    """
+    Reject an oversized request body on the bytes actually received.
+
+    The declared `Content-Length` is advisory: a client can omit it
+    (chunked transfer) or understate it, so enforcing only the header
+    leaves the real bound unbounded. This measures the received
+    stream and rejects the request as soon as it crosses the limit,
+    stopping the handler from draining the rest. An honestly oversized
+    declaration is still refused up front without reading a byte.
+
+    Implemented as raw ASGI rather than `BaseHTTPMiddleware` so the
+    receive channel is what gets bounded, and so a rejected request
+    cannot leave a half-sent handler response behind.
+    """
+
+    TOO_LARGE_BODY = b'{"detail":"request body too large"}'
+
+    def __init__(self, app, max_bytes: int = 256 * 1024):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared = _declared_content_length(scope)
+
+        if declared is not None and declared > self.max_bytes:
+            await self._reject(send)
+            return
+
+        state = {"received": 0, "exceeded": False, "responded": False}
+
+        async def limited_receive():
+            message = await receive()
+
+            if message["type"] == "http.request":
+                body = message.get("body") or b""
+                state["received"] += len(body)
+
+                if state["received"] > self.max_bytes:
+                    state["exceeded"] = True
+                    # End the stream so the handler cannot buffer the
+                    # rest of an unbounded payload.
+                    return {
+                        "type": "http.request",
+                        "body": b"",
+                        "more_body": False,
+                    }
+
+            return message
+
+        async def guarded_send(message):
+            if state["exceeded"]:
+                # The handler is reacting to a truncated body; the
+                # size decision, not its response, is authoritative.
+                if not state["responded"]:
+                    state["responded"] = True
+                    await self._reject(send)
+                return
+
+            await send(message)
+
+        await self.app(scope, limited_receive, guarded_send)
+
+        if state["exceeded"] and not state["responded"]:
+            state["responded"] = True
+            await self._reject(send)
+
+    async def _reject(self, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (
+                        b"content-length",
+                        str(len(self.TOO_LARGE_BODY)).encode(),
+                    ),
+                ],
+            }
+        )
+        await send(
+            {"type": "http.response.body", "body": self.TOO_LARGE_BODY}
+        )
+
+app.add_middleware(BodyLimitMiddleware, max_bytes=256 * 1024)
+# Correlation IDs wrap the body guard so rejected requests stay traceable.
+app.add_middleware(CorrelationIdMiddleware)
+
+
+# API-A public contract handlers (RFC 7807 envelopes) subsume the
+# generic 500 mask above: unhandled errors keep the envelope shape.
+# ============================================================
+# Exception handlers (standardized errors)
+# ============================================================
+
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Convert HTTPException to RFC 7807 envelope (except 401/403 which keep minimal body)."""
+    # 401 and 403 are intentionally minimal for security
+    if exc.status_code in (401, 403):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail} if isinstance(exc.detail, str) else {"detail": "access denied"},
+            headers=exc.headers,
+        )
+    # Preserve headers for 429 and other status codes
+    return _error_response(request, exc, exc.status_code, exc.detail if isinstance(exc.detail, str) else "HTTP Error", headers=exc.headers)
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Convert validation errors to RFC 7807 envelope with field details."""
+    envelope = ErrorEnvelope(
+        type="https://yodaw.ai/errors/validation-error",
+        title="Validation Error",
+        status=422,
+        detail="Request body failed validation",
+        instance=str(request.url.path),
+        trace_id=f"trc_{__import__('uuid').uuid4().hex[:12]}",
+        errors=[{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()],
+    )
+    return JSONResponse(status_code=422, content=envelope.model_dump(exclude_none=True))
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all: never expose stack traces, return 500 with envelope."""
+    import logging
+    logging.getLogger("yodaw.api").exception("Unhandled error")
+    return _error_response(request, exc, 500, "Internal Server Error", "An unexpected error occurred")
 
 
 def _bearer(authorization: str | None) -> str:
@@ -321,13 +603,52 @@ def health():
         "config_ok": config_ok,
         "config_error": config_error,
         "profile": cfg.profile if cfg else None,
+        "storage_backend": instantiated_backend(),
+        "repository_bound": repo_roots_report(),
     }
 
+
+@app.get("/api/v1/ready")
+def readiness():
+    """Readiness probe: returns 200 when coordinator is healthy and can accept work."""
+    coordinator = _coordinator
+    stats = coordinator.stats() if coordinator is not None else {}
+    coordinator_ready = coordinator is None or (
+        stats.get("loop_alive", False)
+        and stats.get("heartbeat_thread_alive", False)
+    )
+    try:
+        cfg = load_config()
+        config_ok = True
+    except Exception:
+        config_ok = False
+    ready = coordinator_ready and config_ok
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "service": "YODAW",
+            "ready": ready,
+            "coordinator": "ok" if coordinator_ready else "unavailable",
+            "config": "ok" if config_ok else "error",
+            "profile": cfg.profile if config_ok else None,
+        }
+    )
+
+@app.get("/api/v1/version")
+def version():
+    """API version and metadata."""
+    return {
+        "api_version": API_VERSION,
+        "title": API_TITLE,
+        "service_version": "0.3.0",
+        "build": __import__("os").environ.get("YODAW_BUILD_SHA", "dev"),
+    }
 
 @app.get("/api/v1/workers")
 def workers(authorization: str | None = Header(default=None)):
     _guard(authorization)
     return registry.status()
+
 
 
 @app.get("/api/v1/runtime/status")
@@ -350,7 +671,11 @@ def runtime_status(
         cfg = load_config()
         profile_state = {
             "profile": cfg.profile,
+            # `backend` is what configuration asks for;
+            # `instantiated_backend` is what this process is really
+            # running on. They must agree or startup refuses.
             "backend": cfg.backend,
+            "instantiated_backend": instantiated_backend(),
             "auth_mode": cfg.auth_mode,
             "require_auth": cfg.require_auth,
             "embed_coordinator": cfg.embed_coordinator,
@@ -360,6 +685,8 @@ def runtime_status(
     except Exception as exc:
         profile_state = {
             "profile": None,
+            "backend": None,
+            "instantiated_backend": instantiated_backend(),
             "config_error": str(exc),
         }
 
@@ -378,11 +705,121 @@ def runtime_status(
         "configuration": profile_state,
     }
 
+# ============================================================
+# Classification endpoint
+# ============================================================
+
+class ClassifyRequest(BaseModel):
+    """Request for classification endpoint."""
+    prompt: str
+    context: dict = {}
+
+@app.post("/api/v1/classify")
+def classify_prompt(
+    request: ClassifyRequest,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Classify a prompt/task into capability and skill intent.
+
+    Body: { "prompt": "task description", "context": {...} }
+    Returns: { "capability": "...", "intent": "...", "skill": "...", "confidence": 0.0 }
+    """
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+
+    if not principal.can("missions.create"):
+        raise HTTPException(403, detail="missing permission: missions.create")
+
+    # Use the existing skill classifier
+    try:
+        from app.skills import TaskClassifier, SkillRegistry
+        from app.skills.selection import SelectionContext, SkillSelector
+        from app.skills.skills import (
+            BugfixSkill, DocumentationSkill, FeatureSkill,
+            RefactorSkill, ReviewSkill, TestSkill
+        )
+
+        registry_obj = SkillRegistry()
+        for cls in (BugfixSkill, RefactorSkill, TestSkill, ReviewSkill, FeatureSkill, DocumentationSkill):
+            try:
+                registry_obj.register(cls())
+            except Exception:
+                continue
+
+        classifier = TaskClassifier({s.id: s for s in registry_obj.get_all()})
+        classification = classifier.classify(request.prompt, context={"language": request.context.get("language")})
+        selection = SkillSelector(registry_obj).select(SelectionContext(
+            task_description=request.prompt,
+            classification=classification,
+        ))
+
+        # Map intent to capability
+        capability_map = {
+            "bugfix": "repo-code",
+            "refactor": "repo-code",
+            "test": "repo-code",
+            "review": "repo-code",
+            "feature": "repo-code",
+            "documentation": "repo-code",
+        }
+
+        capability = capability_map.get(classification.detected_intent.value, "repo-code")
+
+        return {
+            "capability": capability,
+            "intent": classification.detected_intent.value,
+            "skill": selection.selected_skill,
+            "confidence": selection.confidence,
+            "reason": classification.reason,
+            "metadata": classification.metadata,
+        }
+    except Exception:
+        return {
+            "capability": "repo-code",
+            "intent": "feature",
+            "skill": "feature",
+            "confidence": 0.5,
+            "reason": "classification unavailable",
+            "metadata": {},
+        }
+
+# ============================================================
+# Task result endpoint
+# ============================================================
+
+@app.get("/api/v1/missions/{mission_id}/result")
+def get_task_result(
+    mission_id: str,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Get the final structured result of a completed mission.
+
+    Only available for terminal missions (PASS, FAIL, BLOCKED_EXTERNAL, CANCELLED).
+    """
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+
+    mission = _load_mission_for(principal, mission_id)
+
+    terminal_statuses = {"PASS", "FAIL", "BLOCKED_EXTERNAL", "BLOCKED", "CANCELLED"}
+    if mission.status.value not in terminal_statuses:
+        raise HTTPException(409, detail=f"Mission not terminal (status: {mission.status.value})")
+
+    return {
+        "mission_id": mission.id,
+        "status": mission.status.value,
+        "result": mission.result,
+        "error_class": mission.error_class,
+        "finished_at": mission.finished_at,
+        "attempt": mission.attempt,
+        "evidence_count": len(mission.evidence),
+    }
 
 # ---------------------------------------------------------
 # Missions (client surface + isolation)
 # ---------------------------------------------------------
-
 
 def _can_read_mission(principal: Principal, mission: Mission) -> bool:
     """
@@ -422,13 +859,45 @@ def create_mission(
     metadata = dict(request.metadata or {})
     dry_run = bool(request.dry_run or metadata.pop("dry_run", False))
     body_key = request.idempotency_key or metadata.pop("idempotency_key", None)
+    # Resolve exactly one authoritative target repository. The
+    # top-level field wins and a metadata alias may supply the value
+    # only when the field is absent; every candidate is canonicalized
+    # and the aliases are then dropped, so the path that gets
+    # authorized, the path that keys deduplication and leases, and the
+    # path the worker actually opens are the same directory under the
+    # same spelling. A conflicting pair is refused further down, after
+    # authentication, so an anonymous caller never learns the
+    # difference between a bad credential and a bad repository.
+    legacy_repo = next(
+        (
+            metadata.get(alias)
+            for alias in ("repo_path", "repo_ref", "repo")
+            if metadata.get(alias)
+        ),
+        None,
+    )
+    declared_repos = {
+        canonical
+        for canonical in (
+            canonical_repo_path(request.repo_path),
+            canonical_repo_path(legacy_repo),
+        )
+        if canonical
+    }
+    declared_repo = canonical_repo_path(request.repo_path) or (
+        canonical_repo_path(legacy_repo)
+    )
+
     for alias in ("repo_path", "repo_ref", "repo"):
-        if metadata.get(alias) and "repo_path" not in metadata:
-            metadata["repo_path"] = metadata[alias]
+        metadata.pop(alias, None)
+
+    if declared_repo:
+        metadata["repo_path"] = declared_repo
+
     product_request = ProductMissionSubmit(
         goal=request.goal,
-        repo_path=request.repo_path or metadata.get("repo_path"),
-        repo_ref=request.repo_ref or metadata.get("repo_ref"),
+        repo_path=declared_repo,
+        repo_ref=request.repo_ref,
         capability=request.capability,
         constraints=request.constraints or metadata.get("constraints"),
         model=request.model or metadata.get("preferred_model") or metadata.get("model"),
@@ -466,6 +935,40 @@ def create_mission(
         )
 
         raise HTTPException(413, detail=reason)
+
+    # Repository trust boundary (Stage 11): reject a target that lies
+    # outside every operator-authorized root, and reject a request that
+    # names two different repositories through two surfaces.
+    if len(declared_repos) > 1:
+        audit.append(
+            client_id=principal.client_id,
+            actor=principal.name,
+            action="mission.rejected",
+            data={
+                "reason": "conflicting_repository",
+                "via": principal.kind,
+            },
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail="conflicting repository references",
+        )
+
+    try:
+        ensure_authorized(declared_repo)
+    except RepoNotAllowed as exc:
+        audit.append(
+            client_id=principal.client_id,
+            actor=principal.name,
+            action="mission.rejected",
+            data={
+                "reason": "repository_not_allowed",
+                "via": principal.kind,
+            },
+        )
+
+        raise HTTPException(status_code=403, detail=str(exc))
 
     # Mission creation rate (separate from the general bucket).
     bucket_key = principal.client_id or principal.admin_id or (
@@ -533,19 +1036,10 @@ def create_mission(
             },
         )
 
-        return {
-            "id": mission.id,
-            "mission_id": mission.id,
-            "status": mission.status.value,
-            "created_at": mission.created_at,
-            "links": {
-                "self": f"/api/v1/missions/{mission.id}",
-                "evidence": f"/api/v1/missions/{mission.id}/evidence",
-                "cancel": f"/api/v1/missions/{mission.id}/cancel",
-                "retry": f"/api/v1/missions/{mission.id}/retry",
-            },
-            "detail": "no worker for capability; mission blocked",
-        }
+        view = product_view(mission)
+        # Legacy keys stay for backward compatibility with Stage 8/9/10.
+        view["id"] = mission.id
+        return view
 
     # Stage 9: per-client concurrency quota (fast admission check).
     limit = principal.max_concurrent_missions
@@ -619,10 +1113,14 @@ def list_missions(
     else:
         missions = store.list()
 
-    start = max(0, int(offset))
-    end = start + max(1, min(int(limit), 500))
+    # Clamp pagination parameters to safe bounds
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
 
-    return missions[start:end]
+    start = offset
+    end = start + limit
+
+    return [product_view(m) for m in missions[start:end]]
 
 
 @app.get("/api/v1/missions/{mission_id}")
@@ -635,7 +1133,7 @@ def get_mission(
 
     mission = _load_mission_for(principal, mission_id)
 
-    return mission
+    return product_view(mission)
 
 
 @app.get("/api/v1/missions/{mission_id}/evidence")
@@ -650,7 +1148,7 @@ def get_evidence(
 
     return {
         "mission_id": mission.id,
-        "evidence": mission.evidence,
+        "evidence": redact(mission.evidence) if mission.evidence else [],
     }
 
 
@@ -1082,6 +1580,10 @@ def query_audit(
             detail="the global audit trail requires auditor access",
         )
 
+    # Clamp pagination parameters to safe bounds
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+
     return {
         "events": audit.query(
             client_id=client_id,
@@ -1147,6 +1649,45 @@ def prune_audit(
 
 
 # ---------------------------------------------------------
+# API-C: unified operational diagnostics
+# ---------------------------------------------------------
+
+@app.get("/api/v1/diagnostics")
+def diagnostics(
+    authorization: str | None = Header(default=None),
+):
+    """
+    Unified operational snapshot for a single task/mission.
+    Combines runtime state, queue position, evidence, and audit
+    into one call so operators and automations don't need to
+    stitch together /status, /events, /evidence, /runtime/status.
+    """
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+
+    if principal.kind == "client":
+        # Clients get scoped diagnostics; no cross-tenant info
+        missions = [m for m in store.list() if m.client_id == principal.client_id]
+        outbox_stats = {"note": "outbox.manage permission required"}
+        coordinator_stats = {"note": "runtime.control permission required"}
+        audit_summary = {"note": "audit.read permission required"}
+    else:
+        missions = store.list()
+        outbox_stats = store.outbox_stats()
+        coordinator = get_coordinator()
+        coordinator_stats = coordinator.stats() if coordinator else {"embedded": False}
+        audit_summary = {"total_events": audit.count(), "intact": audit.verify()["intact"]}
+
+    return {
+        "missions_total": len(missions),
+        "missions_by_status": store.status_counts(),
+        "coordinator": coordinator_stats,
+        "outbox": outbox_stats,
+        "audit": audit_summary,
+        "profile": load_config().profile if True else None,
+    }
+
+# ---------------------------------------------------------
 # Stage 10.6: outbox operations surface
 # ---------------------------------------------------------
 
@@ -1163,8 +1704,11 @@ def list_outbox(
 
     _enforce_rate_limit(principal)
 
+    # Clamp pagination to safe bounds
+    limit = max(1, min(int(limit), 500))
+
     stats = store.outbox_stats()
-    pending = store.outbox_pending(limit=max(1, min(int(limit), 500)))
+    pending = store.outbox_pending(limit=limit)
 
     return {"stats": stats, "pending": pending}
 
@@ -1315,49 +1859,18 @@ def _create_product_mission_impl(
     authorization: str | None,
     idempotency_key: str | None,
 ):
-    principal = resolve_principal(authorization)
-    if not principal.can("missions.create"):
-        raise HTTPException(403, detail="missing permission: missions.create")
-    _enforce_rate_limit(principal)
-    ok, reason = check_payload_governance(
-        goal=request.goal,
-        metadata={**(request.metadata or {}), "repo": request.repo_path or request.repo_ref},
-        config=_governance_config_for(principal),
-    )
-    if not ok:
-        raise HTTPException(413, detail=reason)
+    """
+    Legacy product-mission aliases.
 
-    def _enqueue(mission):
-        worker = registry.find(mission.capability)
-        if worker is None:
-            mission.status = MissionStatus.blocked
-            mission.error_class = "task"
-            mission.result = {
-                "error": f"No worker for capability: {mission.capability}"
-            }
-            mission.finished_at = mission.updated_at
-            store.save(mission)
-            return mission
-        store.enqueue(mission)
-        return mission
-
-    def _wake():
-        coordinator = get_coordinator()
-        if coordinator is not None:
-            coordinator.wake()
-
-    mission, replayed = submit_product_mission(
-        store=store,
-        audit=audit,
-        principal=principal,
-        request=request,
-        header_key=idempotency_key,
-        enqueue=_enqueue,
-        wake=_wake,
-    )
-    view = product_view(mission)
-    view["replayed"] = replayed
-    return view
+    This used to be a second, independent admission path that
+    re-implemented governance, worker lookup, and enqueue. Two
+    admission paths inevitably drift, and the duplicate one had
+    already lost repository canonicalization and the repository trust
+    boundary. It now delegates to the single authoritative admission
+    path (`create_mission`), which already returns the documented
+    `replayed` flag.
+    """
+    return create_mission(request, authorization, idempotency_key)
 
 
 @app.post("/api/v1/product-missions")

@@ -207,11 +207,19 @@ def test_check_7_body_and_payload_limits_enforced(monkeypatch):
     monkeypatch.delenv("YODAW_API_KEY", raising=False)
     monkeypatch.setenv("YODAW_RATE_LIMIT_RPM", "0")
 
+    # Earlier checks in this module register admin identities, which
+    # closes the anonymous local-open path; authenticate so the
+    # assertion isolates payload governance, not authentication.
+    admin = main_module.admins.create_admin(
+        f"chk7-{uuid.uuid4().hex[:8]}", role="superadmin"
+    )
+
     client = TestClient(app)
 
     response = client.post(
         "/api/v1/missions",
         json={"goal": "g" * 5000, "capability": "code"},
+        headers=_auth(admin["api_key"]),
     )
 
     assert response.status_code == 413
