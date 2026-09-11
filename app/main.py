@@ -906,6 +906,7 @@ def create_mission(
         metadata=metadata,
         dry_run=dry_run,
         idempotency_key=body_key,
+        dependencies=request.dependencies or metadata.get("dependencies"),
     )
     principal = resolve_principal(authorization)
 

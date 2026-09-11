@@ -280,7 +280,7 @@ class TestServingPathGraduation:
         if mission_b["status"] == "PASS":
             # This would be incorrect - dependent passed despite parent failure
             assert False, "Dependent mission passed despite parent failure"
-        assert mission_b["status"] in ("BLOCKED", "FAIL", "CANCELLED")
+        assert mission_b["status"] in ("BLOCKED", "BLOCKED_EXTERNAL", "FAIL", "CANCELLED")
 
     def test_retry_policy_controlled_by_supervisor(self):
         """Test that retry policy is controlled by supervisor."""

@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi.testclient import TestClient
 
-TERMINAL = {"PASS", "FAIL", "BLOCKED", "CANCELLED"}
+TERMINAL = {"PASS", "FAIL", "BLOCKED", "BLOCKED_EXTERNAL", "CANCELLED"}
 
 
 def poll_mission(
