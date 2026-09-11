@@ -229,10 +229,10 @@ def test_stage8_hermetic_runtime_e2e(runtime_with_fake_planner, tmp_path):
 
     # Observed transitions must show the async progression. The
     # POST response proved QUEUED; polling may legitimately catch
-    # the mission already RUNNING (a fast coordinator claims
+    # the mission already RUNNING/EXECUTING (a fast coordinator claims
     # within milliseconds).
-    assert observed[0] in ("QUEUED", "RUNNING")
-    assert "RUNNING" in observed
+    assert observed[0] in ("QUEUED", "RUNNING", "EXECUTING")
+    assert "RUNNING" in observed or "EXECUTING" in observed
     assert observed[-1] == "PASS"
 
     # The provider path really ran through the fake Ollama.

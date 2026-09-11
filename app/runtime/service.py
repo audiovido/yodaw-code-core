@@ -13,24 +13,61 @@ leases, and close storage without corrupting worktrees.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 import sys
+from datetime import datetime, timezone
 
 import uvicorn
 
-from app.main import app, get_coordinator
-
+from app.main import app, get_coordinator, RequestIdLogFilter
 
 logger = logging.getLogger("yodaw.runtime")
 
 
+class JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter with correlation IDs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        # Include correlation ID if available
+        if hasattr(record, "request_id"):
+            payload["request_id"] = record.request_id
+        # Include any extra fields
+        for key, value in record.__dict__.items():
+            if key not in {
+                "name", "msg", "args", "levelname", "levelno", "pathname",
+                "filename", "module", "lineno", "funcName", "created",
+                "msecs", "relativeCreated", "thread", "threadName",
+                "processName", "process", "exc_info", "exc_text",
+                "stack_info", "getMessage", "request_id"
+            }:
+                payload[key] = value
+        return json.dumps(payload)
+
+
+def _setup_logging():
+    """Configure structured JSON logging."""
+    level = os.environ.get("YODAW_LOG_LEVEL", "INFO").upper()
+    formatter = JsonFormatter()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    handler.addFilter(RequestIdLogFilter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
 def main() -> int:
-    logging.basicConfig(
-        level=os.environ.get("YODAW_LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _setup_logging()
 
     host = os.environ.get("YODAW_HOST", "127.0.0.1")
     port = int(os.environ.get("YODAW_PORT", "8844"))
