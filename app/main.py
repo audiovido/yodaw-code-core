@@ -35,8 +35,63 @@ import json
 import os
 import threading
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# ============================================================
+# Standardized error envelope (RFC 7807 Problem Details)
+# ============================================================
+
+class ErrorEnvelope(BaseModel):
+    """RFC 7807-compatible error envelope."""
+    type: str = "about:blank"
+    title: str
+    status: int
+    detail: Optional[str] = None
+    instance: Optional[str] = None
+    trace_id: Optional[str] = None
+    errors: Optional[list[dict]] = None  # For validation errors
+
+class ValidationErrorDetail(BaseModel):
+    """Single validation error detail."""
+    loc: list
+    msg: str
+    type: str
+
+# ============================================================
+# Versioning / API metadata
+# ============================================================
+
+API_VERSION = "v1"
+API_TITLE = "YODAW Public API"
+
+# ============================================================
+# Standard exception handlers
+# ============================================================
+
+def _error_response(request: Request, exc: Exception, status: int, title: str, detail: str | None = None, headers: dict | None = None) -> JSONResponse:
+    """Build a standardized error response."""
+    from uuid import uuid4
+    envelope = ErrorEnvelope(
+        type=f"https://yodaw.ai/errors/{title.lower().replace(' ', '-')}",
+        title=title,
+        status=status,
+        detail=detail or str(exc),
+        instance=str(request.url.path),
+        trace_id=f"trc_{uuid4().hex[:12]}",
+    )
+    return JSONResponse(
+        status_code=status,
+        content=envelope.model_dump(exclude_none=True),
+        headers=headers,
+    )
+
+# ============================================================
+# App & config
+# ============================================================
 
 from app.api.auth import Principal, require, resolve_principal
 from app.api.governance import (
@@ -71,6 +126,7 @@ from app.api.v1.missions import (
     retry_product_mission,
     submit_product_mission,
 )
+from app.mission.facade import select_skills
 
 
 store = MissionStore()
@@ -251,6 +307,46 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ============================================================
+# Exception handlers (standardized errors)
+# ============================================================
+
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Convert HTTPException to RFC 7807 envelope (except 401/403 which keep minimal body)."""
+    # 401 and 403 are intentionally minimal for security
+    if exc.status_code in (401, 403):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail} if isinstance(exc.detail, str) else {"detail": "access denied"},
+            headers=exc.headers,
+        )
+    # Preserve headers for 429 and other status codes
+    return _error_response(request, exc, exc.status_code, exc.detail if isinstance(exc.detail, str) else "HTTP Error", headers=exc.headers)
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Convert validation errors to RFC 7807 envelope with field details."""
+    envelope = ErrorEnvelope(
+        type="https://yodaw.ai/errors/validation-error",
+        title="Validation Error",
+        status=422,
+        detail="Request body failed validation",
+        instance=str(request.url.path),
+        trace_id=f"trc_{__import__('uuid').uuid4().hex[:12]}",
+        errors=[{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()],
+    )
+    return JSONResponse(status_code=422, content=envelope.model_dump(exclude_none=True))
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all: never expose stack traces, return 500 with envelope."""
+    import logging
+    logging.getLogger("yodaw.api").exception("Unhandled error")
+    return _error_response(request, exc, 500, "Internal Server Error", "An unexpected error occurred")
 
 def _bearer(authorization: str | None) -> str:
     if authorization and authorization.startswith("Bearer "):
@@ -324,10 +420,43 @@ def health():
     }
 
 
+@app.get("/api/v1/ready")
+def readiness():
+    """Readiness probe: returns 200 when coordinator is healthy and can accept work."""
+    coordinator = _coordinator
+    coordinator_ready = coordinator is None or coordinator.stats().get("running", False)
+    try:
+        cfg = load_config()
+        config_ok = True
+    except Exception:
+        config_ok = False
+    ready = coordinator_ready and config_ok
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "service": "YODAW",
+            "ready": ready,
+            "coordinator": "ok" if coordinator_ready else "unavailable",
+            "config": "ok" if config_ok else "error",
+            "profile": cfg.profile if config_ok else None,
+        }
+    )
+
+@app.get("/api/v1/version")
+def version():
+    """API version and metadata."""
+    return {
+        "api_version": API_VERSION,
+        "title": API_TITLE,
+        "service_version": "0.3.0",
+        "build": __import__("os").environ.get("YODAW_BUILD_SHA", "dev"),
+    }
+
 @app.get("/api/v1/workers")
 def workers(authorization: str | None = Header(default=None)):
     _guard(authorization)
     return registry.status()
+
 
 
 @app.get("/api/v1/runtime/status")
@@ -378,11 +507,121 @@ def runtime_status(
         "configuration": profile_state,
     }
 
+# ============================================================
+# Classification endpoint
+# ============================================================
+
+class ClassifyRequest(BaseModel):
+    """Request for classification endpoint."""
+    prompt: str
+    context: dict = {}
+
+@app.post("/api/v1/classify")
+def classify_prompt(
+    request: ClassifyRequest,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Classify a prompt/task into capability and skill intent.
+
+    Body: { "prompt": "task description", "context": {...} }
+    Returns: { "capability": "...", "intent": "...", "skill": "...", "confidence": 0.0 }
+    """
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+
+    if not principal.can("missions.create"):
+        raise HTTPException(403, detail="missing permission: missions.create")
+
+    # Use the existing skill classifier
+    try:
+        from app.skills import TaskClassifier, SkillRegistry
+        from app.skills.selection import SelectionContext, SkillSelector
+        from app.skills.skills import (
+            BugfixSkill, DocumentationSkill, FeatureSkill,
+            RefactorSkill, ReviewSkill, TestSkill
+        )
+
+        registry_obj = SkillRegistry()
+        for cls in (BugfixSkill, RefactorSkill, TestSkill, ReviewSkill, FeatureSkill, DocumentationSkill):
+            try:
+                registry_obj.register(cls())
+            except Exception:
+                continue
+
+        classifier = TaskClassifier({s.id: s for s in registry_obj.get_all()})
+        classification = classifier.classify(request.prompt, context={"language": request.context.get("language")})
+        selection = SkillSelector(registry_obj).select(SelectionContext(
+            task_description=request.prompt,
+            classification=classification,
+        ))
+
+        # Map intent to capability
+        capability_map = {
+            "bugfix": "repo-code",
+            "refactor": "repo-code",
+            "test": "repo-code",
+            "review": "repo-code",
+            "feature": "repo-code",
+            "documentation": "repo-code",
+        }
+
+        capability = capability_map.get(classification.detected_intent.value, "repo-code")
+
+        return {
+            "capability": capability,
+            "intent": classification.detected_intent.value,
+            "skill": selection.selected_skill,
+            "confidence": selection.confidence,
+            "reason": classification.reason,
+            "metadata": classification.metadata,
+        }
+    except Exception:
+        return {
+            "capability": "repo-code",
+            "intent": "feature",
+            "skill": "feature",
+            "confidence": 0.5,
+            "reason": "classification unavailable",
+            "metadata": {},
+        }
+
+# ============================================================
+# Task result endpoint
+# ============================================================
+
+@app.get("/api/v1/missions/{mission_id}/result")
+def get_task_result(
+    mission_id: str,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Get the final structured result of a completed mission.
+
+    Only available for terminal missions (PASS, FAIL, BLOCKED_EXTERNAL, CANCELLED).
+    """
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+
+    mission = _load_mission_for(principal, mission_id)
+
+    terminal_statuses = {"PASS", "FAIL", "BLOCKED_EXTERNAL", "BLOCKED", "CANCELLED"}
+    if mission.status.value not in terminal_statuses:
+        raise HTTPException(409, detail=f"Mission not terminal (status: {mission.status.value})")
+
+    return {
+        "mission_id": mission.id,
+        "status": mission.status.value,
+        "result": mission.result,
+        "error_class": mission.error_class,
+        "finished_at": mission.finished_at,
+        "attempt": mission.attempt,
+        "evidence_count": len(mission.evidence),
+    }
 
 # ---------------------------------------------------------
 # Missions (client surface + isolation)
 # ---------------------------------------------------------
-
 
 def _can_read_mission(principal: Principal, mission: Mission) -> bool:
     """
