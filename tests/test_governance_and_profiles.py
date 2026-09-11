@@ -338,12 +338,22 @@ def test_unknown_profile_rejected(monkeypatch):
 
 
 def test_runtime_status_exposes_safe_config(monkeypatch):
+    import uuid
+
     monkeypatch.delenv("YODAW_API_KEY", raising=False)
     monkeypatch.delenv("YODAW_PROFILE", raising=False)
 
+    # An admin identity exists by this point in the module, so the
+    # anonymous local-open path is closed by design; authenticate
+    # explicitly rather than depending on request-path state.
+    admin = main_module.admins.create_admin(
+        f"status-root-{uuid.uuid4().hex[:8]}", role="superadmin"
+    )
+    headers = {"Authorization": f"Bearer {admin['api_key']}"}
+
     client = TestClient(main_module.app)
 
-    response = client.get("/api/v1/runtime/status")
+    response = client.get("/api/v1/runtime/status", headers=headers)
 
     assert response.status_code == 200
 
