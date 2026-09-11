@@ -1,32 +1,79 @@
 # YODAW Code Core
 
-Run locally:
+## Production Entrypoint (canonical)
 
-    source .venv/bin/activate
-    uvicorn app.main:app --host 127.0.0.1 --port 8844
+```bash
+source .venv/bin/activate
+python -m app.runtime
+```
 
-Health:
+Runs API + embedded coordinator + watchdog + outbox relay on `YODAW_HOST:YODAW_PORT`.
 
-    curl http://127.0.0.1:8844/api/v1/health
+Defaults: `127.0.0.1:8844`, SQLite `data/yodaw.db`, profile `local` (open access).
 
-Mission:
+## Quick Health Check
 
-    curl -X POST \
-      http://127.0.0.1:8844/api/v1/missions \
-      -H "Content-Type: application/json" \
-      -d '{"goal":"Test YODAW Code Core","capability":"code"}'
+```bash
+curl http://127.0.0.1:8844/api/v1/health
+# {"service":"YODAW","status":"READY","auth":"local-dev","profile":"local",...}
+```
 
-API docs:
+## Submit a Mission
 
-    http://127.0.0.1:8844/docs
+```bash
+curl -X POST http://127.0.0.1:8844/api/v1/missions \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"Test YODAW Code Core","capability":"code"}'
+# Returns QUEUED immediately with mission_id
+```
 
-## Developer testing
+## Poll for Result
+
+```bash
+MISSION_ID=m_abc123
+curl "http://127.0.0.1:8844/api/v1/missions/$MISSION_ID"
+# Poll until status in {PASS,FAIL,BLOCKED_EXTERNAL,CANCELLED}
+```
+
+## Get Evidence
+
+```bash
+curl "http://127.0.0.1:8844/api/v1/missions/$MISSION_ID/evidence"
+```
+
+## Cancel / Retry
+
+```bash
+curl -X POST "http://127.0.0.1:8844/api/v1/missions/$MISSION_ID/cancel" -d '{}'
+curl -X POST "http://127.0.0.1:8844/api/v1/missions/$MISSION_ID/retry" -d '{}'
+```
+
+## API Documentation
+
+- Swagger UI: `http://127.0.0.1:8844/docs`
+- Minimal usage guide: `docs/api_e2e_usage.md`
+- Example requests/responses: `docs/api_examples.md`
+- Graduation checklist: `docs/api_graduation_checklist.md`
+
+## E2E Smoke Test (Worker E deliverable)
+
+```bash
+# Against existing server
+python3.12 scripts/e2e_smoke.py --base-url http://127.0.0.1:8844
+
+# Start server + run full lifecycle
+python3.12 scripts/e2e_smoke.py --base-url http://127.0.0.1:8888 --start-server
+```
+
+## Developer Testing
 
 Requires Python 3.12 (`python3.12` on PATH).
 
 Canonical regression command (macOS):
 
-    ./scripts/run_regression_mac.sh
+```bash
+./scripts/run_regression_mac.sh
+```
 
 The script creates a temporary `python` -> `python3.12` shim
 because some tests and subprocesses invoke `python`, which does
