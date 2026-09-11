@@ -56,6 +56,7 @@ from app.core.models import (
     Mission,
     MissionCreate,
     MissionStatus,
+    AuditPruneRequest,
 )
 from app.runtime.repo_leases import RepoLeaseManager
 from app.storage.sqlite_store import MissionStore, DuplicateMission
@@ -250,6 +251,41 @@ app = FastAPI(
     version="0.3.0",
     lifespan=lifespan,
 )
+
+# ---------------------------------------------------------
+# Safe defaults: body-size guard + generic 500 mask
+# ---------------------------------------------------------
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+class BodyLimitMiddleware(BaseHTTPMiddleware):
+    """Enforce max request body size before payload reaches handlers."""
+    def __init__(self, app, max_bytes: int = 256 * 1024):
+        super().__init__(app)
+        self.max_bytes = max_bytes
+
+    async def dispatch(self, request, call_next):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                if int(cl) > self.max_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "request body too large"},
+                    )
+            except ValueError:
+                pass
+        return await call_next(request)
+
+app.add_middleware(BodyLimitMiddleware, max_bytes=256 * 1024)
+
+
+@app.exception_handler(Exception)
+async def _mask_server_errors(request, exc):
+    """Never leak stack traces; log internally, return generic 500."""
+    import logging
+    logging.getLogger("yodaw.api").exception("unhandled error")
+    return JSONResponse(status_code=500, content={"detail": "internal server error"})
 
 
 def _bearer(authorization: str | None) -> str:
@@ -619,8 +655,12 @@ def list_missions(
     else:
         missions = store.list()
 
-    start = max(0, int(offset))
-    end = start + max(1, min(int(limit), 500))
+    # Clamp pagination parameters to safe bounds
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+
+    start = offset
+    end = start + limit
 
     return missions[start:end]
 
@@ -1082,6 +1122,10 @@ def query_audit(
             detail="the global audit trail requires auditor access",
         )
 
+    # Clamp pagination parameters to safe bounds
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+
     return {
         "events": audit.query(
             client_id=client_id,
@@ -1163,8 +1207,11 @@ def list_outbox(
 
     _enforce_rate_limit(principal)
 
+    # Clamp pagination to safe bounds
+    limit = max(1, min(int(limit), 500))
+
     stats = store.outbox_stats()
-    pending = store.outbox_pending(limit=max(1, min(int(limit), 500)))
+    pending = store.outbox_pending(limit=limit)
 
     return {"stats": stats, "pending": pending}
 

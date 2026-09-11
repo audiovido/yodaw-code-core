@@ -21,10 +21,10 @@ from app.storage.sqlite_store import DuplicateMission
 
 
 class ProductMissionSubmit(BaseModel):
-    goal: str
+    goal: str = Field(min_length=1, pattern=r"\S")
     repo_path: str | None = None
     repo_ref: str | None = None
-    capability: str = "repo-code"
+    capability: str = Field(default="repo-code", min_length=1)
     constraints: dict[str, Any] | None = None
     model: dict[str, Any] | None = None
     provider: dict[str, Any] | None = None
