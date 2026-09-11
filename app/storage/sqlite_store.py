@@ -29,6 +29,12 @@ class DuplicateMission(Exception):
         super().__init__(message)
         self.mission_id = mission_id
 
+class StaleOwnerError(Exception):
+    """A worker that lost ownership tried a fenced write."""
+
+class InvalidStateError(Exception):
+    """A state transition violated its preconditions."""
+
 
 ACTIVE_STATUSES = (
     "QUEUED",
@@ -1371,6 +1377,16 @@ class MissionStore:
             if row:
                 db.rollback()
                 return row[0]
+            # A bare claim leaves a dangling pointer if the caller
+            # dies before inserting the mission row. New code must
+            # use submit_idempotent_mission; this path inserts the
+            # mapping only when the mission row already exists.
+            target = db.execute(
+                "SELECT id FROM missions WHERE id=?", (mission_id,)
+            ).fetchone()
+            if not target:
+                db.rollback()
+                return mission_id
             db.execute(
                 "INSERT INTO mission_idempotency("
                 "tenant_scope, idempotency_key, mission_id, created_at) "
@@ -1379,6 +1395,138 @@ class MissionStore:
             )
             db.commit()
             return mission_id
+
+    def submit_idempotent_mission(
+        self,
+        mission: Mission,
+        *,
+        tenant_scope: str,
+        idempotency_key: str | None,
+    ) -> tuple[Mission, bool]:
+        """Claim idempotency key and insert mission in one tx.
+
+        Returns (mission, replayed). Either both rows exist or
+        neither does; concurrent same-key submits yield exactly
+        one mission row. Raises DuplicateMission on single-flight
+        duplicate (no idempotency row written).
+        """
+        if not idempotency_key:
+            self.enqueue(mission)
+            stored = self.get(mission.id)
+            return (stored or mission), False
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT mission_id FROM mission_idempotency "
+                "WHERE tenant_scope=? AND idempotency_key=?",
+                (tenant_scope, idempotency_key),
+            ).fetchone()
+            if row:
+                winner = db.execute(
+                    "SELECT payload FROM missions WHERE id=?",
+                    (row[0],),
+                ).fetchone()
+                if winner:
+                    db.rollback()
+                    return Mission.model_validate_json(winner[0]), True
+                # Legacy dangling mapping (pre-atomic crash row):
+                # heal it by pointing at this submission inside
+                # the same transaction, then fall through to the
+                # mission insert below so both rows commit once.
+                db.execute(
+                    "UPDATE mission_idempotency SET mission_id=?, "
+                    "created_at=? WHERE tenant_scope=? "
+                    "AND idempotency_key=?",
+                    (mission.id, now_ts(), tenant_scope, idempotency_key),
+                )
+            repo_key = self._repo_key(mission)
+            dup = db.execute(
+                """
+                SELECT id FROM missions
+                WHERE repo_key=? AND goal=? AND id != ? AND status IN
+                    ('QUEUED','OBSERVING','PLANNING','RUNNING','EXECUTING',
+                     'VERIFYING','REPAIRING','RECOVERING')
+                """,
+                (repo_key, mission.goal, mission.id),
+            ).fetchone()
+            if dup:
+                db.rollback()
+                raise DuplicateMission(
+                    f"mission {dup[0]} already active "
+                    "for this repo and goal",
+                    mission_id=dup[0],
+                )
+            now = now_ts()
+            db.execute(
+                """
+                INSERT INTO missions(
+                    id, payload, status, goal, repo_key,
+                    claimed_by, claimed_at, heartbeat_at,
+                    cancel_requested, created_at, updated_at,
+                    client_id, priority
+                )
+                VALUES(?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?)
+                """,
+                (
+                    mission.id,
+                    mission.model_dump_json(),
+                    mission.status.value,
+                    mission.goal,
+                    repo_key,
+                    mission.created_at,
+                    now,
+                    mission.client_id,
+                    mission.priority,
+                ),
+            )
+            db.execute(
+                "INSERT INTO mission_idempotency("
+                "tenant_scope, idempotency_key, mission_id, created_at) "
+                "VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(tenant_scope, idempotency_key) DO UPDATE "
+                "SET mission_id=excluded.mission_id, "
+                "created_at=excluded.created_at",
+                (tenant_scope, idempotency_key, mission.id, now_ts()),
+            )
+            db.commit()
+        except DuplicateMission:
+            raise
+        except sqlite3.IntegrityError:
+            db.rollback()
+            row = self.idempotency_lookup(tenant_scope, idempotency_key)
+            if row:
+                winner = self.get(row)
+                if winner is not None:
+                    return winner, True
+            # Same-id replay (e.g. dry-run resubmit): mission row
+            # already exists, mapping missing -> recreate mapping.
+            existing = self.get(mission.id)
+            if existing is not None:
+                self.idempotency_claim(
+                    tenant_scope, idempotency_key, mission.id
+                )
+                return existing, True
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        stored = self.get(mission.id)
+        event_ok = True
+        try:
+            self.record_event(
+                mission.id,
+                "mission.queued",
+                attempt=0,
+                data={"goal": mission.goal, "capability": mission.capability},
+            )
+        except Exception:
+            event_ok = False
+        if stored is None:
+            raise RuntimeError("mission insert committed but row missing")
+        return stored, False
 
     def outbox_stats(self) -> dict:
         # Pending means deliverable work: undelivered AND not
@@ -1404,3 +1552,245 @@ class MissionStore:
             "delivered": row[2] or 0,
             "dead_lettered": row[3] or 0,
         }
+
+    def save_owned(self, mission: Mission, owner: str) -> Mission:
+        """Owner-fenced save: zero rows unless owner still holds it.
+
+        Raises StaleOwnerError without touching state. Used for
+        execution-owned intermediate writes.
+        """
+        db = connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT payload, claimed_by FROM missions WHERE id=?",
+                (mission.id,),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                raise InvalidStateError(f"unknown mission: {mission.id}")
+            if row[1] != owner:
+                db.rollback()
+                raise StaleOwnerError(
+                    f"mission {mission.id} owned by {row[1]!r}, "
+                    f"not {owner!r}"
+                )
+            payload = mission.model_dump_json()
+            now = now_ts()
+            db.execute(
+                """
+                UPDATE missions SET
+                    payload=?,
+                    status=?,
+                    goal=?,
+                    repo_key=COALESCE(?, repo_key),
+                    claimed_by=?,
+                    claimed_at=?,
+                    heartbeat_at=?,
+                    cancel_requested=CASE
+                        WHEN missions.cancel_requested=1 THEN 1
+                        ELSE ? END,
+                    updated_at=?,
+                    client_id=COALESCE(?, client_id),
+                    priority=?
+                WHERE id=? AND claimed_by=?
+                """,
+                (
+                    payload,
+                    mission.status.value,
+                    mission.goal,
+                    self._repo_key(mission),
+                    mission.claimed_by,
+                    mission.claimed_at,
+                    mission.heartbeat_at,
+                    int(mission.cancel_requested),
+                    now,
+                    mission.client_id,
+                    mission.priority,
+                    mission.id,
+                    owner,
+                ),
+            )
+            if db.total_changes == 0:
+                db.rollback()
+                raise StaleOwnerError(
+                    f"mission {mission.id} lost ownership race"
+                )
+            db.commit()
+            return mission
+        except (StaleOwnerError, InvalidStateError):
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def finalize_mission(        self,
+        mission_id: str,
+        *,
+        owner: str | None = None,
+        status: MissionStatus,
+        result: dict | None = None,
+        evidence: list | None = None,
+        error_class: str | None = None,
+        event_type: str = "mission.completed",
+        event_data: dict | None = None,
+        outbox_kind: str = "learning.record",
+        outbox_payload: dict | None = None,
+        outbox_idempotency_key: str | None = None,
+        require_executing: bool = True,
+    ) -> Mission:
+        """Atomically finalize: mission + event + outbox, one tx.
+
+        Verifies owner/state preconditions, updates mission row,
+        inserts terminal event and learning outbox row, commits
+        once. Stale owner or wrong state -> zero rows, raises
+        StaleOwnerError / InvalidStateError. Deterministic outbox
+        key keeps retries duplicate-free.
+        """
+        from app.storage.db import connect as _connect
+
+        allowed = {
+            MissionStatus.observing,
+            MissionStatus.planning,
+            MissionStatus.running,
+            MissionStatus.executing,
+            MissionStatus.verifying,
+            MissionStatus.repairing,
+            MissionStatus.recovering,
+        }
+        terminal = {
+            MissionStatus.passed,
+            MissionStatus.failed,
+            MissionStatus.blocked,
+            MissionStatus.blocked_external,
+            MissionStatus.cancelled,
+        }
+        if status not in terminal:
+            raise InvalidStateError(f"not a terminal status: {status}")
+        db = _connect(self.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT payload, status, claimed_by FROM missions "
+                "WHERE id=?",
+                (mission_id,),
+            ).fetchone()
+            if not row:
+                db.rollback()
+                raise InvalidStateError(f"unknown mission: {mission_id}")
+            if owner is not None and row[2] != owner:
+                db.rollback()
+                raise StaleOwnerError(
+                    f"mission {mission_id} owned by {row[2]!r}, "
+                    f"not {owner!r}"
+                )
+            current = Mission.model_validate_json(row[0])
+            if require_executing and current.status not in allowed:
+                # Idempotent replay: same terminal state already
+                # durable -> return it without duplicating outbox.
+                if current.status == status:
+                    db.rollback()
+                    return current
+                db.rollback()
+                raise InvalidStateError(
+                    f"mission {mission_id} in {current.status}, "
+                    "not an executing state"
+                )
+            if current.status in terminal and current.status != status:
+                db.rollback()
+                raise InvalidStateError(
+                    f"mission {mission_id} already {current.status}"
+                )
+            current.status = status
+            if result is not None:
+                current.result = result
+            if evidence is not None:
+                current.evidence = evidence
+            if error_class is not None:
+                current.error_class = error_class
+            now = now_ts()
+            current.finished_at = current.finished_at or now
+            payload = current.model_dump_json()
+            db.execute(
+                """
+                UPDATE missions SET
+                    payload=?, status=?, goal=?,
+                    repo_key=COALESCE(?, repo_key),
+                    claimed_by=?, claimed_at=?, heartbeat_at=?,
+                    cancel_requested=CASE
+                        WHEN missions.cancel_requested=1 THEN 1
+                        ELSE ? END,
+                    updated_at=?,
+                    client_id=COALESCE(?, client_id),
+                    priority=?
+                WHERE id=?
+                """,
+                (
+                    payload,
+                    current.status.value,
+                    current.goal,
+                    self._repo_key(current),
+                    current.claimed_by,
+                    current.claimed_at,
+                    current.heartbeat_at,
+                    int(current.cancel_requested),
+                    now,
+                    current.client_id,
+                    current.priority,
+                    mission_id,
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO mission_events(
+                    mission_id, event_type, attempt, timestamp, data
+                )
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    mission_id,
+                    event_type,
+                    current.attempt,
+                    now,
+                    json.dumps(event_data or {}),
+                ),
+            )
+            if outbox_payload is not None:
+                key = (
+                    outbox_idempotency_key
+                    or f"learning:{mission_id}"
+                )
+                existing = db.execute(
+                    "SELECT id FROM mission_outbox "
+                    "WHERE idempotency_key=?",
+                    (key,),
+                ).fetchone()
+                if not existing:
+                    db.execute(
+                        """
+                        INSERT INTO mission_outbox(
+                            mission_id, kind, payload, created_at,
+                            idempotency_key, next_attempt_at
+                        )
+                        VALUES(?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            mission_id,
+                            outbox_kind,
+                            json.dumps(outbox_payload),
+                            now,
+                            key,
+                            now,
+                        ),
+                    )
+            db.commit()
+            return current
+        except (StaleOwnerError, InvalidStateError):
+            raise
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()

@@ -26,6 +26,7 @@ Design notes:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -36,7 +37,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
-from app.storage.sqlite_store import MissionStore
+from app.storage.sqlite_store import (
+    InvalidStateError,
+    MissionStore,
+    StaleOwnerError,
+)
 from app.runtime.repo_leases import RepoLeaseManager, now_ts
 
 logger = logging.getLogger("yodaw.coordinator")
@@ -431,11 +436,21 @@ class Coordinator:
                     "error": f"No worker for capability: {mission.capability}"
                 }
                 fresh.finished_at = now_ts()
-                store.save(fresh)
+                try:
+                    fresh = self._owned_save(fresh)
+                except (StaleOwnerError, InvalidStateError):
+                    logger.error(
+                        "stale owner blocked for %s", fresh.id
+                    )
+                    return
                 return
 
             fresh.worker = worker.name
-            store.save(fresh)
+            try:
+                fresh = self._owned_save(fresh)
+            except (StaleOwnerError, InvalidStateError):
+                logger.error("stale owner blocked for %s", fresh.id)
+                return
 
             # Worker I product lifecycle: observe/plan/skills context is
             # recorded through the facade before the existing worker
@@ -483,7 +498,11 @@ class Coordinator:
                     }
                 )
                 fresh.evidence = evidence
-                store.save(fresh)
+                try:
+                    fresh = self._owned_save(fresh)
+                except (StaleOwnerError, InvalidStateError):
+                    logger.error("stale owner blocked for %s", fresh.id)
+                    return
                 store.record_event(
                     fresh.id, "mission.executing", attempt=fresh.attempt, data={}
                 )
@@ -531,53 +550,89 @@ class Coordinator:
             except Exception as exc:
                 # Worker-level contract violation (should be rare:
                 # repo worker catches its own exceptions).
-                fresh.status = MissionStatus.failed
-                fresh.result = {
+                failed_result = {
                     "error": {
                         "type": type(exc).__name__,
                         "message": str(exc),
                     }
                 }
-                fresh.finished_at = now_ts()
-                store.save(fresh)
-                store.record_event(
-                    fresh.id,
-                    "mission.completed",
-                    attempt=fresh.attempt,
-                    data={"outcome": "FAIL", "error": str(exc)},
-                )
+                try:
+                    fresh = self._finalize_terminal(
+                        fresh,
+                        status=MissionStatus.failed,
+                        result=failed_result,
+                        evidence=fresh.evidence,
+                        error_class="task",
+                        event_data={"outcome": "FAIL", "error": str(exc)},
+                        success=False,
+                    )
+                except (StaleOwnerError, InvalidStateError):
+                    logger.error(
+                        "terminal finalize rejected for %s: %s",
+                        fresh.id,
+                        traceback.format_exc(),
+                    )
+                except Exception:
+                    logger.error(
+                        "terminal finalize failed for %s\n%s",
+                        fresh.id,
+                        traceback.format_exc(),
+                    )
+                    return
+                try:
+                    self.relay.drain_once()
+                except Exception:
+                    logger.error(
+                        "eager outbox drain failed\n%s",
+                        traceback.format_exc(),
+                    )
                 return
 
             # Cancellation observed mid-flight by the worker?
             error_type = (result.get("error") or {}).get("type", "")
 
             if error_type == "Cancelled":
-                fresh.status = MissionStatus.cancelled
-                fresh.result = dict(result.get("output", {}))
-                fresh.result["error"] = result["error"]
-                fresh.evidence = list(result.get("evidence", []))
-                fresh.finished_at = now_ts()
-                store.save(fresh)
-
-                store.record_event(
-                    fresh.id,
-                    "mission.cancelled",
-                    attempt=fresh.attempt,
-                    data={"while": "executing"},
-                )
-
+                cancelled_result = dict(result.get("output", {}))
+                cancelled_result["error"] = result["error"]
+                try:
+                    fresh = self._finalize_terminal(
+                        fresh,
+                        status=MissionStatus.cancelled,
+                        result=cancelled_result,
+                        evidence=self._merged_evidence(
+                            fresh.evidence, result.get("evidence", [])
+                        ),
+                        event_type="mission.cancelled",
+                        event_data={"while": "executing"},
+                        success=False,
+                    )
+                except (StaleOwnerError, InvalidStateError):
+                    logger.error(
+                        "cancel finalize rejected for %s: %s",
+                        fresh.id,
+                        traceback.format_exc(),
+                    )
+                except Exception:
+                    logger.error(
+                        "cancel finalize failed for %s\n%s",
+                        fresh.id,
+                        traceback.format_exc(),
+                    )
+                    return
+                try:
+                    self.relay.drain_once()
+                except Exception:
+                    logger.error(
+                        "eager outbox drain failed\n%s",
+                        traceback.format_exc(),
+                    )
                 return
-
-            fresh.evidence = list(result.get("evidence", []))
-            fresh.result = dict(result.get("output", {}))
-
-            if result.get("error"):
-                fresh.result["error"] = result["error"]
 
             # Worker I: verify stage, then classify so provider faults
             # surface as BLOCKED_EXTERNAL instead of task FAIL.
+            # The verify marker is best-effort only; the terminal
+            # finalize below is the single durable commit.
             fresh.status = MissionStatus.verifying
-            store.save(fresh)
             try:
                 from app.mission.facade import classify_error
 
@@ -589,55 +644,46 @@ class Coordinator:
             except Exception:
                 error_class = None if result.get("success") else "task"
             if result.get("success"):
-                fresh.status = MissionStatus.passed
+                terminal_status = MissionStatus.passed
+                terminal_error_class = fresh.error_class
             elif error_class == "provider":
-                fresh.status = MissionStatus.blocked_external
-                fresh.error_class = "provider"
+                terminal_status = MissionStatus.blocked_external
+                terminal_error_class = "provider"
             else:
-                fresh.status = MissionStatus.failed
-                fresh.error_class = "task"
-            fresh.finished_at = now_ts()
-
-            store.save(fresh)
-
-            store.record_event(
-                fresh.id,
-                "mission.completed",
-                attempt=fresh.attempt,
-                data={
-                    "outcome": fresh.status.value,
-                    "commit_sha": fresh.result.get("commit_sha"),
-                },
-            )
-
-            # Stage 9.5: learning is produced through the durable
-            # outbox, so a crash between mission completion and
-            # learning delivery loses nothing. The relay drains it
-            # exactly-once (idempotent upsert by record id); the
-            # eager drain below keeps in-process latency at zero
-            # while the relay thread covers crash recovery.
-            from app.learning.engine import record_id_default
-
+                terminal_status = MissionStatus.failed
+                terminal_error_class = "task"
+            terminal_result = dict(result.get("output", {}))
+            if result.get("error"):
+                terminal_result["error"] = result["error"]
             try:
-                self.store.outbox_enqueue(
-                    mission_id=fresh.id,
-                    kind="learning.record",
-                    payload={
-                        "mission_id": fresh.id,
-                        "goal": fresh.goal,
-                        "worker": fresh.worker,
-                        "success": result.get("success", False),
-                        "evidence": fresh.evidence,
-                        "result": fresh.result,
-                        "record_id": record_id_default(fresh.id),
+                fresh = self._finalize_terminal(
+                    fresh,
+                    status=terminal_status,
+                    result=terminal_result,
+                    evidence=self._merged_evidence(
+                        fresh.evidence, result.get("evidence", [])
+                    ),
+                    error_class=terminal_error_class,
+                    event_data={
+                        "outcome": terminal_status.value,
+                        "commit_sha": terminal_result.get("commit_sha"),
                     },
+                    success=bool(result.get("success", False)),
                 )
-            except Exception:
+            except (StaleOwnerError, InvalidStateError):
                 logger.error(
-                    "outbox enqueue failed for mission %s\n%s",
+                    "terminal finalize rejected for %s: %s",
                     fresh.id,
                     traceback.format_exc(),
                 )
+                return
+            except Exception:
+                logger.error(
+                    "terminal finalize failed for %s\n%s",
+                    fresh.id,
+                    traceback.format_exc(),
+                )
+                return
 
             try:
                 self.relay.drain_once()
@@ -675,6 +721,15 @@ class Coordinator:
 
             self._wake.set()
 
+    def _owned_save(self, mission: Mission) -> Mission:
+        """Fenced intermediate write; stale owner aborts execution."""
+        save_owned = getattr(self.store, "save_owned", None)
+        if save_owned is None:
+            self.store.save(mission)
+            return self.store.get(mission.id) or mission
+        save_owned(mission, self.id)
+        return self.store.get(mission.id) or mission
+
     def _finalize_cancelled(self, mission: Mission, repo_key: str):
         mission.status = MissionStatus.cancelled
         mission.result = {
@@ -691,6 +746,89 @@ class Coordinator:
             attempt=0,
             data={"while": "claimed_not_started"},
         )
+
+    @staticmethod
+    def _merged_evidence(prior: list | None, new: list | None) -> list:
+        """Preserve prior evidence, append new items, skip dups."""
+        merged = list(prior or [])
+        seen = set()
+        for item in merged:
+            try:
+                seen.add(json.dumps(item, sort_keys=True))
+            except Exception:
+                seen.add(repr(item))
+        for item in new or []:
+            try:
+                key = json.dumps(item, sort_keys=True)
+            except Exception:
+                key = repr(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
+
+    def _finalize_terminal(
+        self,
+        mission: Mission,
+        *,
+        status: MissionStatus,
+        result: dict,
+        evidence: list | None,
+        error_class: str | None = None,
+        event_type: str = "mission.completed",
+        event_data: dict | None = None,
+        success: bool = False,
+    ) -> Mission:
+        """One atomic commit: mission + event + learning outbox."""
+        from app.learning.engine import record_id_default
+
+        finalize = getattr(self.store, "finalize_mission", None)
+        merged_evidence = self._merged_evidence(
+            (mission.evidence or []), evidence
+        )
+        payload = {
+            "mission_id": mission.id,
+            "goal": mission.goal,
+            "worker": mission.worker,
+            "success": success,
+            "evidence": merged_evidence,
+            "result": result,
+            "record_id": record_id_default(mission.id),
+        }
+        if finalize is None:
+            mission.status = status
+            mission.result = result
+            mission.evidence = merged_evidence
+            if error_class is not None:
+                mission.error_class = error_class
+            mission.finished_at = mission.finished_at or now_ts()
+            self.store.save(mission)
+            self.store.record_event(
+                mission.id, event_type,
+                attempt=mission.attempt, data=event_data or {},
+            )
+            self.store.outbox_enqueue(
+                mission_id=mission.id,
+                kind="learning.record",
+                payload=payload,
+                idempotency_key=f"learning:{mission.id}",
+            )
+            return self.store.get(mission.id) or mission
+        finalized = self.store.finalize_mission(
+            mission.id,
+            owner=self.id,
+            status=status,
+            result=result,
+            evidence=merged_evidence,
+            error_class=error_class,
+            event_type=event_type,
+            event_data=event_data or {},
+            outbox_kind="learning.record",
+            outbox_payload=payload,
+            outbox_idempotency_key=f"learning:{mission.id}",
+        )
+        return finalized
 
     # -----------------------------------------------------
     # Watchdog / recovery (Stage 8.5)

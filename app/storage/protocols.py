@@ -107,6 +107,45 @@ class MissionStoreProtocol(Protocol):
 
     def outbox_message(self, outbox_id: int) -> dict | None: ...
 
+    # ------------------------------------------------- idempotency
+    def idempotency_lookup(
+        self, tenant_scope: str, idempotency_key: str
+    ) -> str | None: ...
+
+    def submit_idempotent_mission(
+        self,
+        mission: Mission,
+        *,
+        tenant_scope: str,
+        idempotency_key: str | None,
+    ) -> tuple[Mission, bool]:
+        """Atomic claim+insert; returns (mission, replayed)."""
+        ...
+
+    # ------------------------------------------------- finalization
+    def save_owned(self, mission: Mission, owner: str) -> Mission:
+        """Owner-fenced save; raises on stale owner."""
+        ...
+
+    def finalize_mission(
+        self,
+        mission_id: str,
+        *,
+        owner: str | None = None,
+        status=None,
+        result: dict | None = None,
+        evidence: list | None = None,
+        error_class: str | None = None,
+        event_type: str = "mission.completed",
+        event_data: dict | None = None,
+        outbox_kind: str = "learning.record",
+        outbox_payload: dict | None = None,
+        outbox_idempotency_key: str | None = None,
+        require_executing: bool = True,
+    ) -> Mission:
+        """Atomic terminal commit: mission + event + outbox."""
+        ...
+
 
 @runtime_checkable
 class LeaseManagerProtocol(Protocol):
