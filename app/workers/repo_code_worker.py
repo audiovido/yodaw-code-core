@@ -38,6 +38,13 @@ class CancelContext:
         self.mission_id = mission_id
         self.store = store
         self.cancel_requested = False
+        if mission_id and store is not None:
+            try:
+                existing = store.get(mission_id)
+                if existing is not None:
+                    self.cancel_requested = bool(existing.cancel_requested)
+            except Exception:
+                pass
 
     def bind(self, store, mission_id: str | None):
         self.store = store

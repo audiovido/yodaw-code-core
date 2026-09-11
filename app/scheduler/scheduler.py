@@ -195,7 +195,11 @@ class Scheduler:
 
     # ------------------------------------------------- readiness
     def refresh_readiness(self) -> list[str]:
-        """Release dependencies whose parents all completed."""
+        """Release dependencies whose parents all completed.
+
+        State transitions use the store's atomic transaction so
+        concurrent dispatch or recovery cannot be lost.
+        """
         now_s = now_iso()
         released: list[str] = []
         for task in self.store.list_all():
@@ -211,48 +215,64 @@ class Scheduler:
             if task.state == TaskState.retry_wait:
                 if task.next_retry_at and task.next_retry_at > now_s:
                     continue
-                task.state = TaskState.recovering
-                self.store.save(task)
-                self.store.record_event(task.task_id, "ready", {})
-                released.append(task.task_id)
+                updated = self.store.transact_task(task.task_id, lambda t: self._retry_to_recovering(t, now_s))
+                if updated is not None:
+                    self.store.record_event(task.task_id, "ready", {})
+                    released.append(task.task_id)
                 continue
             deps = [self.store.get(dep) for dep in task.dependencies]
             if any(d is None for d in deps):
-                if task.state != TaskState.blocked:
-                    task.state = TaskState.blocked
-                    self.store.save(task)
-                    self.store.record_event(
-                        task.task_id, "blocked", {"reason": "missing_dependency"}
-                    )
+                updated = self.store.transact_task(task.task_id, lambda t: self._to_blocked(t, "missing_dependency"))
                 continue
             failed = [d for d in deps if d.state in (TaskState.failed, TaskState.cancelled)]
             if failed:
-                task.state = TaskState.failed
-                task.last_error_type = "DependencyFailed"
-                task.last_error_message = ",".join(d.task_id for d in failed)
-                task.lease_owner = None
-                task.lease_expiry = None
-                self.store.save(task)
-                self.store.record_event(
-                    task.task_id,
-                    "blocked",
-                    {"reason": "dependency_failed"},
-                )
+                updated = self.store.transact_task(task.task_id, lambda t: self._dep_failed(t, failed))
                 continue
             if all(d.state == TaskState.completed for d in deps):
-                if task.state != TaskState.ready and task.state != TaskState.recovering:
-                    task.state = TaskState.ready
-                    self.store.save(task)
+                updated = self.store.transact_task(task.task_id, lambda t: self._to_ready(t))
+                if updated is not None:
                     self.store.record_event(task.task_id, "ready", {})
                     released.append(task.task_id)
             else:
-                if task.state != TaskState.blocked:
-                    task.state = TaskState.blocked
-                    self.store.save(task)
-                    self.store.record_event(
-                        task.task_id, "blocked", {"reason": "waiting_on_dependencies"}
-                    )
+                updated = self.store.transact_task(task.task_id, lambda t: self._to_blocked(t, "waiting_on_dependencies"))
         return released
+
+    def _retry_to_recovering(self, task: TaskSpec, now_s: str) -> TaskSpec | None:
+        if task.state != TaskState.retry_wait:
+            return None
+        if task.next_retry_at and task.next_retry_at > now_s:
+            return None
+        task.state = TaskState.recovering
+        task.next_retry_at = None
+        return task
+
+    def _to_blocked(self, task: TaskSpec, reason: str) -> TaskSpec | None:
+        if task.state in (TaskState.assigned, TaskState.running, TaskState.completed, TaskState.failed, TaskState.cancelled, TaskState.blocked_external):
+            return None
+        if task.state == TaskState.blocked:
+            return None
+        task.state = TaskState.blocked
+        task.lease_owner = None
+        task.lease_expiry = None
+        return task
+
+    def _dep_failed(self, task: TaskSpec, failed: list[TaskSpec]) -> TaskSpec | None:
+        if task.state in (TaskState.assigned, TaskState.running, TaskState.completed, TaskState.failed, TaskState.cancelled, TaskState.blocked_external):
+            return None
+        task.state = TaskState.failed
+        task.last_error_type = "DependencyFailed"
+        task.last_error_message = ",".join(d.task_id for d in failed)
+        task.lease_owner = None
+        task.lease_expiry = None
+        return task
+
+    def _to_ready(self, task: TaskSpec) -> TaskSpec | None:
+        if task.state in (TaskState.assigned, TaskState.running, TaskState.completed, TaskState.failed, TaskState.cancelled, TaskState.blocked_external):
+            return None
+        if task.state in (TaskState.ready, TaskState.recovering):
+            return None
+        task.state = TaskState.ready
+        return task
 
     def effective_priority(self, task: TaskSpec) -> int:
         boost = task.wait_rounds // self.aging_threshold
@@ -503,7 +523,11 @@ class Scheduler:
     def recover(
         self, stale_worker_seconds: int | None = None
     ) -> list[str]:
-        """Recover expired leases and stale workers after restart."""
+        """Recover expired leases and stale workers after restart.
+
+        Uses per-task atomic transactions so a concurrent claim that
+        just took ownership is never overwritten by a stale scan.
+        """
         recovered: list[str] = []
         now_s = now_iso()
         stale_cutoff: str | None = None
@@ -515,25 +539,33 @@ class Scheduler:
         for task in self.store.list_all():
             if task.state not in (TaskState.assigned, TaskState.running):
                 continue
-            lease_stale = (
-                not task.lease_expiry or task.lease_expiry < now_s
-            )
-            worker_stale = False
-            if stale_cutoff is not None and task.lease_owner:
+            # Use the store's atomic claim check to avoid races.
+            # If another worker holds a live lease, we skip.
+            if task.lease_expiry and task.lease_expiry >= now_s:
+                if stale_cutoff is None or not task.lease_owner:
+                    continue
                 worker = self.store.get_worker(task.lease_owner)
-                if worker is None or worker.heartbeat_at < stale_cutoff:
-                    worker_stale = True
-            if not (lease_stale or worker_stale):
-                continue
-            task.state = TaskState.recovering
-            task.lease_owner = None
-            task.lease_expiry = None
-            self.store.save(task)
-            self.store.record_event(task.task_id, "recovered", {})
-            recovered.append(task.task_id)
+                if worker is not None and worker.heartbeat_at >= stale_cutoff:
+                    continue
+            # Attempt atomic recovery via store transaction.
+            updated = self.store.transact_task(task.task_id, lambda t: self._recover_task(t, now_s))
+            if updated is not None:
+                self.store.record_event(task.task_id, "recovered", {})
+                recovered.append(task.task_id)
         if recovered:
             self.refresh_readiness()
         return recovered
+
+    def _recover_task(self, task: TaskSpec, now_s: str) -> TaskSpec | None:
+        """Return updated task for recovery, or None to skip."""
+        if task.state not in (TaskState.assigned, TaskState.running):
+            return None
+        if task.lease_expiry and task.lease_expiry >= now_s:
+            return None
+        task.state = TaskState.recovering
+        task.lease_owner = None
+        task.lease_expiry = None
+        return task
 
     # ------------------------------------------------- merge coordination
     def _register_merge(self, task: TaskSpec, output: TaskOutput) -> MergeCandidate:

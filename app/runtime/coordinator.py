@@ -367,14 +367,17 @@ class Coordinator:
         return True
 
     def _requeue(self, mission: Mission):
-        try:
-            mission.status = MissionStatus.queued
-            mission.claimed_by = None
-            mission.claimed_at = None
-            mission.heartbeat_at = None
-            self.store.save(mission)
-        except Exception:
-            pass
+        """Atomically requeue a mission that couldn't acquire repo lease."""
+        self.store.transact_mission(mission.id, lambda m: self._requeue_inner(m))
+
+    def _requeue_inner(self, mission: Mission) -> Mission | None:
+        if mission.status not in (MissionStatus.running, MissionStatus.observing, MissionStatus.planning, MissionStatus.executing, MissionStatus.verifying, MissionStatus.repairing, MissionStatus.recovering):
+            return None
+        mission.status = MissionStatus.queued
+        mission.claimed_by = None
+        mission.claimed_at = None
+        mission.heartbeat_at = None
+        return mission
 
     # -----------------------------------------------------
     # Execution
