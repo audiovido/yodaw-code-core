@@ -42,9 +42,11 @@ from app.runtime.repo_identity import repo_identity
 from app.storage.sqlite_store import (
     ACTIVE_STATUSES,
     DuplicateMission,
+    InvalidStateError,
     OUTBOX_BACKOFF_BASE_SECONDS,
     OUTBOX_BACKOFF_MAX_SECONDS,
     OUTBOX_MAX_ATTEMPTS,
+    StaleOwnerError,
 )
 
 try:
@@ -154,6 +156,15 @@ SCHEMA_SQL = [
     )
     """,
     # ------------------------------------------------- clients
+    """
+    CREATE TABLE IF NOT EXISTS mission_idempotency (
+        tenant_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        mission_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_scope, idempotency_key)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS api_clients (
         id TEXT PRIMARY KEY,
@@ -869,6 +880,353 @@ class PostgresMissionStore:
                 raise RuntimeError(
                     "outbox insert neither inserted nor resolved"
                 )
+
+    # -----------------------------------------------------
+    # Idempotency + finalization (parity with SQLite)
+    # -----------------------------------------------------
+
+    def idempotency_lookup(
+        self, tenant_scope: str, idempotency_key: str
+    ) -> str | None:
+        with self._connect() as db:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT mission_id FROM mission_idempotency "
+                    "WHERE tenant_scope=%s AND idempotency_key=%s",
+                    (tenant_scope, idempotency_key),
+                )
+                row = cur.fetchone()
+        return row[0] if row else None
+
+    def submit_idempotent_mission(
+        self,
+        mission: Mission,
+        *,
+        tenant_scope: str,
+        idempotency_key: str | None,
+    ) -> tuple[Mission, bool]:
+        """Atomic claim+insert; returns (mission, replayed)."""
+        if not idempotency_key:
+            self.enqueue(mission)
+            return (self.get(mission.id) or mission), False
+        repo_key = _repo_key(mission)
+        with self._connect() as db:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT mission_id FROM mission_idempotency "
+                    "WHERE tenant_scope=%s AND idempotency_key=%s "
+                    "FOR UPDATE",
+                    (tenant_scope, idempotency_key),
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        "SELECT payload FROM missions WHERE id=%s",
+                        (row[0],),
+                    )
+                    winner = cur.fetchone()
+                    if winner:
+                        payload = winner[0]
+                        db.commit()
+                        return (
+                            Mission.model_validate_json(payload)
+                            if isinstance(payload, str)
+                            else Mission.model_validate(payload)
+                        ), True
+                    cur.execute(
+                        "UPDATE mission_idempotency SET mission_id=%s, "
+                        "created_at=%s WHERE tenant_scope=%s "
+                        "AND idempotency_key=%s",
+                        (
+                            mission.id,
+                            now_ts(),
+                            tenant_scope,
+                            idempotency_key,
+                        ),
+                    )
+                cur.execute(
+                    """
+                    SELECT id FROM missions
+                    WHERE repo_key=%s AND goal=%s AND id != %s
+                      AND status IN ('QUEUED','OBSERVING','PLANNING',
+                        'RUNNING','EXECUTING','VERIFYING','REPAIRING',
+                        'RECOVERING')
+                    FOR UPDATE
+                    """,
+                    (repo_key, mission.goal, mission.id),
+                )
+                dup = cur.fetchone()
+                if dup:
+                    db.rollback()
+                    raise DuplicateMission(
+                        f"mission {dup[0]} already active "
+                        "for this repo and goal",
+                        mission_id=dup[0],
+                    )
+                now = now_ts()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO missions(
+                            id, payload, status, goal, repo_key,
+                            claimed_by, claimed_at, heartbeat_at,
+                            cancel_requested, created_at, updated_at,
+                            client_id, priority
+                        )
+                        VALUES(%s, %s, %s, %s, %s, NULL, NULL,
+                               NULL, FALSE, %s, %s, %s, %s)
+                        """,
+                        (
+                            mission.id,
+                            mission.model_dump_json(),
+                            mission.status.value,
+                            mission.goal,
+                            repo_key,
+                            mission.created_at,
+                            now,
+                            mission.client_id,
+                            mission.priority,
+                        ),
+                    )
+                except Exception:
+                    db.rollback()
+                    existing_key = self.idempotency_lookup(
+                        tenant_scope, idempotency_key
+                    )
+                    if existing_key:
+                        winner = self.get(existing_key)
+                        if winner is not None:
+                            return winner, True
+                    existing = self.get(mission.id)
+                    if existing is not None:
+                        return existing, True
+                    raise
+                cur.execute(
+                    """
+                    INSERT INTO mission_idempotency(
+                        tenant_scope, idempotency_key, mission_id,
+                        created_at
+                    )
+                    VALUES(%s, %s, %s, %s)
+                    ON CONFLICT (tenant_scope, idempotency_key)
+                    DO UPDATE SET mission_id=EXCLUDED.mission_id,
+                                  created_at=EXCLUDED.created_at
+                    """,
+                    (tenant_scope, idempotency_key, mission.id, now_ts()),
+                )
+            db.commit()
+        stored = self.get(mission.id)
+        if stored is None:
+            raise RuntimeError("mission insert committed but row missing")
+        try:
+            self.record_event(
+                mission.id,
+                "mission.queued",
+                attempt=0,
+                data={"goal": mission.goal, "capability": mission.capability},
+            )
+        except Exception:
+            pass
+        return stored, False
+
+    def save_owned(self, mission: Mission, owner: str) -> Mission:
+        """Owner-fenced save; raises StaleOwnerError on mismatch."""
+        with self._connect() as db:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT claimed_by FROM missions WHERE id=%s "
+                    "FOR UPDATE",
+                    (mission.id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    db.rollback()
+                    raise InvalidStateError(
+                        f"unknown mission: {mission.id}"
+                    )
+                if row[0] != owner:
+                    db.rollback()
+                    raise StaleOwnerError(
+                        f"mission {mission.id} owned by {row[0]!r}, "
+                        f"not {owner!r}"
+                    )
+                cur.execute(
+                    """
+                    UPDATE missions SET
+                        payload=%s, status=%s, goal=%s,
+                        repo_key=COALESCE(%s, repo_key),
+                        claimed_by=%s, claimed_at=%s, heartbeat_at=%s,
+                        updated_at=%s,
+                        client_id=COALESCE(%s, client_id),
+                        priority=%s
+                    WHERE id=%s AND claimed_by=%s
+                    """,
+                    (
+                        mission.model_dump_json(),
+                        mission.status.value,
+                        mission.goal,
+                        _repo_key(mission),
+                        mission.claimed_by,
+                        mission.claimed_at,
+                        mission.heartbeat_at,
+                        now_ts(),
+                        mission.client_id,
+                        mission.priority,
+                        mission.id,
+                        owner,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    db.rollback()
+                    raise StaleOwnerError(
+                        f"mission {mission.id} lost ownership race"
+                    )
+            db.commit()
+            return mission
+
+    def finalize_mission(
+        self,
+        mission_id: str,
+        *,
+        owner: str | None = None,
+        status=None,
+        result: dict | None = None,
+        evidence: list | None = None,
+        error_class: str | None = None,
+        event_type: str = "mission.completed",
+        event_data: dict | None = None,
+        outbox_kind: str = "learning.record",
+        outbox_payload: dict | None = None,
+        outbox_idempotency_key: str | None = None,
+        require_executing: bool = True,
+    ) -> Mission:
+        """Atomic terminal commit: mission + event + outbox."""
+        allowed = {
+            MissionStatus.observing, MissionStatus.planning,
+            MissionStatus.running, MissionStatus.executing,
+            MissionStatus.verifying, MissionStatus.repairing,
+            MissionStatus.recovering,
+        }
+        terminal = {
+            MissionStatus.passed, MissionStatus.failed,
+            MissionStatus.blocked, MissionStatus.blocked_external,
+            MissionStatus.cancelled,
+        }
+        if status not in terminal:
+            raise InvalidStateError(f"not a terminal status: {status}")
+        with self._connect() as db:
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT payload, status, claimed_by FROM missions "
+                    "WHERE id=%s FOR UPDATE",
+                    (mission_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    db.rollback()
+                    raise InvalidStateError(
+                        f"unknown mission: {mission_id}"
+                    )
+                if owner is not None and row[2] != owner:
+                    db.rollback()
+                    raise StaleOwnerError(
+                        f"mission {mission_id} owned by {row[2]!r}, "
+                        f"not {owner!r}"
+                    )
+                payload = row[0]
+                current = (
+                    Mission.model_validate_json(payload)
+                    if isinstance(payload, str)
+                    else Mission.model_validate(payload)
+                )
+                if require_executing and current.status not in allowed:
+                    if current.status == status:
+                        db.rollback()
+                        return current
+                    db.rollback()
+                    raise InvalidStateError(
+                        f"mission {mission_id} in {current.status}, "
+                        "not an executing state"
+                    )
+                if current.status in terminal and current.status != status:
+                    db.rollback()
+                    raise InvalidStateError(
+                        f"mission {mission_id} already {current.status}"
+                    )
+                current.status = status
+                if result is not None:
+                    current.result = result
+                if evidence is not None:
+                    current.evidence = evidence
+                if error_class is not None:
+                    current.error_class = error_class
+                now = now_ts()
+                current.finished_at = current.finished_at or now
+                cur.execute(
+                    """
+                    UPDATE missions SET
+                        payload=%s, status=%s, goal=%s,
+                        repo_key=COALESCE(%s, repo_key),
+                        claimed_by=%s, claimed_at=%s, heartbeat_at=%s,
+                        updated_at=%s,
+                        client_id=COALESCE(%s, client_id),
+                        priority=%s
+                    WHERE id=%s
+                    """,
+                    (
+                        current.model_dump_json(),
+                        current.status.value,
+                        current.goal,
+                        _repo_key(current),
+                        current.claimed_by,
+                        current.claimed_at,
+                        current.heartbeat_at,
+                        now,
+                        current.client_id,
+                        current.priority,
+                        mission_id,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO mission_events(
+                        mission_id, event_type, attempt, timestamp, data
+                    )
+                    VALUES(%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        mission_id,
+                        event_type,
+                        current.attempt,
+                        now,
+                        json.dumps(event_data or {}),
+                    ),
+                )
+                if outbox_payload is not None:
+                    key = (
+                        outbox_idempotency_key
+                        or f"learning:{mission_id}"
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO mission_outbox(
+                            mission_id, kind, payload, created_at,
+                            idempotency_key, next_attempt_at
+                        )
+                        VALUES(%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (idempotency_key) DO NOTHING
+                        """,
+                        (
+                            mission_id,
+                            outbox_kind,
+                            json.dumps(outbox_payload),
+                            now,
+                            key,
+                            now,
+                        ),
+                    )
+            db.commit()
+            return current
 
     def outbox_pending(
         self, limit: int = 100, kinds: list[str] | None = None
