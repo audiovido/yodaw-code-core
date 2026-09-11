@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
+from app.runtime.repo_identity import RepoNotAllowed, ensure_authorized
 from app.workers.base import Worker, WorkerResult
 from app.workers.python_runtime import resolve_python_executable
 from app.llm.coder import generate_edit_plan, generate_repair_plan
@@ -666,7 +667,23 @@ class RepoCodeWorker(Worker):
                 retryable=False,
             )
 
-        repo = Path(repo_path).expanduser().resolve()
+        # Canonicalize through the shared identity helper and
+        # re-check authorization here: a mission admitted before the
+        # operator tightened YODAW_REPO_ROOTS must not still reach the
+        # filesystem.
+        try:
+            repo = Path(ensure_authorized(repo_path))
+        except RepoNotAllowed as exc:
+            return WorkerResult(
+                success=False,
+                output={},
+                evidence=[],
+                error={
+                    "type": "RepoNotAllowed",
+                    "message": str(exc),
+                },
+                retryable=False,
+            )
 
         if not (repo / ".git").exists():
             return WorkerResult(

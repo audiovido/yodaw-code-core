@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.core.models import Mission, MissionStatus
+from app.runtime.repo_identity import repo_identity
 from app.storage.db import DB_PATH, connect
 
 # Stage 10.6: shared relay policy. The SQLite store applies the
@@ -470,10 +471,17 @@ class MissionStore:
 
     @staticmethod
     def _repo_key(mission: Mission) -> str:
-        repo_path = mission.metadata.get("repo_path")
-        if repo_path:
-            return str(repo_path)
-        return f"capability:{mission.capability}"
+        """
+        Canonical single-flight + lease key for a mission target.
+
+        Canonicalization is what makes the key trustworthy: without
+        it, `/repo`, `/repo/`, and a symlink to `/repo` would be
+        three distinct keys, letting one directory be claimed twice
+        concurrently and letting duplicate submissions through.
+        """
+        return repo_identity(
+            mission.metadata.get("repo_path"), mission.capability
+        )
 
     def enqueue(self, mission: Mission) -> None:
         """

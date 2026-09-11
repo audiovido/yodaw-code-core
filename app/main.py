@@ -115,6 +115,12 @@ from app.core.models import (
     MissionStatus,
     AuditPruneRequest,
 )
+from app.runtime.repo_identity import (
+    RepoNotAllowed,
+    canonical_repo_path,
+    ensure_authorized,
+    repo_roots_report,
+)
 from app.runtime.repo_leases import RepoLeaseManager
 from app.storage.sqlite_store import MissionStore, DuplicateMission
 from app.tenants.admins import AdminStore
@@ -484,6 +490,7 @@ def health():
         "config_ok": config_ok,
         "config_error": config_error,
         "profile": cfg.profile if cfg else None,
+        "repository_bound": repo_roots_report(),
     }
 
 
@@ -728,13 +735,45 @@ def create_mission(
     metadata = dict(request.metadata or {})
     dry_run = bool(request.dry_run or metadata.pop("dry_run", False))
     body_key = request.idempotency_key or metadata.pop("idempotency_key", None)
+    # Resolve exactly one authoritative target repository. The
+    # top-level field wins and a metadata alias may supply the value
+    # only when the field is absent; every candidate is canonicalized
+    # and the aliases are then dropped, so the path that gets
+    # authorized, the path that keys deduplication and leases, and the
+    # path the worker actually opens are the same directory under the
+    # same spelling. A conflicting pair is refused further down, after
+    # authentication, so an anonymous caller never learns the
+    # difference between a bad credential and a bad repository.
+    legacy_repo = next(
+        (
+            metadata.get(alias)
+            for alias in ("repo_path", "repo_ref", "repo")
+            if metadata.get(alias)
+        ),
+        None,
+    )
+    declared_repos = {
+        canonical
+        for canonical in (
+            canonical_repo_path(request.repo_path),
+            canonical_repo_path(legacy_repo),
+        )
+        if canonical
+    }
+    declared_repo = canonical_repo_path(request.repo_path) or (
+        canonical_repo_path(legacy_repo)
+    )
+
     for alias in ("repo_path", "repo_ref", "repo"):
-        if metadata.get(alias) and "repo_path" not in metadata:
-            metadata["repo_path"] = metadata[alias]
+        metadata.pop(alias, None)
+
+    if declared_repo:
+        metadata["repo_path"] = declared_repo
+
     product_request = ProductMissionSubmit(
         goal=request.goal,
-        repo_path=request.repo_path or metadata.get("repo_path"),
-        repo_ref=request.repo_ref or metadata.get("repo_ref"),
+        repo_path=declared_repo,
+        repo_ref=request.repo_ref,
         capability=request.capability,
         constraints=request.constraints or metadata.get("constraints"),
         model=request.model or metadata.get("preferred_model") or metadata.get("model"),
@@ -772,6 +811,40 @@ def create_mission(
         )
 
         raise HTTPException(413, detail=reason)
+
+    # Repository trust boundary (Stage 11): reject a target that lies
+    # outside every operator-authorized root, and reject a request that
+    # names two different repositories through two surfaces.
+    if len(declared_repos) > 1:
+        audit.append(
+            client_id=principal.client_id,
+            actor=principal.name,
+            action="mission.rejected",
+            data={
+                "reason": "conflicting_repository",
+                "via": principal.kind,
+            },
+        )
+
+        raise HTTPException(
+            status_code=400,
+            detail="conflicting repository references",
+        )
+
+    try:
+        ensure_authorized(declared_repo)
+    except RepoNotAllowed as exc:
+        audit.append(
+            client_id=principal.client_id,
+            actor=principal.name,
+            action="mission.rejected",
+            data={
+                "reason": "repository_not_allowed",
+                "via": principal.kind,
+            },
+        )
+
+        raise HTTPException(status_code=403, detail=str(exc))
 
     # Mission creation rate (separate from the general bucket).
     bucket_key = principal.client_id or principal.admin_id or (
@@ -1662,49 +1735,18 @@ def _create_product_mission_impl(
     authorization: str | None,
     idempotency_key: str | None,
 ):
-    principal = resolve_principal(authorization)
-    if not principal.can("missions.create"):
-        raise HTTPException(403, detail="missing permission: missions.create")
-    _enforce_rate_limit(principal)
-    ok, reason = check_payload_governance(
-        goal=request.goal,
-        metadata={**(request.metadata or {}), "repo": request.repo_path or request.repo_ref},
-        config=_governance_config_for(principal),
-    )
-    if not ok:
-        raise HTTPException(413, detail=reason)
+    """
+    Legacy product-mission aliases.
 
-    def _enqueue(mission):
-        worker = registry.find(mission.capability)
-        if worker is None:
-            mission.status = MissionStatus.blocked
-            mission.error_class = "task"
-            mission.result = {
-                "error": f"No worker for capability: {mission.capability}"
-            }
-            mission.finished_at = mission.updated_at
-            store.save(mission)
-            return mission
-        store.enqueue(mission)
-        return mission
-
-    def _wake():
-        coordinator = get_coordinator()
-        if coordinator is not None:
-            coordinator.wake()
-
-    mission, replayed = submit_product_mission(
-        store=store,
-        audit=audit,
-        principal=principal,
-        request=request,
-        header_key=idempotency_key,
-        enqueue=_enqueue,
-        wake=_wake,
-    )
-    view = product_view(mission)
-    view["replayed"] = replayed
-    return view
+    This used to be a second, independent admission path that
+    re-implemented governance, worker lookup, and enqueue. Two
+    admission paths inevitably drift, and the duplicate one had
+    already lost repository canonicalization and the repository trust
+    boundary. It now delegates to the single authoritative admission
+    path (`create_mission`), which already returns the documented
+    `replayed` flag.
+    """
+    return create_mission(request, authorization, idempotency_key)
 
 
 @app.post("/api/v1/product-missions")
