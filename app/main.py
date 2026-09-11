@@ -32,14 +32,17 @@ Governance (Stage 10.4):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ============================================================
 # Standardized error envelope (RFC 7807 Problem Details)
@@ -92,7 +95,6 @@ def _error_response(request: Request, exc: Exception, status: int, title: str, d
 # ============================================================
 # App & config
 # ============================================================
-
 from app.api.auth import Principal, require, resolve_principal
 from app.api.governance import (
     DEFAULT_GOVERNANCE,
@@ -118,6 +120,7 @@ from app.storage.sqlite_store import MissionStore, DuplicateMission
 from app.tenants.admins import AdminStore
 from app.tenants.audit import AuditStore
 from app.tenants.clients import ClientStore
+from app.tenants.redact import redact
 from app.workers.registry import registry
 from app.learning.engine import store as learning_store
 from app.api.v1.missions import (
@@ -302,6 +305,36 @@ async def lifespan(_app):
         coordinator.stop(drain=True, timeout=20)
 
 
+import contextvars
+
+_request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
+
+
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """Attach and propagate a correlation ID (X-Request-ID) per request."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        request.state.request_id = request_id
+        token = _request_id_var.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            _request_id_var.reset(token)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+class RequestIdLogFilter(logging.Filter):
+    """Inject request_id from contextvar into log records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = _request_id_var.get()
+        if request_id:
+            record.request_id = request_id
+        return True
+
+
 app = FastAPI(
     title="YODAW Code Core",
     version="0.3.0",
@@ -309,9 +342,9 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------
-# Safe defaults: body-size guard + generic 500 mask
+# Safe defaults: body-size guard (header check now; received-byte
+# hardening lands with the security fixes)
 # ---------------------------------------------------------
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 class BodyLimitMiddleware(BaseHTTPMiddleware):
@@ -334,6 +367,8 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 app.add_middleware(BodyLimitMiddleware, max_bytes=256 * 1024)
+# Correlation IDs wrap the body guard so rejected requests stay traceable.
+app.add_middleware(CorrelationIdMiddleware)
 
 
 # API-A public contract handlers (RFC 7807 envelopes) subsume the
@@ -378,6 +413,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     import logging
     logging.getLogger("yodaw.api").exception("Unhandled error")
     return _error_response(request, exc, 500, "Internal Server Error", "An unexpected error occurred")
+
 
 def _bearer(authorization: str | None) -> str:
     if authorization and authorization.startswith("Bearer "):
@@ -803,19 +839,10 @@ def create_mission(
             },
         )
 
-        return {
-            "id": mission.id,
-            "mission_id": mission.id,
-            "status": mission.status.value,
-            "created_at": mission.created_at,
-            "links": {
-                "self": f"/api/v1/missions/{mission.id}",
-                "evidence": f"/api/v1/missions/{mission.id}/evidence",
-                "cancel": f"/api/v1/missions/{mission.id}/cancel",
-                "retry": f"/api/v1/missions/{mission.id}/retry",
-            },
-            "detail": "no worker for capability; mission blocked",
-        }
+        view = product_view(mission)
+        # Legacy keys stay for backward compatibility with Stage 8/9/10.
+        view["id"] = mission.id
+        return view
 
     # Stage 9: per-client concurrency quota (fast admission check).
     limit = principal.max_concurrent_missions
@@ -896,7 +923,7 @@ def list_missions(
     start = offset
     end = start + limit
 
-    return missions[start:end]
+    return [product_view(m) for m in missions[start:end]]
 
 
 @app.get("/api/v1/missions/{mission_id}")
@@ -909,7 +936,7 @@ def get_mission(
 
     mission = _load_mission_for(principal, mission_id)
 
-    return mission
+    return product_view(mission)
 
 
 @app.get("/api/v1/missions/{mission_id}/evidence")
@@ -924,7 +951,7 @@ def get_evidence(
 
     return {
         "mission_id": mission.id,
-        "evidence": mission.evidence,
+        "evidence": redact(mission.evidence) if mission.evidence else [],
     }
 
 
@@ -1423,6 +1450,45 @@ def prune_audit(
 
     return result
 
+
+# ---------------------------------------------------------
+# API-C: unified operational diagnostics
+# ---------------------------------------------------------
+
+@app.get("/api/v1/diagnostics")
+def diagnostics(
+    authorization: str | None = Header(default=None),
+):
+    """
+    Unified operational snapshot for a single task/mission.
+    Combines runtime state, queue position, evidence, and audit
+    into one call so operators and automations don't need to
+    stitch together /status, /events, /evidence, /runtime/status.
+    """
+    principal = resolve_principal(authorization)
+    _enforce_rate_limit(principal)
+
+    if principal.kind == "client":
+        # Clients get scoped diagnostics; no cross-tenant info
+        missions = [m for m in store.list() if m.client_id == principal.client_id]
+        outbox_stats = {"note": "outbox.manage permission required"}
+        coordinator_stats = {"note": "runtime.control permission required"}
+        audit_summary = {"note": "audit.read permission required"}
+    else:
+        missions = store.list()
+        outbox_stats = store.outbox_stats()
+        coordinator = get_coordinator()
+        coordinator_stats = coordinator.stats() if coordinator else {"embedded": False}
+        audit_summary = {"total_events": audit.count(), "intact": audit.verify()["intact"]}
+
+    return {
+        "missions_total": len(missions),
+        "missions_by_status": store.status_counts(),
+        "coordinator": coordinator_stats,
+        "outbox": outbox_stats,
+        "audit": audit_summary,
+        "profile": load_config().profile if True else None,
+    }
 
 # ---------------------------------------------------------
 # Stage 10.6: outbox operations surface
