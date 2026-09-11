@@ -258,6 +258,11 @@ class LocalLLMProvider:
                 time.sleep(delay)
 
     def _ollama(self, system: str, user: str) -> str:
+        print(f"!!! PROVIDER _OLLAMA CALLED: model={self.model!r}", flush=True)
+        if self.model == "test":
+            # Return a non-JSON string to cause an error if LLM is used, so we can see if deduction worked.
+            print("!!! PROVIDER returning non-JSON for test model", flush=True)
+            return 'not a json'
         payload = {
             "model": self.model,
             "stream": False,

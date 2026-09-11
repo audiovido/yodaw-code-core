@@ -629,6 +629,11 @@ class Coordinator:
                     )
                 return
 
+            # Refetch the mission to ensure we have the latest state before proceeding.
+            fresh = store.get(mission.id)
+            if fresh is None:
+                return
+
             # Worker I: verify stage, then classify so provider faults
             # surface as BLOCKED_EXTERNAL instead of task FAIL.
             # The verify marker is best-effort only; the terminal
