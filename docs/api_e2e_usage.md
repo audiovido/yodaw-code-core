@@ -33,6 +33,11 @@ curl http://127.0.0.1:8844/api/v1/health
 
 Production profiles (`single-node`, `multi-process`, `production`) require auth: set `YODAW_API_KEY` or create admin identities.
 
+**Supported release scope:** trusted single-node operation only, verified end-to-end by Worker E
+(see `docs/api_graduation_final_repo_code.md`). With no `YODAW_REPO_ROOTS` configured the
+server accepts any local `repo_path`; set `YODAW_REPO_ROOTS` at startup to confine repo targets
+(outside/`..`/symlink → 403). Broader or multi-tenant deployment is not proven.
+
 ---
 
 ## Quick Start (curl)
