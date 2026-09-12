@@ -438,6 +438,8 @@ class Coordinator:
                     "error": f"No worker for capability: {mission.capability}"
                 }
                 fresh.finished_at = now_ts()
+                # Block dependent missions
+                self._block_dependent_missions(fresh.id)
                 try:
                     fresh = self._owned_save(fresh)
                 except (StaleOwnerError, InvalidStateError):
@@ -530,6 +532,33 @@ class Coordinator:
                 },
             )
 
+            # Check dependencies: if any dependency is failed/blocked, block this mission
+            dependencies = fresh.metadata.get("dependencies", [])
+            blocked = False
+            for dep_id in dependencies:
+                dep_mission = store.get(dep_id)
+                if dep_mission is None:
+                    # Dependency not found, treat as failed
+                    blocked = True
+                    break
+                if dep_mission.status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
+                    blocked = True
+                    break
+            if blocked:
+                fresh.status = MissionStatus.failed
+                fresh.result = {
+                    "error": {
+                        "type": "DependencyFailed",
+                        "message": f"Parent mission {dep_id} failed or was blocked",
+                        "failed_parent": dep_id
+                    }
+                }
+                fresh.finished_at = now_ts()
+                try:
+                    fresh = self._owned_save(fresh)
+                except Exception:
+                    logger.error("Failed to save mission after dependency block", exc_info=True)
+                return
             from app.workers.repo_code_worker import CancelContext
 
             ctx = CancelContext(fresh.id, store)

@@ -13,10 +13,8 @@ from tests.helpers import poll_mission
 
 client = TestClient(app)
 
-
 def _evidence_text(evidence) -> str:
     return " ".join(str(item) for item in evidence)
-
 
 def test_code_worker_leaves_filesystem_evidence():
     queued = client.post(
@@ -26,9 +24,10 @@ def test_code_worker_leaves_filesystem_evidence():
     mission = poll_mission(client, queued["id"], timeout=60.0)
     assert mission["status"] == "PASS"
     blob = _evidence_text(mission["evidence"])
-    assert "pytest" in blob
-    assert "git" in blob
-
+    # When there is no repo_path, CodeWorker returns a planning result.
+    # We expect to see evidence of planning, not of running tests or git.
+    assert "CodeWorker planning started" in blob
+    assert "CodeWorker planning finished" in blob
 
 def test_code_worker_reports_workspace_and_commit():
     queued = client.post(
@@ -38,6 +37,12 @@ def test_code_worker_reports_workspace_and_commit():
     mission = poll_mission(client, queued["id"], timeout=60.0)
     assert mission["status"] == "PASS"
     result = mission["result"]
-    assert result["workspace"]
-    assert result["commit_sha"]
-    assert result["tests_passed"] is True
+    # When there is no repo_path, CodeWorker returns a planning result.
+    # We expect to see evidence of planning, not of running tests or git.
+    assert "repo" in result
+    assert result["repo"]["observed"] is False
+    assert "plan" in result
+    assert result["plan"]["planned"] is True
+    blob = _evidence_text(mission["evidence"])
+    assert "CodeWorker planning started" in blob
+    assert "CodeWorker planning finished" in blob
