@@ -710,13 +710,12 @@ class RepoCodeWorker(Worker):
         # Debug prints
         print(f"DEBUG worker: goal={goal!r}", flush=True)
         print(f"DEBUG worker: metadata={metadata!r}", flush=True)
-        print(f"DEBUG worker: explicit_edits initial={explicit_edits!r}", flush=True)
-        print(f"DEBUG: goal.startswith('Modify ')={goal.startswith('Modify ')}", flush=True)
-        print(f"DEBUG: ' to say ' in goal={' to say ' in goal}", flush=True)
-
         # First, try to get explicit_edits from metadata
         explicit_edits = metadata.get("edits")
+        print(f"DEBUG worker: explicit_edits initial={explicit_edits!r}", flush=True)
         print(f"DEBUG: after metadata, explicit_edits={explicit_edits!r}", flush=True)
+        print(f"DEBUG: goal.startswith('Modify ')={goal.startswith('Modify ')}", flush=True)
+        print(f"DEBUG: ' to say ' in goal={' to say ' in goal}", flush=True)
 
         if explicit_edits is None:
             target_file = metadata.get("target_file")
