@@ -11,6 +11,9 @@ class CodeWorker:
 
     capabilities = {"code"}
 
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
+
     def execute(self, goal: str, metadata: Optional[dict] = None) -> dict:
         # Small delay to allow cancellation to be processed if requested immediately
         time.sleep(0.1)
