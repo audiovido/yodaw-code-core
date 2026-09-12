@@ -705,6 +705,10 @@ class RepoCodeWorker(Worker):
                 retryable=False,
             )
 
+        # First, try to get explicit_edits from metadata
+        explicit_edits = metadata.get("edits")
+        print(f"DEBUG: after metadata, explicit_edits={explicit_edits!r}", flush=True)
+
         print(f"DEBUG worker: past git check", flush=True)
         print(f"DEBUG worker: about to print goal debugs", flush=True)
         # Debug prints
@@ -713,10 +717,6 @@ class RepoCodeWorker(Worker):
         print(f"DEBUG worker: explicit_edits initial={explicit_edits!r}", flush=True)
         print(f"DEBUG: goal.startswith('Modify ')={goal.startswith('Modify ')}", flush=True)
         print(f"DEBUG: ' to say ' in goal={' to say ' in goal}", flush=True)
-
-        # First, try to get explicit_edits from metadata
-        explicit_edits = metadata.get("edits")
-        print(f"DEBUG: after metadata, explicit_edits={explicit_edits!r}", flush=True)
 
         if explicit_edits is None:
             target_file = metadata.get("target_file")
@@ -1265,8 +1265,13 @@ class RepoCodeWorker(Worker):
                     evidence,
                     retries,
                 )
-
-                clean_after_restore = worktree_is_clean(worktree)
+                # Debug: check worktree status after restore
+                status_after_restore = run(
+                    ["git", "status", "--short"],
+                    cwd=worktree,
+                )
+                clean_after_restore = status_after_restore["returncode"] == 0 and not status_after_restore["stdout"].strip()
+                print(f"DEBUG: After restore, worktree git status: {status_after_restore}", flush=True)
 
                 evidence.append(
                     {
