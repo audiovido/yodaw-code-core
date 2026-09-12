@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 data/*.db
+.yodaw/
 workspace/*
 !workspace/.gitkeep
 .env

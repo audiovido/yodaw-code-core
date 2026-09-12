@@ -1,6 +1,49 @@
 # YODAW Code Core
 
+## Launcher (one command)
+
+`./yodaw` (or `python -m app.launcher`) is the product entrypoint: it
+starts, supervises, and stops the whole runtime — API + embedded
+coordinator + watchdog + outbox relay — as one unit. No shell
+one-liners, no manual process management.
+
+```bash
+./yodaw start          # start the runtime (idempotent)
+./yodaw status         # supervisor + service state + live health
+./yodaw stop           # graceful shutdown (drain, SIGKILL fallback)
+./yodaw restart        # stop, then start
+./yodaw logs [-n 50] [-f]   # supervisor + runtime logs
+./yodaw health         # print GET /api/v1/health
+```
+
+Behavior:
+
+- **Single process set.** `start` spawns a detached supervisor that
+  owns the `runtime` service (`python -m app.runtime`). Backend order
+  is preserved: the runtime embeds API, coordinator, watchdog, and
+  outbox relay, and every spawn passes the `/api/v1/health` readiness
+  gate before it is declared running.
+- **No duplicates.** The supervisor holds an exclusive flock on its
+  pidfile, so a second `start` is a safe no-op. Both `start` and the
+  supervisor refuse to run while another process already answers
+  `YODAW_HOST:YODAW_PORT`.
+- **Crash recovery.** If the runtime dies, the supervisor respawns it
+  with capped backoff and records `restarts` / `last_error` in
+  `status`.
+- **Graceful shutdown.** `stop` signals the supervisor, which drains
+  the runtime (SIGTERM, then SIGKILL after the 25s drain window)
+  and removes its pidfile; orphans are reaped from the state file.
+
+State and logs live in `YODAW_RUNTIME_DIR` (default `<repo>/.yodaw`:
+`supervisor.pid`, `state.json`, `yodaw.log`) — repo-relative and
+env-overridable, never a hardcoded user path. The interpreter is
+`YODAW_PYTHON`, else `<repo>/.venv/bin/python`, else `python3.12`,
+else `python3`. `status --json` emits the same state as inline text
+for automation.
+
 ## Production Entrypoint (canonical)
+
+Low-level equivalent of `./yodaw start` (used by the launcher itself):
 
 ```bash
 source .venv/bin/activate
