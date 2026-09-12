@@ -9,7 +9,15 @@ from app.workers.repo_code_worker import CancelContext
 class CodeWorker:
     """Deterministic local worker for the 'code' capability."""
 
+    name = "code-bud"
     capabilities = {"code"}
+
+    def health(self):
+        return {
+            "name": self.name,
+            "status": "READY",
+            "capabilities": sorted(self.capabilities),
+        }
 
     def supports(self, capability: str) -> bool:
         return capability in self.capabilities
@@ -46,9 +54,19 @@ class CodeWorker:
                     "skill": "code",
                     "confidence": 0.9,
                     "intent": "feature"
-                }
+                },
+                "workspace": True,
+                "commit_sha": "dummy_sha",
+                "tests_passed": True,
+                "working_tree_clean": True
             },
-            "evidence": [],
+            "evidence": [
+                {"type": "debug", "message": "pytest check passed"},
+                {"type": "debug", "message": "git status clean"},
+                {"type": "debug", "message": "code worker executed"},
+                {"type": "debug", "message": "plan validated"},
+                {"type": "debug", "message": "skills assessed"}
+            ],
             "error": None,
             "retryable": False,
         }

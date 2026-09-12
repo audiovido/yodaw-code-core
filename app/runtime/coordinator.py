@@ -43,6 +43,7 @@ from app.storage.sqlite_store import (
     MissionStore,
     StaleOwnerError,
 )
+from app.storage.db import connect
 from app.runtime.repo_leases import RepoLeaseManager, now_ts
 
 logger = logging.getLogger("yodaw.coordinator")

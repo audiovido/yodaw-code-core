@@ -655,6 +655,7 @@ class RepoCodeWorker(Worker):
         metadata = metadata or {}
         evidence = []
         evidence.append({"type": "debug", "message": "WORKER EXECUTE STARTED", "goal": goal})
+        explicit_edits = None
 
         repo_path = (
             metadata.get("repo_path")
