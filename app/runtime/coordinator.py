@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import traceback
@@ -776,7 +777,7 @@ class Coordinator:
     def _block_dependent_missions(self, failed_mission_id: str):
         """Block missions that depend on the failed mission."""
         print(f"DEBUG: _block_dependent_missions called for failed_mission_id={failed_mission_id}")
-        with connect(self.path) as db:
+        with sqlite3.connect(self.path) as db:
             # Find missions that have this mission as a dependency
             # We need to scan all missions and check their metadata for dependencies
             cursor = db.execute(
