@@ -312,6 +312,12 @@ async def lifespan(_app):
     unsafe production combinations (Stage 10.7).
     """
     try:
+        # File-based product config feeds the same environment the
+        # runtime reads (env vars already set always win, so this is
+        # a no-op unless a config file exists).
+        from app.product_config import apply_product_config
+
+        apply_product_config()
         cfg = load_config()
     except Exception as exc:
         # Surface the ConfigError message in the failure.

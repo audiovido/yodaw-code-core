@@ -11,6 +11,42 @@ Runs API + embedded coordinator + watchdog + outbox relay on `YODAW_HOST:YODAW_P
 
 Defaults: `127.0.0.1:8844`, SQLite `data/yodaw.db`, profile `local` (open access).
 
+## Configuration
+
+One canonical TOML config file; no manual environment editing.
+First run: `yodaw config init`, then `yodaw config validate`.
+Effective (non-secret) settings: `yodaw config show` / `--json`.
+
+File locations (first match wins):
+
+- `YODAW_CONFIG` (explicit)
+- `~/Library/Application Support/yodaw/config.toml` (macOS)
+- `${XDG_CONFIG_HOME:-~/.config}/yodaw/config.toml`
+- `./yodaw.config.toml`
+
+```toml
+[llm]
+provider = "auto"   # auto | ollama | openai | anthropic
+mode     = "auto"   # auto | local | remote
+model    = "auto"   # model id, or "auto" for the provider default
+# base_url = "..."            # override the provider endpoint
+# api_key_env = "OPENAI_API_KEY"
+
+[server]
+profile = "local"   # local | single-node | multi-process | production
+port    = 8844
+
+[logging]
+level = "INFO"
+```
+
+Environment variables always win over the file (`YODAW_LLM_PROVIDER`,
+`YODAW_LLM_MODE`, `YODAW_LLM_MODEL`, `YODAW_LLM_BASE_URL`,
+`YODAW_LLM_API_KEY`, `YODAW_LLM_API_KEY_ENV`, `YODAW_PROFILE`,
+`YODAW_HOST`, `YODAW_PORT`, `YODAW_LOG_LEVEL`). Keys live in
+environment variables only — the file names the variable, and neither
+the file nor logs ever contain the secret.
+
 ## Quick Health Check
 
 ```bash
