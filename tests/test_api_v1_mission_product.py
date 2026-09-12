@@ -5,9 +5,11 @@ evidence, blocked-external vs task failure, success, tenant
 isolation, and concurrent duplicate submit. No provider/network.
 """
 
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -265,3 +267,128 @@ def test_product_status_and_capabilities_endpoints():
     capabilities = client.get("/api/v1/capabilities")
     assert capabilities.status_code == 200
     assert "capabilities" in capabilities.json()
+
+
+def _make_smoke_repo(root: Path) -> Path:
+    """Real temporary git repo for a deterministic repo mission."""
+    import subprocess
+
+    repo = root / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        subprocess.run(
+            ["git", *args], cwd=repo, check=True,
+            capture_output=True, text=True,
+        )
+
+    run("init")
+    run("config", "user.email", "test@example.com")
+    run("config", "user.name", "Test")
+    (repo / "app.py").write_text("def greet():\n    return 'old'\n")
+    (repo / "test_app.py").write_text(
+        "from app import greet\n\n"
+        "def test_greet():\n"
+        "    assert greet() == 'hello'\n"
+    )
+    (repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
+    run("add", ".")
+    run("commit", "-m", "baseline")
+    return repo
+
+
+def _poll_terminal(client, mission_id, timeout=45.0):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        body = client.get(f"/api/v1/missions/{mission_id}").json()
+        status = body["status"]
+        if status != last:
+            last = status
+        if status in (
+            "PASS", "FAIL", "BLOCKED",
+            "BLOCKED_EXTERNAL", "CANCELLED",
+        ):
+            return body
+        time.sleep(0.1)
+    raise AssertionError(
+        f"mission {mission_id} not terminal (last {last})"
+    )
+
+
+def test_product_top_level_dependencies_block_through_public_api():
+    """
+    Top-level ProductMissionSubmit.dependencies must survive the
+    API and drive coordinator blocking: failed parent => dependent
+    BLOCKED_EXTERNAL (DependencyFailed), dependent worker never
+    executes.
+    """
+    client = make_client()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # A long-running real-repo mission first in the queue keeps
+        # both serving slots busy, so the dependent stays QUEUED
+        # while the parent fails and the blocker scans.
+        filler = client.post(
+            "/api/v1/missions",
+            json={
+                "goal": (
+                    "Modify app.py to say "
+                    "def greet():\n    return 'hello'\n"
+                ),
+                "capability": "code",
+                "repo_path": str(_make_smoke_repo(root)),
+            },
+        ).json()
+        assert filler["status"] == "QUEUED"
+
+        # Parent: capability code against a non-git directory fails
+        # through the coordinator with RepoError.
+        notgit = root / "notgit"
+        notgit.mkdir()
+        parent = client.post(
+            "/api/v1/missions",
+            json={
+                "goal": "Modify app.py to say def broken():\n    pass\n",
+                "capability": "code",
+                "repo_path": str(notgit),
+            },
+        ).json()
+        parent_id = parent["mission_id"]
+
+        # Dependent goes through the public API with TOP-LEVEL
+        # dependencies (never smuggled into metadata).
+        dependent = client.post(
+            "/api/v1/missions",
+            json={
+                "goal": "dependent of failed parent",
+                "capability": "code",
+                "dependencies": [parent_id],
+            },
+        ).json()
+        dependent_id = dependent["mission_id"]
+
+        # 1+2: the top-level field is persisted into mission metadata.
+        stored = main_module.store.get(dependent_id)
+        assert stored.metadata.get("dependencies") == [parent_id]
+
+        parent_terminal = _poll_terminal(client, parent_id)
+        assert parent_terminal["status"] == "FAIL"
+
+        dependent_terminal = _poll_terminal(client, dependent_id)
+        # 3: blocking through the public API path: dependent worker
+        # never executes.
+        assert dependent_terminal["status"] == "BLOCKED_EXTERNAL"
+        error = (dependent_terminal.get("result") or {}).get("error") or {}
+        assert error.get("type") == "DependencyFailed"
+        assert error.get("failed_parent") == parent_id
+        assert dependent_terminal["worker"] is None
+        assert dependent_terminal["claimed_by"] is None
+        assert dependent_terminal["evidence"] == []
+
+        # Draining the filler (and its isolated worktree) before the
+        # tempdir goes away: a still-running repo worker would share
+        # the second-granularity `workspace/repo_<ts>` name with any
+        # concurrently executing RepoCodeWorker in the suite.
+        assert _poll_terminal(client, filler["mission_id"])["status"] == "PASS"
