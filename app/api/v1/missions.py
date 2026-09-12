@@ -78,6 +78,7 @@ def product_view(mission: Mission) -> dict:
     return {
         "id": mission.id,
         "mission_id": mission.id,
+        "goal": mission.goal,
         "status": to_product_status(mission.status),
         "created_at": mission.created_at,
         "updated_at": mission.updated_at,
