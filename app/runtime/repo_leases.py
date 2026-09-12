@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from app.storage.db import DB_PATH, connect
 
@@ -49,7 +50,7 @@ class RepoLeaseManager:
         self,
         repo_key: str,
         owner: str,
-        mission_id: str | None = None,
+        mission_id: Optional[str] = None,
         stale_after_seconds: int = 300,
     ) -> bool:
         """
@@ -146,7 +147,7 @@ class RepoLeaseManager:
 
         return {row[0] for row in rows}
 
-    def holder(self, repo_key: str) -> str | None:
+    def holder(self, repo_key: str) -> Optional[str]:
         with connect(self.path) as db:
             row = db.execute(
                 "SELECT owner FROM repo_leases WHERE repo_key=?",

@@ -8,6 +8,7 @@ asserting on the POST response body.
 """
 
 import time
+from typing import Optional
 
 from fastapi.testclient import TestClient
 
@@ -19,7 +20,7 @@ def poll_mission(
     mission_id: str,
     timeout: float = 30.0,
     interval: float = 0.1,
-    headers: dict | None = None,
+    headers: Optional[dict] = None,
 ):
     deadline = time.monotonic() + timeout
 

@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.runtime.repo_identity import RepoNotAllowed, ensure_authorized
 from app.workers.base import Worker, WorkerResult
@@ -35,7 +36,7 @@ class CancelContext:
     it must never break mission execution.
     """
 
-    def __init__(self, mission_id: str | None, store=None):
+    def __init__(self, mission_id: Optional[str], store=None):
         self.mission_id = mission_id
         self.store = store
         self.cancel_requested = False
@@ -47,7 +48,7 @@ class CancelContext:
             except Exception:
                 pass
 
-    def bind(self, store, mission_id: str | None):
+    def bind(self, store, mission_id: Optional[str]):
         self.store = store
 
         if mission_id and mission_id != self.mission_id:
@@ -227,7 +228,7 @@ def detect_test_commands(worktree: Path):
     return commands
 
 
-def normalize_edits(plan: dict) -> list | None:
+def normalize_edits(plan: dict) -> Optional[list]:
     """
     Accept either the structured multi-edit plan or the legacy
     Stage 6 single-edit shape and return an edits list, or None
@@ -495,7 +496,7 @@ def build_failure_context(
 def collect_learning_lessons(
     goal: str,
     evidence: list,
-    mission_id: str | None = None,
+    mission_id: Optional[str] = None,
     limit: int = 3,
 ):
     """
@@ -646,9 +647,10 @@ class RepoCodeWorker(Worker):
             "capabilities": sorted(self.capabilities),
         }
 
-    def execute(self, goal: str, metadata: dict | None = None) -> WorkerResult:
+    def execute(self, goal: str, metadata: Optional[dict] = None) -> WorkerResult:
         metadata = metadata or {}
         evidence = []
+        evidence.append({"type": "debug", "message": "WORKER EXECUTE STARTED", "goal": goal})
 
         repo_path = (
             metadata.get("repo_path")
@@ -697,7 +699,51 @@ class RepoCodeWorker(Worker):
                 retryable=False,
             )
 
-        worktree_root = Path("workspace")
+        # First, try to get explicit_edits from metadata
+        explicit_edits = metadata.get("edits")
+
+        if explicit_edits is None:
+            target_file = metadata.get("target_file")
+            find_text = metadata.get("find")
+            replace_text = metadata.get("replace")
+
+            if (
+                target_file
+                and find_text is not None
+                and replace_text is not None
+            ):
+                explicit_edits = [
+                    {
+                        "target_file": target_file,
+                        "find": find_text,
+                        "replace": replace_text,
+                    }
+                ]
+
+        # If we still don't have explicit_edits, try to deduce from the goal for simple file modification.
+        if explicit_edits is None and goal.startswith("Modify ") and " to say " in goal:
+            parts = goal.split(" to say ", 1)
+            if len(parts) == 2:
+                file_part = parts[0][len("Modify "):].strip()
+                new_content = parts[1].strip()
+                repo_path = metadata.get("repo_path")
+                if repo_path and os.path.exists(repo_path):
+                    file_path = os.path.join(repo_path, file_part)
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r') as f:
+                                original_content = f.read()
+                            explicit_edits = [{
+                                "target_file": file_part,
+                                "find": original_content,
+                                "replace": new_content,
+                            }]
+                        except Exception:
+                            pass
+
+        is_llm_mission = explicit_edits is None
+
+        worktree_root = Path("workspace").resolve()
         worktree_root.mkdir(exist_ok=True)
 
         branch_name = (
@@ -705,10 +751,10 @@ class RepoCodeWorker(Worker):
             or f"yodaw/task-{int(datetime.now().timestamp())}"
         )
 
-        worktree = Path(
-            tempfile.mkdtemp(prefix="repo_", dir=worktree_root)
-        )
-        worktree.rmdir()
+        worktree = worktree_root / f"repo_{int(datetime.now().timestamp())}"
+        # Ensure the worktree directory does not exist (remove if it does)
+        if worktree.exists():
+            shutil.rmtree(worktree, ignore_errors=True)
 
         max_retries = int(metadata.get("max_retries", 1))
         retries = 0
@@ -803,27 +849,7 @@ class RepoCodeWorker(Worker):
             # the next plan is requested. Only a final PASS may
             # produce the single mission commit.
             # -------------------------------------------------
-            explicit_edits = metadata.get("edits")
-
-            if explicit_edits is None:
-                target_file = metadata.get("target_file")
-                find_text = metadata.get("find")
-                replace_text = metadata.get("replace")
-
-                if (
-                    target_file
-                    and find_text is not None
-                    and replace_text is not None
-                ):
-                    explicit_edits = [
-                        {
-                            "target_file": target_file,
-                            "find": find_text,
-                            "replace": replace_text,
-                        }
-                    ]
-
-            is_llm_mission = explicit_edits is None
+            
 
             # Detect validation tooling once, before any edit is
             # applied, so a missing tool fails fast with a clear

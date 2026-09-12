@@ -31,6 +31,7 @@ class ProductMissionSubmit(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     dry_run: bool = False
     idempotency_key: str | None = None
+    dependencies: list[str] | None = None
 
 
 def tenant_scope(principal: Principal) -> str:
@@ -127,6 +128,8 @@ def build_metadata(request: ProductMissionSubmit) -> dict:
     metadata["max_retries"] = metadata.get(
         "max_retries", MAX_RETRY_ATTEMPTS - 1
     )
+    if request.dependencies is not None:
+        metadata["dependencies"] = request.dependencies
     return metadata
 
 

@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 from datetime import datetime, timezone
 
@@ -40,19 +40,19 @@ class MissionCreate(BaseModel):
     capability: str = "code"
     metadata: dict[str, Any] = Field(default_factory=dict)
     # Worker I product surface (all optional; legacy callers omit).
-    repo_path: str | None = None
-    repo_ref: str | None = None
-    constraints: dict[str, Any] | None = None
-    model: dict[str, Any] | None = None
-    provider: dict[str, Any] | None = None
+    repo_path: Optional[str] = None
+    repo_ref: Optional[str] = None
+    constraints: Optional[dict[str, Any]] = None
+    model: Optional[dict[str, Any]] = None
+    provider: Optional[dict[str, Any]] = None
     dry_run: bool = False
-    idempotency_key: str | None = None
+    idempotency_key: Optional[str] = None
 
 
 class ClientCreate(BaseModel):
     name: str
     priority: int = 5
-    max_concurrent_missions: int | None = None
+    max_concurrent_missions: Optional[int] = None
 
 
 class ClientPriorityUpdate(BaseModel):
@@ -60,7 +60,7 @@ class ClientPriorityUpdate(BaseModel):
 
 
 class ClientQuotaUpdate(BaseModel):
-    max_concurrent_missions: int | None = None
+    max_concurrent_missions: Optional[int] = None
 
 
 class AdminCreate(BaseModel):
@@ -74,7 +74,7 @@ class AdminRoleUpdate(BaseModel):
 
 class AuditPruneRequest(BaseModel):
     keep_days: int
-    archive_path: str | None = None
+    archive_path: Optional[str] = None
 
 
 class Mission(BaseModel):
@@ -82,7 +82,7 @@ class Mission(BaseModel):
     goal: str
     capability: str
     status: MissionStatus = MissionStatus.queued
-    worker: str | None = None
+    worker: Optional[str] = None
     result: dict[str, Any] = Field(default_factory=dict)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -94,23 +94,23 @@ class Mission(BaseModel):
     # idempotency_key makes resubmission exactly-once per tenant.
     # error_class is task | provider | blocked_external | cancelled.
     attempt_lineage: list[str] = Field(default_factory=list)
-    retried_from_id: str | None = None
-    idempotency_key: str | None = None
-    error_class: str | None = None
+    retried_from_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    error_class: Optional[str] = None
 
     # Stage 8 runtime fields. All defaulted so Stage 7 payloads
     # and requests keep loading without migration of stored JSON.
     attempt: int = 0
     max_attempts: int = 1
-    claimed_by: str | None = None
-    claimed_at: str | None = None
-    started_at: str | None = None
-    heartbeat_at: str | None = None
-    finished_at: str | None = None
+    claimed_by: Optional[str] = None
+    claimed_at: Optional[str] = None
+    started_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
+    finished_at: Optional[str] = None
     cancel_requested: bool = False
 
     # Stage 9 multi-tenancy. Default priority keeps single-tenant
     # (Stage 8) ordering identical; client_id is None for calls
     # made without a client identity (local-dev / shared key).
-    client_id: str | None = None
+    client_id: Optional[str] = None
     priority: int = 5

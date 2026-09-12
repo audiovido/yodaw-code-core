@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Optional
 
 
 ALLOWED_LICENSES = {
@@ -10,7 +11,7 @@ ALLOWED_LICENSES = {
 }
 
 
-def _days_since(iso_value: str | None) -> int | None:
+def _days_since(iso_value: Optional[str]) -> Optional[int]:
     if not iso_value:
         return None
 

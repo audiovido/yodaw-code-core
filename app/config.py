@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
+from typing import Optional
 
 
 class ConfigError(Exception):
@@ -46,7 +48,7 @@ class RuntimeConfig:
     profile: str
     embed_coordinator: bool
     backend: str                    # sqlite | postgres
-    database_url: str | None        # Postgres DSN, if backend=postgres
+    database_url: Optional[str]     # Postgres DSN, if backend=postgres
     db_path: str                    # SQLite path, if backend=sqlite
     auth_mode: str                  # open | shared-key | identities
     require_auth: bool
@@ -91,7 +93,7 @@ def _auth_mode() -> str:
     return "open"
 
 
-def load_config(profile: str | None = None) -> RuntimeConfig:
+def load_config(profile: Optional[str] = None) -> RuntimeConfig:
     """
     Read the environment into a RuntimeConfig and validate it.
 

@@ -15,6 +15,7 @@ import time
 import urllib.request
 
 import pytest
+from typing import Optional
 
 from app.core.models import Mission
 from app.storage.sqlite_store import MissionStore
@@ -26,7 +27,7 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def http_get(url: str, timeout: float = 2.0, headers: dict | None = None):
+def http_get(url: str, timeout: float = 2.0, headers: Optional[dict] = None):
     request = urllib.request.Request(url, headers=headers or {})
 
     try:
@@ -46,7 +47,7 @@ def http_post_json(
     url: str,
     payload: dict,
     timeout: float = 5.0,
-    headers: dict | None = None,
+    headers: Optional[dict] = None,
 ):
     import json
 

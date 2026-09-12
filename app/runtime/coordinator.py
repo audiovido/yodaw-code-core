@@ -35,8 +35,10 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Optional
 
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
+from app.storage.db import connect
 from app.storage.sqlite_store import (
     InvalidStateError,
     MissionStore,
@@ -90,8 +92,8 @@ class Coordinator:
 
     def __init__(
         self,
-        store: MissionStore | None = None,
-        leases: RepoLeaseManager | None = None,
+        store: Optional[MissionStore] = None,
+        leases: Optional[RepoLeaseManager] = None,
         registry=None,
         id_prefix: str = "coord",
         relay=None,
@@ -115,8 +117,8 @@ class Coordinator:
         self._inflight_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._hb_thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
+        self._hb_thread: Optional[threading.Thread] = None
         self._shutting_down = False
 
         # Observability for the heartbeat loop: every failure is
@@ -375,7 +377,7 @@ class Coordinator:
         """Atomically requeue a mission that couldn't acquire repo lease."""
         self.store.transact_mission(mission.id, lambda m: self._requeue_inner(m))
 
-    def _requeue_inner(self, mission: Mission) -> Mission | None:
+    def _requeue_inner(self, mission: Mission) -> Optional[Mission]:
         if mission.status not in (MissionStatus.running, MissionStatus.observing, MissionStatus.planning, MissionStatus.executing, MissionStatus.verifying, MissionStatus.repairing, MissionStatus.recovering):
             return None
         mission.status = MissionStatus.queued
@@ -443,6 +445,8 @@ class Coordinator:
                         "stale owner blocked for %s", fresh.id
                     )
                     return
+                # Block dependent missions
+                self._block_dependent_missions(fresh.id)
                 return
 
             fresh.worker = worker.name
@@ -748,7 +752,7 @@ class Coordinator:
         )
 
     @staticmethod
-    def _merged_evidence(prior: list | None, new: list | None) -> list:
+    def _merged_evidence(prior: Optional[list], new: Optional[list]) -> list:
         """Preserve prior evidence, append new items, skip dups."""
         merged = list(prior or [])
         seen = set()
@@ -768,16 +772,77 @@ class Coordinator:
             merged.append(item)
         return merged
 
+    def _block_dependent_missions(self, failed_mission_id: str):
+        """Block missions that depend on the failed mission."""
+        with connect(self.path) as db:
+            # Find missions that have this mission as a dependency
+            # We need to scan all missions and check their metadata for dependencies
+            cursor = db.execute(
+                """
+                SELECT id, payload FROM missions 
+                WHERE status IN ('QUEUED', 'OBSERVING', 'PLANNING')
+                """
+            )
+            rows = cursor.fetchall()
+            
+            for mission_id, payload in rows:
+                try:
+                    mission = Mission.model_validate_json(payload)
+                    dependencies = mission.metadata.get("dependencies", [])
+                    if failed_mission_id in dependencies:
+                        # Block this dependent mission
+                        mission.status = MissionStatus.blocked_external
+                        mission.result = {
+                            **mission.result,
+                            "error": {
+                                "type": "DependencyFailed",
+                                "message": f"Parent mission {failed_mission_id} failed or was blocked",
+                                "failed_parent": failed_mission_id
+                            }
+                        }
+                        mission.finished_at = now_ts()
+                        # Update in database
+                        db.execute(
+                            """
+                            UPDATE missions SET
+                                payload=?,
+                                status=?,
+                                finished_at=?,
+                                updated_at=?
+                            WHERE id=?
+                            """,
+                            (
+                                mission.model_dump_json(),
+                                mission.status.value,
+                                mission.finished_at,
+                                now_ts(),
+                                mission_id,
+                            ),
+                        )
+                        # Record the blocking event
+                        self.record_event(
+                            mission_id,
+                            "mission.blocked",
+                            attempt=mission.attempt,
+                            data={
+                                "reason": "DependencyFailed",
+                                "failed_parent": failed_mission_id
+                            }
+                        )
+                except Exception as e:
+                    # Skip corrupt payloads
+                    continue
+
     def _finalize_terminal(
         self,
         mission: Mission,
         *,
         status: MissionStatus,
         result: dict,
-        evidence: list | None,
-        error_class: str | None = None,
+        evidence: Optional[list],
+        error_class: Optional[str] = None,
         event_type: str = "mission.completed",
-        event_data: dict | None = None,
+        event_data: Optional[dict] = None,
         success: bool = False,
     ) -> Mission:
         """One atomic commit: mission + event + learning outbox."""
@@ -814,6 +879,8 @@ class Coordinator:
                 payload=payload,
                 idempotency_key=f"learning:{mission.id}",
             )
+            if status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
+                self._block_dependent_missions(mission.id)
             return self.store.get(mission.id) or mission
         finalized = self.store.finalize_mission(
             mission.id,
@@ -828,6 +895,8 @@ class Coordinator:
             outbox_payload=payload,
             outbox_idempotency_key=f"learning:{mission.id}",
         )
+        if status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
+            self._block_dependent_missions(mission.id)
         return finalized
 
     # -----------------------------------------------------

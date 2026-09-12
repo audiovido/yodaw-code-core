@@ -67,8 +67,8 @@ def test_pg_store_satisfies_mission_protocol_hermetically():
 
     methods = {
         name
-        for name in MissionStoreProtocol.__protocol_attrs__  # type: ignore[attr-defined]
-        if not name.startswith("_")
+        for name in MissionStoreProtocol.__dict__
+        if not name.startswith("_") and callable(getattr(MissionStoreProtocol, name))
     }
 
     for name in methods:

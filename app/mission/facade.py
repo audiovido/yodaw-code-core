@@ -54,7 +54,6 @@ TASK_ERROR_TYPES = {
 
 MAX_RETRY_ATTEMPTS = 3
 
-
 def classify_error(error: Any) -> str:
     """Classify a worker error without collapsing provider faults."""
     if not error:
@@ -88,7 +87,6 @@ def classify_error(error: Any) -> str:
         return "task"
     return "task"
 
-
 def observe_repo(repo_path: str | None) -> dict:
     """Build repo context through the existing intelligence engine."""
     if not repo_path:
@@ -105,7 +103,6 @@ def observe_repo(repo_path: str | None) -> dict:
         }
     except Exception as exc:
         return {"observed": False, "reason": str(exc)}
-
 
 def build_plan(goal: str, repo_context: dict) -> dict:
     """Decompose through the existing planning layer (no duplicate)."""
@@ -124,7 +121,6 @@ def build_plan(goal: str, repo_context: dict) -> dict:
         }
     except Exception as exc:
         return {"planned": False, "reason": str(exc)}
-
 
 def select_skills(goal: str, repo_context: dict) -> dict:
     """Select skills through the existing classifier/registry."""
@@ -175,7 +171,6 @@ def select_skills(goal: str, repo_context: dict) -> dict:
     except Exception as exc:
         return {"selected": False, "reason": str(exc)}
 
-
 def transition(
     store, mission_id: str, status: MissionStatus, event: str
 ) -> Mission | None:
@@ -192,7 +187,6 @@ def transition(
     except Exception:
         pass
     return store.get(mission_id)
-
 
 def run_product_lifecycle(
     store,
@@ -245,7 +239,6 @@ def run_product_lifecycle(
         return execute(fresh)
     return store.get(mission.id) or fresh
 
-
 def finalize_from_worker_result(store, mission_id: str, worker_result: dict) -> Mission | None:
     """Apply bounded recovery labels and error classification."""
     mission = store.get(mission_id)
@@ -265,7 +258,6 @@ def finalize_from_worker_result(store, mission_id: str, worker_result: dict) -> 
     mission.error_class = error_class if not success else mission.error_class
     store.save(mission)
     return mission
-
 
 def retry_allowed(mission: Mission) -> tuple[bool, str]:
     """Bounded retry policy with terminal/attempt guards."""
