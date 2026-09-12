@@ -287,6 +287,52 @@ def test_worker_crash_finalizes_and_releases_lease(tmp_path):
     assert "mission.completed" in events
 
 
+def test_failed_parent_blocks_dependent_mission(tmp_path):
+    """
+    Regression: _block_dependent_missions used connect(self.path)
+    and self.record_event — neither exists on Coordinator, so the
+    dependent was never blocked and an AttributeError was silently
+    swallowed. Coordinator must block dependents through its real
+    store path and record the blocking event.
+    """
+    worker = RecordingWorker(fail=True)
+    coordinator, store, _ = make_coordinator(tmp_path, worker)
+
+    repo_key = str(tmp_path / "dep-repo")
+    parent = Mission(
+        goal="parent fails",
+        capability="repo-code",
+        metadata={"repo_path": repo_key},
+    )
+    store.enqueue(parent)
+    parent_claim = store.claim_next(coordinator.id)
+
+    dependent = Mission(
+        goal="dependent must not run",
+        capability="repo-code",
+        metadata={"repo_path": repo_key, "dependencies": [parent.id]},
+    )
+    store.enqueue(dependent)
+
+    coordinator._execute(parent_claim, repo_key)
+
+    final_parent = store.get(parent.id)
+    assert final_parent.status == MissionStatus.failed
+
+    final_dep = store.get(dependent.id)
+    assert final_dep.status == MissionStatus.blocked_external
+    assert final_dep.result["error"]["type"] == "DependencyFailed"
+    assert final_dep.result["error"]["failed_parent"] == parent.id
+    assert final_dep.finished_at is not None
+
+    # The dependent was never claimed, so its worker must not run.
+    assert worker.executed == ["parent fails"]
+    assert "dependent must not run" not in worker.executed
+
+    events = [e["event_type"] for e in store.events(dependent.id)]
+    assert "mission.blocked" in events
+
+
 def test_outbox_enqueue_failure_does_not_fail_mission(tmp_path):
     class FlakyOutboxStore(MissionStore):
         def outbox_enqueue(self, **kwargs):

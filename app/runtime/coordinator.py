@@ -774,7 +774,7 @@ class Coordinator:
 
     def _block_dependent_missions(self, failed_mission_id: str):
         """Block missions that depend on the failed mission."""
-        with connect(self.path) as db:
+        with connect(self.store.path) as db:
             # Find missions that have this mission as a dependency
             # We need to scan all missions and check their metadata for dependencies
             cursor = db.execute(
@@ -807,20 +807,24 @@ class Coordinator:
                             UPDATE missions SET
                                 payload=?,
                                 status=?,
-                                finished_at=?,
                                 updated_at=?
                             WHERE id=?
                             """,
                             (
                                 mission.model_dump_json(),
                                 mission.status.value,
-                                mission.finished_at,
                                 now_ts(),
                                 mission_id,
                             ),
                         )
+                        # Commit the block before recording the
+                        # event: the UPDATE runs on this
+                        # connection's transaction, and the event
+                        # goes through a second connection that
+                        # cannot write while it stays open.
+                        db.commit()
                         # Record the blocking event
-                        self.record_event(
+                        self.store.record_event(
                             mission_id,
                             "mission.blocked",
                             attempt=mission.attempt,
