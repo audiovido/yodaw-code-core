@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""YODAW one-command entrypoint.
+
+Usage: ./yodaw start|status|stop|restart|logs|health
+
+Re-executes itself with the project interpreter (YODAW_PYTHON, else
+<repo>/.venv/bin/python, else python3.12, else python3) so a stock
+macOS `python3` (3.9) can drive a runtime that needs 3.12.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO))
+
+from app.launcher import resolve_python  # noqa: E402
+
+
+def main() -> int:
+    python = resolve_python()
+    if Path(python).resolve() != Path(sys.executable).resolve():
+        os.chdir(REPO)
+        os.execv(python, [python, "-m", "app.launcher"] + sys.argv[1:])
+    return 0  # unreachable after execv
+
+
+if __name__ == "__main__":
+    sys.exit(main())
