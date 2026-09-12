@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
+from app.storage.db import connect
 from app.storage.sqlite_store import (
     InvalidStateError,
     MissionStore,
@@ -390,7 +391,6 @@ class Coordinator:
     # -----------------------------------------------------
 
     def _execute(self, mission: Mission, repo_key: str):
-        print(f"DEBUG: _execute called for mission {mission.id} with capability {mission.capability}")
         import time
 
         store = self.store
@@ -438,8 +438,6 @@ class Coordinator:
                     "error": f"No worker for capability: {mission.capability}"
                 }
                 fresh.finished_at = now_ts()
-                # Block dependent missions
-                self._block_dependent_missions(fresh.id)
                 try:
                     fresh = self._owned_save(fresh)
                 except (StaleOwnerError, InvalidStateError):
@@ -448,7 +446,6 @@ class Coordinator:
                     )
                     return
                 # Block dependent missions
-                print(f"DEBUG: Blocking dependent missions for failed mission {fresh.id}", flush=True)
                 self._block_dependent_missions(fresh.id)
                 return
 
@@ -532,33 +529,6 @@ class Coordinator:
                 },
             )
 
-            # Check dependencies: if any dependency is failed/blocked, block this mission
-            dependencies = fresh.metadata.get("dependencies", [])
-            blocked = False
-            for dep_id in dependencies:
-                dep_mission = store.get(dep_id)
-                if dep_mission is None:
-                    # Dependency not found, treat as failed
-                    blocked = True
-                    break
-                if dep_mission.status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
-                    blocked = True
-                    break
-            if blocked:
-                fresh.status = MissionStatus.failed
-                fresh.result = {
-                    "error": {
-                        "type": "DependencyFailed",
-                        "message": f"Parent mission {dep_id} failed or was blocked",
-                        "failed_parent": dep_id
-                    }
-                }
-                fresh.finished_at = now_ts()
-                try:
-                    fresh = self._owned_save(fresh)
-                except Exception:
-                    logger.error("Failed to save mission after dependency block", exc_info=True)
-                return
             from app.workers.repo_code_worker import CancelContext
 
             ctx = CancelContext(fresh.id, store)
@@ -804,7 +774,6 @@ class Coordinator:
 
     def _block_dependent_missions(self, failed_mission_id: str):
         """Block missions that depend on the failed mission."""
-        print(f"DEBUG: _block_dependent_missions called for failed_mission_id={failed_mission_id}")
         with connect(self.path) as db:
             # Find missions that have this mission as a dependency
             # We need to scan all missions and check their metadata for dependencies
@@ -815,15 +784,12 @@ class Coordinator:
                 """
             )
             rows = cursor.fetchall()
-            print(f"DEBUG: Found {len(rows)} missions in QUEUED/OBSERVING/PLANNING")
             
             for mission_id, payload in rows:
                 try:
                     mission = Mission.model_validate_json(payload)
                     dependencies = mission.metadata.get("dependencies", [])
-                    print(f"DEBUG: Mission {mission_id} has dependencies: {dependencies}")
                     if failed_mission_id in dependencies:
-                        print(f"DEBUG: Blocking dependent mission {mission_id} due to failed parent {failed_mission_id}")
                         # Block this dependent mission
                         mission.status = MissionStatus.blocked_external
                         mission.result = {
@@ -864,7 +830,6 @@ class Coordinator:
                             }
                         )
                 except Exception as e:
-                    print(f"DEBUG: Error processing mission {mission_id}: {e}")
                     # Skip corrupt payloads
                     continue
 
@@ -881,7 +846,6 @@ class Coordinator:
         success: bool = False,
     ) -> Mission:
         """One atomic commit: mission + event + learning outbox."""
-        print(f"DEBUG: _finalize_terminal called for mission {mission.id} with status {status}")
         from app.learning.engine import record_id_default
 
         finalize = getattr(self.store, "finalize_mission", None)
@@ -916,7 +880,6 @@ class Coordinator:
                 idempotency_key=f"learning:{mission.id}",
             )
             if status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
-                print(f"DEBUG: Calling _block_dependent_missions for {mission.id} with status {status}")
                 self._block_dependent_missions(mission.id)
             return self.store.get(mission.id) or mission
         finalized = self.store.finalize_mission(
@@ -933,7 +896,6 @@ class Coordinator:
             outbox_idempotency_key=f"learning:{mission.id}",
         )
         if status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
-            print(f"DEBUG: Calling _block_dependent_missions for {mission.id} with status {status}")
             self._block_dependent_missions(mission.id)
         return finalized
 

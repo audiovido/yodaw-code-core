@@ -1,45 +1,97 @@
-import os
-import tempfile
+import re
 import subprocess
+import tempfile
+from pathlib import Path
+
 from app.workers.code_worker import CodeWorker
 
 
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
+def create_fixture_repo() -> tuple[Path, tempfile.TemporaryDirectory]:
+    """Real git repository with source, test config and baseline commit."""
+    td = tempfile.TemporaryDirectory()
+    repo = Path(td.name) / "repo"
+    repo.mkdir()
+
+    git(repo, "init")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+
+    (repo / "greet.py").write_text(
+        "def greet(name):\n    return 'Hello ' + name\n"
+    )
+    (repo / "test_greet.py").write_text(
+        "from greet import greet\n\n"
+        "def test_greet():\n"
+        "    assert greet('Armin') == 'Hello Armin'\n"
+    )
+    (repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
+
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "baseline")
+
+    return repo, td
+
+
 def test_real_code_worker_end_to_end():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Initialize git repo
-        subprocess.run(["git", "init"], cwd=tmpdir, check=True)
-        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmpdir, check=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmpdir, check=True)
-
-        # Create a pytest.ini to trigger test detection
-        pytest_ini = os.path.join(tmpdir, "pytest.ini")
-        with open(pytest_ini, "w") as f:
-            f.write("[pytest]\n")
-
-        # Create a dummy test file in tests/
-        tests_dir = os.path.join(tmpdir, "tests")
-        os.makedirs(tests_dir)
-        test_file = os.path.join(tests_dir, "test_dummy.py")
-        with open(test_file, "w") as f:
-            f.write("def test_dummy():\n    assert True\n")
-
-        # Create hello.txt with original content
-        hello_file = os.path.join(tmpdir, "hello.txt")
-        with open(hello_file, "w") as f:
-            f.write("original\n")
-
-        # Commit the initial state
-        subprocess.run(["git", "add", "."], cwd=tmpdir, check=True)
-        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tmpdir, check=True)
-
+    repo, td = create_fixture_repo()
+    try:
         worker = CodeWorker()
         result = worker.execute(
-            "Modify hello.txt to say Hello, World!",
-            metadata={"repo_path": tmpdir}
+            "Refactor greeting to use an f-string",
+            {
+                "repo_path": str(repo),
+                "target_file": "greet.py",
+                "find": "return 'Hello ' + name",
+                "replace": "return f'Hello {name}'",
+                "commit_message": "refactor greeting to f-string",
+            },
         )
-        print("DEBUG: result =", result)
+
         assert result["success"] is True
-        assert result["output"]["tests_passed"] is True
-        assert result["output"]["commit_sha"]
-        assert result["output"]["working_tree_clean"] is True
-        assert len(result["evidence"]) >= 5
+
+        output = result["output"]
+        assert output["tests_passed"] is True
+        assert re.fullmatch(r"[0-9a-f]{40}", output["commit_sha"])
+        assert output["working_tree_clean"] is True
+        assert output["worktree"]
+
+        # Commit is real, not a fabricated string.
+        commit = output["commit_sha"]
+        git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
+
+        # Working tree is actually clean.
+        assert git(repo, "status", "--porcelain") == ""
+
+        # Evidence contains real pytest/git command runs.
+        blob = " ".join(str(item) for item in result["evidence"])
+        assert "pytest" in blob
+        assert "git" in blob
+    finally:
+        td.cleanup()
+
+
+def test_code_worker_no_repo_reports_planning_only():
+    worker = CodeWorker()
+    result = worker.execute("Plan something", None)
+
+    assert result["success"] is True
+    assert result["output"]["repo"]["observed"] is False
+
+    # No fabricated repo-derived values when no repository target.
+    assert "tests_passed" not in result["output"]
+    assert "commit_sha" not in result["output"]
+    assert "working_tree_clean" not in result["output"]
+    assert "workspace" not in result["output"]
+    blob = " ".join(str(item) for item in result["evidence"])
+    assert "pytest" not in blob
+    assert "git" not in blob

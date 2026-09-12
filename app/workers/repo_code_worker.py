@@ -648,10 +648,6 @@ class RepoCodeWorker(Worker):
         }
 
     def execute(self, goal: str, metadata: Optional[dict] = None) -> WorkerResult:
-        print("@@@ UNIQUE MARKER @@@", flush=True)
-        print("*** WORKER EXECUTE STARTED ***", flush=True)
-        print(f"DEBUG WORKER ENTER: goal={goal!r}, metadata={metadata!r}", flush=True)
-        print(f"DEBUG: right after enter", flush=True)
         metadata = metadata or {}
         evidence = []
         evidence.append({"type": "debug", "message": "WORKER EXECUTE STARTED", "goal": goal})
@@ -662,7 +658,6 @@ class RepoCodeWorker(Worker):
         )
 
         if not repo_path:
-            print("DEBUG WORKER: no repo_path", flush=True)
             return WorkerResult(
                 success=False,
                 output={},
@@ -693,7 +688,6 @@ class RepoCodeWorker(Worker):
             )
 
         if not (repo / ".git").exists():
-            print(f"DEBUG worker: git check failed for {repo}", flush=True)
             return WorkerResult(
                 success=False,
                 output={"repo": str(repo)},
@@ -705,19 +699,8 @@ class RepoCodeWorker(Worker):
                 retryable=False,
             )
 
-        print(f"DEBUG worker: past git check", flush=True)
-        print(f"DEBUG worker: about to print goal debugs", flush=True)
-        explicit_edits = None
-        # Debug prints
-        print(f"DEBUG worker: goal={goal!r}", flush=True)
-        print(f"DEBUG worker: metadata={metadata!r}", flush=True)
-        print(f"DEBUG worker: explicit_edits initial={explicit_edits!r}", flush=True)
-        print(f"DEBUG: goal.startswith('Modify ')={goal.startswith('Modify ')}", flush=True)
-        print(f"DEBUG: ' to say ' in goal={' to say ' in goal}", flush=True)
-
         # First, try to get explicit_edits from metadata
         explicit_edits = metadata.get("edits")
-        print(f"DEBUG: after metadata, explicit_edits={explicit_edits!r}", flush=True)
 
         if explicit_edits is None:
             target_file = metadata.get("target_file")
@@ -736,21 +719,16 @@ class RepoCodeWorker(Worker):
                         "replace": replace_text,
                     }
                 ]
-            print(f"DEBUG: after checking metadata for edits, explicit_edits={explicit_edits!r}", flush=True)
 
         # If we still don't have explicit_edits, try to deduce from the goal for simple file modification.
-        print(f"DEBUG: checking deduction: explicit_edits is None={explicit_edits is None}, goal={goal!r}", flush=True)
         if explicit_edits is None and goal.startswith("Modify ") and " to say " in goal:
-            print(f"DEBUG worker: attempting to deduce edits", flush=True)
             parts = goal.split(" to say ", 1)
             if len(parts) == 2:
                 file_part = parts[0][len("Modify "):].strip()
                 new_content = parts[1].strip()
                 repo_path = metadata.get("repo_path")
-                print(f"DEBUG worker: file_part={file_part!r}, new_content={new_content!r}, repo_path={repo_path!r}", flush=True)
                 if repo_path and os.path.exists(repo_path):
                     file_path = os.path.join(repo_path, file_part)
-                    print(f"DEBUG worker: file_path={file_path!r}, exists={os.path.exists(file_path)}", flush=True)
                     if os.path.exists(file_path):
                         try:
                             with open(file_path, 'r') as f:
@@ -760,14 +738,8 @@ class RepoCodeWorker(Worker):
                                 "find": original_content,
                                 "replace": new_content,
                             }]
-                            print(f"DEBUG worker: set explicit_edits={explicit_edits!r}", flush=True)
-                        except Exception as e:
-                            print(f"DEBUG worker: exception reading file: {e}", flush=True)
+                        except Exception:
                             pass
-
-        # Debug print
-        print(f"DEBUG: explicit_edits after deduction={explicit_edits!r}", flush=True)
-        print(f"DEBUG: about to check deduction condition: explicit_edits is None={explicit_edits is None}, goal.startswith('Modify ')={goal.startswith('Modify ')}, ' to say ' in goal={' to say ' in goal}", flush=True)
 
         is_llm_mission = explicit_edits is None
 
