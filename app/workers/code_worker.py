@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional
 
-from app.workers.repo_code_worker import CancelContext
-
+from app.workers.base import WorkerResult
+from app.workers.repo_code_worker import CancelContext, RepoCodeWorker
 
 class CodeWorker:
     """Deterministic local worker for the 'code' capability."""
@@ -23,29 +24,36 @@ class CodeWorker:
                 # If we can't create the context, we just proceed without cancellation check
                 pass
 
-        """Always succeed."""
-        return {
-            "success": True,
-            "output": {
-                "goal": goal,
-                "repo": {
-                    "observed": False
+        # Check for repository context
+        repo_path = metadata.get("repo_path") or os.environ.get("YODAW_TARGET_REPO")
+        if repo_path:
+            # Delegate to RepoCodeWorker for real repository operations
+            worker = RepoCodeWorker()
+            return worker.execute(goal, metadata)
+        else:
+            # No repository context: return truthful result without faking
+            return WorkerResult(
+                success=True,
+                output={
+                    "goal": goal,
+                    "repo": {
+                        "observed": False
+                    },
+                    "plan": {
+                        "planned": True,
+                        "plan_id": "plan_code",
+                        "steps": 1,
+                        "valid": True,
+                        "errors": []
+                    },
+                    "skills": {
+                        "selected": True,
+                        "skill": "code",
+                        "confidence": 0.9,
+                        "intent": "feature"
+                    }
                 },
-                "plan": {
-                    "planned": True,
-                    "plan_id": "plan_code",
-                    "steps": 1,
-                    "valid": True,
-                    "errors": []
-                },
-                "skills": {
-                    "selected": True,
-                    "skill": "code",
-                    "confidence": 0.9,
-                    "intent": "feature"
-                }
-            },
-            "evidence": [],
-            "error": None,
-            "retryable": False,
-        }
+                evidence=[],
+                error=None,
+                retryable=False,
+            )
