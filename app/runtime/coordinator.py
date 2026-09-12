@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
+from app.storage.db import connect
 from app.storage.sqlite_store import (
     InvalidStateError,
     MissionStore,
