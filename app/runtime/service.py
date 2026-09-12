@@ -67,6 +67,13 @@ def _setup_logging():
 
 
 def main() -> int:
+    # File-based product config before anything reads the
+    # environment (host/port/log level are read below; LLM settings
+    # are read lazily). Env vars already set always win.
+    from app.product_config import apply_product_config
+
+    apply_product_config()
+
     _setup_logging()
 
     host = os.environ.get("YODAW_HOST", "127.0.0.1")

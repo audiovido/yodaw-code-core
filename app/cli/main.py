@@ -60,6 +60,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common(resume_p)
     sessions_p = sub.add_parser("sessions", help="list persisted sessions")
     _add_common(sessions_p)
+    config_p = sub.add_parser("config", help="manage product configuration")
+    config_sub = config_p.add_subparsers(dest="config_command")
+    init_p = config_sub.add_parser("init", help="write a default config file")
+    init_p.add_argument("--path", default=None, help="write config to this path")
+    init_p.add_argument("--force", action="store_true", help="overwrite an existing config")
+    config_sub.add_parser("validate", help="validate the effective configuration")
+    show_p = config_sub.add_parser("show", help="show the effective non-secret configuration")
+    show_p.add_argument("--json", action="store_true", help="machine-readable output")
     sub.add_parser("version", help="print the CLI version")
     return parser
 
@@ -154,15 +162,87 @@ def cmd_sessions(args: argparse.Namespace) -> int:
             print(f"{item['session_id']} repo={item.get('repo')} tasks={item.get('tasks')} updated={item.get('updated_at')}")
     return EXIT_OK
 
+def cmd_config(args: argparse.Namespace) -> int:
+    from app.product_config import (
+        ConfigError,
+        find_config_file,
+        load_product_config,
+        validate_product_config,
+        write_default_config,
+    )
+
+    command = getattr(args, "config_command", None) or "show"
+
+    if command == "init":
+        try:
+            written = write_default_config(
+                getattr(args, "path", None),
+                force=getattr(args, "force", False),
+            )
+        except ConfigError as exc:  # already exists, no --force
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+        print(f"wrote {written}")
+        return EXIT_OK
+
+    if command == "validate":
+        errors = validate_product_config()
+        source = find_config_file()
+        if errors:
+            for error in errors:
+                print(f"config error: {error}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        print(
+            f"configuration OK"
+            f" ({source})" if source else "configuration OK (environment + defaults)"
+        )
+        return EXIT_OK
+
+    if command == "show":
+        try:
+            cfg = load_product_config()
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        if args.json:
+            print(json.dumps(cfg.to_redacted_dict(), indent=2))
+        else:
+            for line in cfg.summary_lines():
+                print(line)
+        return EXIT_OK
+
+    print(f"unknown config command: {command}", file=sys.stderr)
+    return EXIT_USAGE
+
+def _apply_product_config() -> int:
+    """Feed the config file into the environment before task commands. Env wins."""
+    from app.product_config import ConfigError, apply_product_config
+
+    try:
+        apply_product_config()
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    return EXIT_OK
+
+TASK_COMMANDS = (None, "run", "status", "resume", "sessions")
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse argv and dispatch; bare `yodaw` opens the interactive REPL."""
     parser = _build_parser()
     raw = list(argv) if argv is not None else sys.argv[1:]
-    if raw and not raw[0].startswith("-") and raw[0] not in ("run", "status", "resume", "sessions", "version", "-h", "--help"):
+    if raw and not raw[0].startswith("-") and raw[0] not in ("run", "status", "resume", "sessions", "config", "version", "-h", "--help"):
         # Convenience: `yodaw "fix tests"` behaves like `yodaw run`.
         raw = ["run", *raw]
     full = parser.parse_args(raw)
+
+    # Task commands (REPL, run, status, resume, sessions) honor the
+    # config file; `config` and `version` must work even when the
+    # file is invalid, so they skip the apply step.
+    if full.command in TASK_COMMANDS:
+        code = _apply_product_config()
+        if code != EXIT_OK:
+            return code
 
     if full.command == "run":
         return cmd_run(full)
@@ -172,6 +252,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_resume(full)
     if full.command == "sessions":
         return cmd_sessions(full)
+    if full.command == "config":
+        return cmd_config(full)
     if full.command == "version":
         print(f"yodaw {cli_version}")
         return EXIT_OK

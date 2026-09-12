@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -136,6 +137,15 @@ class LLMError(RuntimeError):
     pass
 
 
+ANTHROPIC_API_VERSION = "2023-06-01"
+SUPPORTED_STYLES = ("ollama", "openai", "anthropic")
+
+
+def _normalize_base_url(url: str) -> str:
+    """Strip a trailing /v1 so providers re-append it without doubling."""
+    return re.sub(r"/v1$", "", url.rstrip("/"))
+
+
 class LocalLLMProvider:
     """
     Generic local LLM adapter.
@@ -143,10 +153,11 @@ class LocalLLMProvider:
     Supports:
       - Ollama native /api/chat
       - OpenAI-compatible /v1/chat/completions
+      - Anthropic /v1/messages
 
     Configuration:
-      YODAW_LLM_STYLE=ollama|openai
-      YODAW_LLM_BASE_URL=http://127.0.0.1:11434
+      YODAW_LLM_STYLE=ollama|openai|anthropic
+      YODAW_LLM_BASE_URL=<base-url>
       YODAW_LLM_MODEL=<model-name>
       YODAW_LLM_API_KEY=<optional>
     """
@@ -157,10 +168,12 @@ class LocalLLMProvider:
             "ollama",
         ).lower()
 
-        self.base_url = os.environ.get(
-            "YODAW_LLM_BASE_URL",
-            "http://127.0.0.1:11434",
-        ).rstrip("/")
+        self.base_url = _normalize_base_url(
+            os.environ.get(
+                "YODAW_LLM_BASE_URL",
+                "http://127.0.0.1:11434",
+            )
+        )
 
         self.model = os.environ.get(
             "YODAW_LLM_MODEL",
@@ -191,8 +204,12 @@ class LocalLLMProvider:
         if self.style == "openai":
             return self._openai(system, user)
 
+        if self.style == "anthropic":
+            return self._anthropic(system, user)
+
         raise LLMError(
-            f"Unsupported YODAW_LLM_STYLE: {self.style}"
+            f"Unsupported YODAW_LLM_STYLE: {self.style} "
+            f"(supported: {', '.join(SUPPORTED_STYLES)})"
         )
 
     def _chat_with_retry(
@@ -328,4 +345,47 @@ class LocalLLMProvider:
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(
                 f"OpenAI-compatible response malformed: {exc}"
+            ) from exc
+
+    def _anthropic(self, system: str, user: str) -> str:
+        if not self.api_key:
+            raise LLMError(
+                "anthropic provider requires an API key "
+                "(YODAW_LLM_API_KEY)"
+            )
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+        }
+
+        payload = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user,
+                },
+            ],
+        }
+
+        data = self._chat_with_retry(
+            f"{self.base_url}/v1/messages",
+            payload,
+            headers=headers,
+        )
+
+        try:
+            parts = data.get("content") or []
+            return "".join(
+                part.get("text", "")
+                for part in parts
+                if part.get("type") == "text"
+            )
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise LLMError(
+                f"Anthropic response malformed: {exc}"
             ) from exc
