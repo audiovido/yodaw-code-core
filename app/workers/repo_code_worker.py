@@ -653,6 +653,7 @@ class RepoCodeWorker(Worker):
         print(f"DEBUG WORKER ENTER: goal={goal!r}, metadata={metadata!r}", flush=True)
         print(f"DEBUG: right after enter", flush=True)
         metadata = metadata or {}
+        explicit_edits = None
         evidence = []
         evidence.append({"type": "debug", "message": "WORKER EXECUTE STARTED", "goal": goal})
 

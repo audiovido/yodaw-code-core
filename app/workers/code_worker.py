@@ -9,10 +9,18 @@ from app.workers.repo_code_worker import CancelContext
 class CodeWorker:
     """Deterministic local worker for the 'code' capability."""
 
+    name = "code-worker"
     capabilities = {"code"}
 
     def supports(self, capability: str) -> bool:
         return capability in self.capabilities
+
+    def health(self):
+        return {
+            "name": self.name,
+            "status": "READY",
+            "capabilities": sorted(self.capabilities),
+        }
 
     def execute(self, goal: str, metadata: Optional[dict] = None) -> dict:
         # Small delay to allow cancellation to be processed if requested immediately
