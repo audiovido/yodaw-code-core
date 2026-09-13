@@ -691,9 +691,29 @@ class RepoCodeWorker(Worker):
 
         try:
             ctx.cancel_check("before_execution")
-        except MissionCancelled:
+        except MissionCancelled as exc:
             ctx.emit("mission.cancelled", attempt=0, data={"while": "claimed"})
-            raise
+            # Mapped CANCELLED result (same shape as the in-flow
+            # handlers): a cancel that lands in the claim-to-start
+            # window must surface as CANCELLED, never as FAIL.
+            return _terminal_result(
+                success=False,
+                output={
+                    "goal": goal,
+                    "repo": str(repo) if repo else None,
+                    "tests_passed": False,
+                    "retries": 0,
+                    "attempts": 0,
+                },
+                evidence=evidence,
+                error={
+                    "type": "Cancelled",
+                    "message": str(exc),
+                    "attempt": 0,
+                },
+                retryable=False,
+                terminal="CANCELLED",
+            )
 
         with _mission_runtime(ctx):
             # Everything below runs with the mission's deadline and

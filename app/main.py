@@ -648,6 +648,7 @@ def version():
     return {
         "api_version": API_VERSION,
         "title": API_TITLE,
+        "product_name": version_info.get("product_name", "YODAW Coder"),
         "service_version": version_info.get("product_version", "0.3.0"),
         "build": version_info.get("commit", "dev"),
     }

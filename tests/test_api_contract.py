@@ -40,7 +40,7 @@ class TestHealthEndpoints:
         body = response.json()
         assert body["api_version"] == "v1"
         assert body["title"] == "YODAW Public API"
-        assert body["service_version"] == "0.3.0"
+        assert body["service_version"] == "0.4.0"
         assert "build" in body
 
 class TestClassifyEndpoint:

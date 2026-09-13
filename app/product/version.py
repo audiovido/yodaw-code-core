@@ -9,9 +9,13 @@ from __future__ import annotations
 import json
 import os
 import platform
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+__version__ = "0.4.0"
+__product_name__ = "YODAW Coder"
 
 
 def _read_version_file() -> Dict[str, Any]:
@@ -127,6 +131,7 @@ def describe(source_dir: Optional[Path] = None) -> Dict[str, Any]:
 
     # Normalize keys for external consumption
     result = {
+        "product_name": version_info.get("__product_name__", "YODAW Coder"),
         "product_version": version_info.get("product_version", "unknown"),
         "commit": version_info.get("__commit__", version_info.get("commit", "unknown")),
         "branch": version_info.get("__branch__", version_info.get("branch", "unknown")),

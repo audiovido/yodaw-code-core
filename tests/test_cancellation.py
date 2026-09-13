@@ -296,3 +296,62 @@ def test_terminal_mission_cannot_be_cancelled(tmp_path):
     store.save(mission)
 
     assert store.request_cancel(mission.id) == "terminal"
+
+
+def test_cancel_in_claim_window_is_cancelled_not_fail(tmp_path):
+    """A cancel that lands after claim but before the worker's first
+    checkpoint must surface as CANCELLED (error type Cancelled), never
+    as FAIL: the entry checkpoint maps MissionCancelled the same way
+    the in-flow handlers do."""
+    repo = tmp_path / "repo"
+    baseline = init_repo(repo)
+
+    store = MissionStore(tmp_path / "window.sqlite")
+
+    mission = Mission(
+        goal="claim window cancel",
+        capability="repo-code",
+        metadata={"repo_path": str(repo)},
+    )
+    store.enqueue(mission)
+    mission_id = store.list()[0].id
+
+    # Claimed (RUNNING) but not yet dispatched: cancellation sits in
+    # the claim-to-start window the worker entry checkpoint covers.
+    claimed = store.get(mission_id)
+    claimed.status = MissionStatus.running
+    claimed.claimed_by = "cancel-test"
+    store.save(claimed)
+
+    assert store.request_cancel(mission_id) == "requested"
+
+    result = worker_module.RepoCodeWorker().execute(
+        mission.goal,
+        {
+            "repo_path": str(repo),
+            "mission_id": mission_id,
+            "_event_store": store,
+        },
+    )
+
+    assert result["success"] is False
+    assert result["error"]["type"] == "Cancelled"
+    assert "before_execution" in result["error"]["message"]
+
+    report = result["output"]["evidence_report"]
+    assert report["terminal"] == "CANCELLED"
+
+    # Never committed; source repository untouched.
+    assert git(repo, "rev-parse", "HEAD") == baseline
+
+    branches = subprocess.run(
+        ["git", "branch", "--list", "yodaw/*", "--format=%(refname:short) %(objectname)"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    for line in branches.splitlines():
+        assert line.endswith(baseline), (
+            f"cancelled mission left a commit behind: {line}"
+        )

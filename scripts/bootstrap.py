@@ -203,7 +203,7 @@ def create_version_file(lib_dir, commit_sha, branch_name, system_info):
         f.write(f'''"""
 YODAW version information.
 """
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 __commit__ = "{commit_sha}"
 __branch__ = "{branch_name}"
 __build_platform__ = "{system_info.get('platform', 'unknown')}"
@@ -448,7 +448,7 @@ def main():
     if args.create_release:
         print("Creating release artifact...")
         version_info = {
-            "version": "0.1.0",
+            "version": "0.4.0",
             "commit": get_commit_sha(args.source),
             "branch": get_branch_name(args.source),
         }

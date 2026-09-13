@@ -150,7 +150,7 @@ def test_create_version_file(tmp_path):
     assert version_file.exists()
     
     content = version_file.read_text()
-    assert "__version__ = \"0.1.0\"" in content
+    assert "__version__ = \"0.4.0\"" in content
     assert f"__commit__ = \"{commit_sha}\"" in content
     assert f"__branch__ = \"{branch_name}\"" in content
     assert "__build_platform__ = \"Darwin\"" in content
