@@ -96,3 +96,28 @@ def test_different_paths_different_keys(tmp_path):
     cache = RepoCache()
     cache.put(tmp_path, "e", ["a.py"], "A")
     assert cache.get(tmp_path, "e", ["b.py"]) is None
+
+def test_identical_fingerprint_never_aliases_different_path_sets(tmp_path):
+    # Regression: two paths with identical mtime AND size must never
+    # alias through the cache key (path set is part of the fingerprint).
+    import os as _os
+    a = _write(tmp_path, "a.py", "AAA\n")
+    b = _write(tmp_path, "b.py", "AAA\n")
+    fixed_mtime = 1_700_000_000
+    _os.utime(a, (fixed_mtime, fixed_mtime))
+    _os.utime(b, (fixed_mtime, fixed_mtime))
+    assert a.stat().st_mtime == b.stat().st_mtime
+    assert a.stat().st_size == b.stat().st_size
+
+    cache = RepoCache()
+    cache.put(tmp_path, "e", ["a.py"], "A")
+    assert cache.get(tmp_path, "e", ["a.py"]) == "A"
+    assert cache.get(tmp_path, "e", ["b.py"]) is None
+    assert cache.get(tmp_path, "e", ["a.py", "b.py"]) is None
+
+def test_path_set_order_does_not_reorder_fingerprint(tmp_path):
+    _write(tmp_path, "a.py", "AAA\n")
+    _write(tmp_path, "b.py", "BBB\n")
+    cache = RepoCache()
+    cache.put(tmp_path, "e", ["b.py", "a.py"], "ordered")
+    assert cache.get(tmp_path, "e", ["a.py", "b.py"]) == "ordered"

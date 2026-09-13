@@ -131,7 +131,11 @@ or:
 """.strip()
 
 
-def build_repo_context(worktree: Path, max_chars: int = 24000) -> str:
+def build_repo_context(
+    worktree: Path,
+    max_chars: int = 24000,
+    max_entries: int = 200,
+) -> str:
     candidates = []
 
     ignored_dirs = {
@@ -140,6 +144,7 @@ def build_repo_context(worktree: Path, max_chars: int = 24000) -> str:
         "node_modules",
         "dist",
         "build",
+        "cache",
         "__pycache__",
         ".pytest_cache",
     }
@@ -169,30 +174,39 @@ def build_repo_context(worktree: Path, max_chars: int = 24000) -> str:
         ".hpp",
     }
 
-    for path in sorted(worktree.rglob("*")):
-        if not path.is_file():
-            continue
+    # Walk with followlinks=False: symlinked directories are never
+    # traversed and symlinked files are skipped, so context can never
+    # leak outside the worktree or loop on directory cycles.
+    for dirpath, dirnames, filenames in os.walk(worktree, followlinks=False):
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in ignored_dirs
+        )
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
 
-        if any(part in ignored_dirs for part in path.parts):
-            continue
-
-        if path.suffix.lower() not in allowed_suffixes:
-            continue
-
-        try:
-            if path.stat().st_size > 120_000:
+            if path.is_symlink():
                 continue
 
-            content = path.read_text(errors="replace")
+            if path.suffix.lower() not in allowed_suffixes:
+                continue
 
-        except Exception:
-            continue
+            try:
+                if path.stat().st_size > 120_000:
+                    continue
 
-        rel = path.relative_to(worktree)
+                content = path.read_text(errors="replace")
 
-        candidates.append(
-            f"\n--- FILE: {rel} ---\n{content}\n"
-        )
+            except OSError:
+                continue
+
+            rel = path.relative_to(worktree).as_posix()
+
+            candidates.append(
+                f"\n--- FILE: {rel} ---\n{content}\n"
+            )
+
+            if len(candidates) >= max_entries:
+                return "".join(candidates)[:max_chars]
 
     joined = "".join(candidates)
 

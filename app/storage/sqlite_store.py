@@ -29,6 +29,9 @@ class DuplicateMission(Exception):
         super().__init__(message)
         self.mission_id = mission_id
 
+class UnknownDependency(Exception):
+    """A mission references a dependency mission that does not exist."""
+
 class StaleOwnerError(Exception):
     """A worker that lost ownership tried a fenced write."""
 
@@ -55,6 +58,73 @@ EXECUTING_STATUSES = (
     "VERIFYING",
     "REPAIRING",
 )
+
+# A dependency is satisfied only by a durable PASS. Any other
+# terminal state blocks dependents; active states simply keep
+# dependents waiting in QUEUED.
+DEPENDENCY_BLOCKING_STATUSES = (
+    "FAIL",
+    "BLOCKED",
+    "BLOCKED_EXTERNAL",
+    "CANCELLED",
+)
+DEPENDENT_CLAIMABLE_STATUSES = ("QUEUED", "OBSERVING", "PLANNING")
+
+
+def _validate_dependencies(db, mission) -> None:
+    """Reject unknown dependency ids before a mission is durable."""
+    dependencies = mission.metadata.get("dependencies") or []
+
+    for dependency in dependencies:
+        row = db.execute(
+            "SELECT id FROM missions WHERE id=?", (dependency,)
+        ).fetchone()
+
+        if row is None:
+            raise UnknownDependency(
+                "mission %s depends on unknown mission: %s"
+                % (mission.id, dependency)
+            )
+
+
+def _block_dependent(db, mission, failed_parent_id: str) -> bool:
+    """Guardedly transition one QUEUED dependent to BLOCKED_EXTERNAL.
+
+    Runs on the caller's open connection inside its transaction.
+    The UPDATE is guarded by the dependent's current status, so a
+    RUNNING or PASS mission is never clobbered; the state transition
+    is the only thing that reports success (the event must be
+    recorded by the caller only on an actual change). result=None
+    payloads spread safely.
+    """
+    now = now_ts()
+    mission.status = MissionStatus.blocked_external
+    mission.result = dict(mission.result) if mission.result else {}
+    mission.result["error"] = {
+        "type": "DependencyFailed",
+        "message": (
+            "Parent mission %s failed or was blocked" % failed_parent_id
+        ),
+        "failed_parent": failed_parent_id,
+    }
+    mission.finished_at = mission.finished_at or now
+    cursor = db.execute(
+        """
+        UPDATE missions SET
+            payload=?,
+            status=?,
+            updated_at=?
+        WHERE id=? AND status IN
+            ('QUEUED','OBSERVING','PLANNING')
+        """,
+        (
+            mission.model_dump_json(),
+            mission.status.value,
+            now,
+            mission.id,
+        ),
+    )
+    return cursor.rowcount > 0
 
 
 def _add_column(db, table, column, decl):
@@ -508,6 +578,11 @@ class MissionStore:
         try:
             db.execute("BEGIN IMMEDIATE")
 
+            # Unknown dependency ids are rejected at enqueue: a
+            # dependent mission must never become durable pointing
+            # at a parent that cannot exist.
+            _validate_dependencies(db, mission)
+
             row = db.execute(
                 """
                 SELECT id FROM missions
@@ -636,6 +711,8 @@ class MissionStore:
 
             rows = db.execute(query, params).fetchall()
 
+            blocked_events = []
+
             for mission_id, payload in rows:
                 try:
                     mission = Mission.model_validate_json(payload)
@@ -670,6 +747,58 @@ class MissionStore:
                     if others >= limit:
                         continue
 
+                # Dependency gate: a dependent mission may only be
+                # claimed when every dependency is durably PASS. An
+                # active dependency keeps the dependent QUEUED; a
+                # durably failed parent transitions the dependent to
+                # BLOCKED_EXTERNAL inside this same transaction
+                # (the guarded UPDATE never clobbers a RUNNING or
+                # PASS mission).
+                dependencies = mission.metadata.get("dependencies") or []
+
+                if dependencies:
+                    failed_dependency = None
+                    ready = True
+
+                    for dependency in dependencies:
+                        dep = db.execute(
+                            "SELECT status FROM missions WHERE id=?",
+                            (dependency,),
+                        ).fetchone()
+
+                        if dep is None:
+                            # Unknown at claim time (dependency was
+                            # removed after enqueue): stay QUEUED,
+                            # never claim against a ghost parent.
+                            ready = False
+                            break
+
+                        if dep[0] == "PASS":
+                            continue
+
+                        if dep[0] in DEPENDENCY_BLOCKING_STATUSES:
+                            failed_dependency = dependency
+                            ready = False
+                            break
+
+                        ready = False
+                        break
+
+                    if not ready:
+                        if (
+                            failed_dependency is not None
+                            and _block_dependent(
+                                db, mission, failed_dependency
+                            )
+                        ):
+                            # Recording only after this transaction
+                            # commits, so the event can never exist
+                            # without the durable transition.
+                            blocked_events.append(
+                                (mission.id, mission.attempt, failed_dependency)
+                            )
+                        continue
+
                 now = now_ts()
                 mission.status = MissionStatus.running
                 mission.claimed_by = coordinator_id
@@ -678,7 +807,7 @@ class MissionStore:
                 mission.started_at = mission.started_at or now
                 mission.attempt = mission.attempt + 1
 
-                db.execute(
+                claim_cursor = db.execute(
                     """
                     UPDATE missions SET
                         payload=?,
@@ -699,12 +828,27 @@ class MissionStore:
                     ),
                 )
 
-                if db.total_changes == 0:
+                if claim_cursor.rowcount == 0:
+                    if blocked_events:
+                        db.commit()
+                        self._record_blocked_events(blocked_events)
+                        return None
+
                     db.rollback()
                     return None
 
                 db.commit()
+                self._record_blocked_events(blocked_events)
+
                 return mission
+
+            if blocked_events:
+                # Only dependents were blocked this pass: the
+                # transitions are durable even though nothing was
+                # claimed.
+                db.commit()
+                self._record_blocked_events(blocked_events)
+                return None
 
             db.rollback()
             return None
@@ -714,6 +858,28 @@ class MissionStore:
             raise
         finally:
             db.close()
+
+    def _record_blocked_events(self, blocked_events) -> None:
+        """Persist mission.blocked events after the blocking commit.
+
+        Events are observability only: a failed event write must
+        never fail the claim or the blocking transition.
+        """
+        for blocked_id, attempt, failed_parent in blocked_events:
+            try:
+                self.record_event(
+                    blocked_id,
+                    "mission.blocked",
+                    attempt=attempt,
+                    data={
+                        "reason": "DependencyFailed",
+                        "failed_parent": failed_parent,
+                    },
+                )
+            except Exception:
+                # The blocking transition is durable in the
+                # preceding commit; the event is observability.
+                continue
 
     def heartbeat(self, mission_id: str, coordinator_id: str) -> bool:
         """
@@ -1440,6 +1606,11 @@ class MissionStore:
                     "AND idempotency_key=?",
                     (mission.id, now_ts(), tenant_scope, idempotency_key),
                 )
+            # Unknown dependency ids are rejected at enqueue time
+            # (HTTP 422 at the API); the same gate applies to the
+            # idempotent-insert path.
+            _validate_dependencies(db, mission)
+
             repo_key = self._repo_key(mission)
             dup = db.execute(
                 """

@@ -43,6 +43,7 @@ from app.storage.sqlite_store import (
     InvalidStateError,
     MissionStore,
     StaleOwnerError,
+    _block_dependent,
 )
 from app.runtime.repo_leases import RepoLeaseManager, now_ts
 
@@ -750,6 +751,8 @@ class Coordinator:
             attempt=0,
             data={"while": "claimed_not_started"},
         )
+        # A cancelled parent never satisfies its dependents.
+        self._block_dependent_missions(mission.id)
 
     @staticmethod
     def _merged_evidence(prior: Optional[list], new: Optional[list]) -> list:
@@ -773,69 +776,72 @@ class Coordinator:
         return merged
 
     def _block_dependent_missions(self, failed_mission_id: str):
-        """Block missions that depend on the failed mission."""
-        with connect(self.store.path) as db:
-            # Find missions that have this mission as a dependency
-            # We need to scan all missions and check their metadata for dependencies
-            cursor = db.execute(
+        """Block QUEUED dependents of a failed mission in one pass.
+
+        All transitions run inside a single immediate transaction so
+        a crash mid-pass cannot leave dependents half-blocked. The
+        guarded UPDATE (status-filtered) never clobbers a RUNNING or
+        PASS mission, and mission.blocked is recorded only when the
+        state actually transitioned. result=None payloads are safe.
+        """
+        blocked = []
+
+        db = connect(self.store.path)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
+            rows = db.execute(
                 """
-                SELECT id, payload FROM missions 
+                SELECT id, payload FROM missions
                 WHERE status IN ('QUEUED', 'OBSERVING', 'PLANNING')
                 """
-            )
-            rows = cursor.fetchall()
-            
+            ).fetchall()
+
             for mission_id, payload in rows:
                 try:
                     mission = Mission.model_validate_json(payload)
-                    dependencies = mission.metadata.get("dependencies", [])
-                    if failed_mission_id in dependencies:
-                        # Block this dependent mission
-                        mission.status = MissionStatus.blocked_external
-                        mission.result = {
-                            **mission.result,
-                            "error": {
-                                "type": "DependencyFailed",
-                                "message": f"Parent mission {failed_mission_id} failed or was blocked",
-                                "failed_parent": failed_mission_id
-                            }
-                        }
-                        mission.finished_at = now_ts()
-                        # Update in database
-                        db.execute(
-                            """
-                            UPDATE missions SET
-                                payload=?,
-                                status=?,
-                                updated_at=?
-                            WHERE id=?
-                            """,
-                            (
-                                mission.model_dump_json(),
-                                mission.status.value,
-                                now_ts(),
-                                mission_id,
-                            ),
-                        )
-                        # Commit the block before recording the
-                        # event: the UPDATE runs on this
-                        # connection's transaction, and the event
-                        # goes through a second connection that
-                        # cannot write while it stays open.
-                        db.commit()
-                        # Record the blocking event
-                        self.store.record_event(
-                            mission_id,
-                            "mission.blocked",
-                            attempt=mission.attempt,
-                            data={
-                                "reason": "DependencyFailed",
-                                "failed_parent": failed_mission_id
-                            }
-                        )
-                except Exception as e:
-                    # Skip corrupt payloads
+                except Exception:
+                    # Corrupt payloads stay for operator inspection.
                     continue
+
+                dependencies = mission.metadata.get("dependencies") or []
+
+                if failed_mission_id not in dependencies:
+                    continue
+
+                if _block_dependent(db, mission, failed_mission_id):
+                    blocked.append((mission_id, mission.attempt))
+
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        for mission_id, attempt in blocked:
+            try:
+                self.store.record_event(
+                    mission_id,
+                    "mission.blocked",
+                    attempt=attempt,
+                    data={
+                        "reason": "DependencyFailed",
+                        "failed_parent": failed_mission_id,
+                    },
+                )
+            except Exception:
+                # Blocking is durable; the event is observability.
+                continue
+
+    def _terminal_blocks_dependents(self, status: MissionStatus) -> bool:
+        """Terminal outcomes that can never satisfy a dependency."""
+        return status in (
+            MissionStatus.failed,
+            MissionStatus.blocked,
+            MissionStatus.blocked_external,
+            MissionStatus.cancelled,
+        )
 
     def _finalize_terminal(
         self,
@@ -883,7 +889,7 @@ class Coordinator:
                 payload=payload,
                 idempotency_key=f"learning:{mission.id}",
             )
-            if status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
+            if self._terminal_blocks_dependents(status):
                 self._block_dependent_missions(mission.id)
             return self.store.get(mission.id) or mission
         finalized = self.store.finalize_mission(
@@ -899,7 +905,7 @@ class Coordinator:
             outbox_payload=payload,
             outbox_idempotency_key=f"learning:{mission.id}",
         )
-        if status in (MissionStatus.failed, MissionStatus.blocked, MissionStatus.blocked_external):
+        if self._terminal_blocks_dependents(status):
             self._block_dependent_missions(mission.id)
         return finalized
 

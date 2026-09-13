@@ -16,7 +16,10 @@ from pydantic import BaseModel, Field
 from app.api.auth import Principal, resolve_principal
 from app.core.models import Mission, MissionStatus
 from app.mission.facade import MAX_RETRY_ATTEMPTS, retry_allowed
-from app.storage.sqlite_store import DuplicateMission
+from app.storage.sqlite_store import (
+    DuplicateMission,
+    UnknownDependency,
+)
 from app.tenants.redact import redact
 
 
@@ -195,6 +198,8 @@ def submit_product_mission(
                     detail=str(exc),
                     headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
                 )
+            except UnknownDependency as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
             if not replayed and stored.id == mission.id:
                 try:
                     store.save(mission)
@@ -226,6 +231,8 @@ def submit_product_mission(
                 detail=str(exc),
                 headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
             )
+        except UnknownDependency as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         if replayed:
             if (
                 principal.kind == "client"
@@ -275,6 +282,8 @@ def submit_product_mission(
                 detail=str(exc),
                 headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
             )
+        except UnknownDependency as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
     audit.append(
         client_id=principal.client_id,
         actor=principal.name,
@@ -327,6 +336,8 @@ def retry_product_mission(*, store, audit, principal, mission: Mission) -> Missi
             detail=str(exc),
             headers={"X-YODAW-Active-Mission": exc.mission_id or ""},
         )
+    except UnknownDependency as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     source = store.get(mission.id)
     if source is not None:
         lineage = list(source.attempt_lineage)
