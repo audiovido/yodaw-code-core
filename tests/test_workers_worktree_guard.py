@@ -81,6 +81,30 @@ def test_stale_directory_removed(repo, tmp_path):
     assert allocated["worktree"].exists()
     assert not (root / "repo_stale_leftover").exists()
 
+def test_live_worktree_of_other_repo_never_pruned(tmp_path):
+    """Allocation for one repo must never delete a live worktree of
+    another repo sharing the same worktree root (concurrent missions
+    on different repos run in one process)."""
+    repo_a = _make_repo_path(tmp_path, "repo_a")
+    repo_b = _make_repo_path(tmp_path, "repo_b")
+    root = tmp_path / "worktrees"
+
+    b_alloc = allocate(repo_b, root)
+    assert b_alloc["error"] is None
+    assert b_alloc["worktree"].exists()
+
+    a_alloc = allocate(repo_a, root)
+    assert a_alloc["error"] is None
+    assert a_alloc["stale_removed"] is False
+    # B's live, git-registered worktree is untouched.
+    assert b_alloc["worktree"].exists()
+
+    # B can still use the worktree end to end.
+    (b_alloc["worktree"] / "change.txt").write_text("x", encoding="utf-8")
+    _git(b_alloc["worktree"], "add", "change.txt")
+    _git(b_alloc["worktree"], "commit", "-q", "-m", "still alive")
+    assert worktree_is_clean(b_alloc["worktree"])
+
 
 def test_dirty_repo_rejected(repo, tmp_path):
     (repo / "dirty.txt").write_text("x", encoding="utf-8")

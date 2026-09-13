@@ -131,25 +131,47 @@ def _default_branch_name() -> str:
     return "yodaw/task-%s" % _unique_suffix()
 
 
+def _is_orphaned_directory(child: Path) -> bool:
+    """True only for directories with no live git worktree metadata.
+
+    A live worktree always carries a `.git` file pointing at a
+    gitdir that exists — even when it belongs to a different source
+    repository than the allocation in progress (concurrent missions
+    on different repos share the workspace root). Such directories
+    are never pruned: only a directory with no `.git` file at all,
+    or one whose gitdir no longer exists, is a genuine orphan from
+    a crashed run.
+    """
+    git_file = child / ".git"
+
+    if not git_file.is_file():
+        return True
+
+    try:
+        text = git_file.read_text(errors="replace").strip()
+    except OSError:
+        # Unreadable metadata: assume live, never delete.
+        return False
+
+    if not text.startswith("gitdir:"):
+        return False
+
+    gitdir = Path(text[len("gitdir:"):].strip())
+
+    return not gitdir.exists()
+
+
 def _unregistered_leftovers(worktree_root: Path, repo: Path, run: Callable) -> list:
-    """Directories under worktree_root named repo_* that git no longer
-    registers as worktrees (crashed runs leave these behind)."""
-    registered = set()
-    listing = run(["git", "worktree", "list", "--porcelain"], cwd=str(repo))
-    for line in listing.get("stdout", "").splitlines():
-        if line.startswith("worktree "):
-            registered.add(line[len("worktree "):].strip())
+    """Directories under worktree_root named repo_* with no live git
+    metadata (crashed runs leave these behind). Live worktrees of
+    other repositories sharing the root are never touched."""
     leftovers = []
     if not worktree_root.exists():
         return leftovers
     for child in worktree_root.iterdir():
         if not child.is_dir() or not child.name.startswith("repo_"):
             continue
-        try:
-            resolved = child.resolve()
-        except OSError:
-            continue
-        if str(resolved) not in registered:
+        if _is_orphaned_directory(child):
             leftovers.append(child)
     return leftovers
 
