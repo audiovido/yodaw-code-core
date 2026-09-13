@@ -3,116 +3,899 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>YODAW Mission Operator</title>
+<title>YODAW Mission Console</title>
 <style>
-body { font-family: system-ui, sans-serif; margin: 24px; max-width: 760px; }
-textarea { width: 100%; min-height: 88px; }
-button { margin: 6px 6px 6px 0; }
-#status { font-weight: bold; }
-pre { background: #f4f4f4; padding: 12px; white-space: pre-wrap; }
-.row { margin: 12px 0; }
+:root {
+  --bg: #0f1115;
+  --bg-panel: #171a21;
+  --bg-panel-2: #1d2129;
+  --bg-input: #12151b;
+  --border: #2a2f3a;
+  --border-soft: #22262f;
+  --text: #e8eaf0;
+  --text-dim: #9aa1ae;
+  --text-faint: #6b7280;
+  --accent: #4f8cff;
+  --accent-strong: #3b78e8;
+  --green: #2fbf71;
+  --green-bg: rgba(47,191,113,.12);
+  --red: #e5534b;
+  --red-bg: rgba(229,83,75,.12);
+  --amber: #d9a13c;
+  --amber-bg: rgba(217,161,60,.12);
+  --gray: #8a92a2;
+  --gray-bg: rgba(138,146,162,.12);
+  --blue: #4f8cff;
+  --blue-bg: rgba(79,140,255,.12);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+input, textarea, select { font: inherit; color: var(--text); }
+
+/* ---------- header ---------- */
+header {
+  display: flex; align-items: center; gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  position: sticky; top: 0; z-index: 10;
+}
+.brand { font-weight: 700; font-size: 15px; letter-spacing: .4px; }
+.brand .accent { color: var(--accent); }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; border: 1px solid var(--border);
+  background: var(--bg-panel-2); color: var(--text-dim);
+}
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gray); }
+.chip.ok .dot { background: var(--green); }
+.chip.bad .dot { background: var(--red); }
+.chip .count { color: var(--text); font-weight: 600; }
+
+/* ---------- layout ---------- */
+.layout {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: 16px;
+  padding: 16px 20px 40px;
+  max-width: 1440px;
+  margin: 0 auto;
+}
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.panel h2 {
+  margin: 0; padding: 12px 16px;
+  font-size: 13px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .8px;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border-soft);
+  display: flex; align-items: center; gap: 8px;
+}
+.panel h2 .spacer { margin-left: auto; }
+
+aside { display: flex; flex-direction: column; gap: 16px; align-self: start; position: sticky; top: 68px; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; }
+}
+
+/* ---------- composer ---------- */
+.composer-body { padding: 14px 16px 16px; }
+.composer-body label { display: block; font-size: 12px; color: var(--text-dim); margin: 0 0 6px; }
+.composer-body .field { margin-bottom: 12px; }
+#goal {
+  width: 100%; min-height: 92px; resize: vertical;
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+  outline: none;
+}
+#goal:focus { border-color: var(--accent); }
+.row2 { display: grid; grid-template-columns: 1fr 130px; gap: 10px; }
+#repo { width: 100%; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; outline: none; }
+#cap { width: 100%; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; outline: none; }
+#goal:focus, #repo:focus, #cap:focus { border-color: var(--accent); }
+.btn-primary {
+  width: 100%; padding: 10px 14px; margin-top: 4px;
+  background: var(--accent-strong); color: #fff; font-weight: 600;
+  border-radius: var(--radius-sm);
+}
+.btn-primary:hover { background: #2f6fdd; }
+.btn-primary:disabled { opacity: .5; cursor: default; }
+.hint { margin-top: 8px; font-size: 12px; color: var(--text-faint); }
+
+/* ---------- history ---------- */
+#history { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
+#history li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+}
+#history li:hover { background: var(--bg-panel-2); }
+#history li.active { background: var(--blue-bg); }
+#history .h-goal {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px;
+}
+#history .h-time { font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+#history-empty { padding: 24px 16px; text-align: center; color: var(--text-faint); font-size: 13px; }
+
+/* ---------- status badges ---------- */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; letter-spacing: .4px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.badge.PASS              { color: var(--green); background: var(--green-bg); }
+.badge.FAIL              { color: var(--red);   background: var(--red-bg); }
+.badge.BLOCKED,
+.badge.BLOCKED_EXTERNAL  { color: var(--amber); background: var(--amber-bg); }
+.badge.CANCELLED         { color: var(--gray);  background: var(--gray-bg); }
+.badge.QUEUED,
+.badge.OBSERVING,
+.badge.PLANNING,
+.badge.EXECUTING,
+.badge.VERIFYING,
+.badge.RECOVERING,
+.badge.RUNNING           { color: var(--blue);  background: var(--blue-bg); }
+.badge.UNKNOWN           { color: var(--text-dim); background: var(--gray-bg); }
+
+/* ---------- mission detail ---------- */
+#detail-empty {
+  padding: 60px 24px; text-align: center; color: var(--text-faint);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
+#detail-empty .big { font-size: 30px; }
+.detail-head {
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap;
+}
+.detail-head .meta { min-width: 0; flex: 1; }
+.mission-id { font-family: var(--mono); font-size: 13px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; word-break: break-all; }
+.mission-goal { margin-top: 6px; font-size: 15px; font-weight: 600; }
+.mission-goal.none { color: var(--text-faint); font-weight: 400; font-size: 13px; }
+.meta-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-panel-2);
+}
+.meta-grid .kv .k { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .5px; }
+.meta-grid .kv .v { font-size: 13px; margin-top: 2px; word-break: break-word; }
+.kv .v.mono { font-family: var(--mono); font-size: 12px; }
+
+.actions { display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
+.btn {
+  padding: 7px 14px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500;
+  border: 1px solid var(--border); background: var(--bg-panel-2); color: var(--text);
+}
+.btn:hover:not(:disabled) { border-color: var(--text-faint); }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn.danger { color: var(--red); border-color: rgba(229,83,75,.35); }
+.btn.danger:hover:not(:disabled) { border-color: var(--red); }
+.btn.ok { color: var(--green); border-color: rgba(47,191,113,.35); }
+.btn.ok:hover:not(:disabled) { border-color: var(--green); }
+.btn .spin { display: none; }
+.btn.busy .spin { display: inline-block; }
+
+/* ---------- progress ---------- */
+#progressWrap { padding: 0 16px 14px; border-bottom: 1px solid var(--border-soft); }
+.stage-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.stage-label { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.stage-note { font-size: 12px; color: var(--text-faint); }
+.track { height: 8px; border-radius: 999px; background: var(--bg-input); border: 1px solid var(--border-soft); overflow: hidden; }
+.bar { height: 100%; width: 0; border-radius: 999px; background: var(--accent); transition: width .45s ease; }
+.bar.done { background: var(--green); }
+.bar.fail { background: var(--red); }
+.bar.blk  { background: var(--amber); }
+.segments { display: flex; gap: 2px; margin-top: 8px; }
+.seg { flex: 1; height: 3px; border-radius: 2px; background: var(--border); }
+.seg.on { background: var(--accent); }
+.seg.on.done { background: var(--green); }
+
+/* ---------- errors ---------- */
+#errorBanner {
+  display: none; margin: 12px 16px 0; padding: 10px 12px;
+  border: 1px solid rgba(229,83,75,.4); background: var(--red-bg);
+  color: #f0a8a2; border-radius: var(--radius-sm); font-size: 13px;
+}
+#errorBanner.show { display: block; }
+#errorBanner .err-title { font-weight: 600; }
+#errorBanner .err-detail { margin-top: 2px; color: #d9b3af; word-break: break-word; }
+#missionError { display: none; margin: 12px 16px 0; padding: 10px 12px; border: 1px solid rgba(229,83,75,.4); background: var(--red-bg); color: #f0a8a2; border-radius: var(--radius-sm); font-size: 13px; }
+#missionError.show { display: block; }
+#missionError .err-title { font-weight: 600; }
+#missionError .err-detail { margin-top: 2px; color: #d9b3af; word-break: break-word; }
+
+/* ---------- tabs ---------- */
+.tabs { display: flex; gap: 4px; padding: 10px 16px 0; border-bottom: 1px solid var(--border-soft); }
+.tab {
+  padding: 7px 14px; font-size: 13px; color: var(--text-dim);
+  border: 1px solid transparent; border-bottom: none; border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+.tab:hover { color: var(--text); }
+.tab.on { color: var(--text); background: var(--bg-panel-2); border-color: var(--border-soft); }
+.tab .n { margin-left: 5px; font-size: 11px; color: var(--text-faint); }
+.tab-body { padding: 14px 16px; min-height: 200px; }
+.empty { color: var(--text-faint); font-size: 13px; }
+
+pre.json, pre.diff, pre.output {
+  background: var(--bg-input); border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.55;
+  overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 0;
+}
+.copy-row { display: flex; align-items: center; gap: 8px; }
+.copy-row .label { font-size: 12px; color: var(--text-dim); flex: 1; }
+
+.btn-icon {
+  padding: 2px 8px; font-size: 11px; border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text-dim); background: var(--bg-panel-2);
+}
+.btn-icon:hover { color: var(--text); border-color: var(--text-faint); }
+
+/* ---------- events ---------- */
+#events { list-style: none; margin: 0; padding: 0; }
+#events li { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 8px; background: var(--bg-panel-2); }
+.ev-head { display: flex; align-items: center; gap: 8px; }
+.ev-type { font-family: var(--mono); font-size: 12px; color: var(--accent); flex: 1; word-break: break-all; }
+.ev-time { font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.ev-toggle { font-size: 11px; color: var(--text-dim); }
+.ev-data { display: none; margin-top: 8px; }
+.ev-data.open { display: block; }
+
+/* ---------- evidence ---------- */
+#evidence { list-style: none; margin: 0; padding: 0; }
+#evidence li { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 10px; background: var(--bg-panel-2); }
+.ev-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.ev-kind { font-family: var(--mono); font-size: 12px; color: var(--text-dim); flex: 1; word-break: break-all; }
+.ev-kind .tag { color: var(--accent); }
+.exit { font-family: var(--mono); font-size: 11px; padding: 1px 7px; border-radius: 4px; background: var(--gray-bg); color: var(--text-dim); }
+.exit.ok { background: var(--green-bg); color: var(--green); }
+.exit.bad { background: var(--red-bg); color: var(--red); }
+.cmd-line { font-family: var(--mono); font-size: 12px; background: var(--bg-input); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 6px 10px; margin-bottom: 8px; word-break: break-all; white-space: pre-wrap; }
+.output-block { margin-bottom: 6px; }
+.output-block .ob-label { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
+.output-block .ob-label.err { color: var(--red); }
+.file-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.file-chip {
+  font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  background: var(--blue-bg); color: var(--blue); border: 1px solid rgba(79,140,255,.3);
+  word-break: break-all;
+}
+img.preview {
+  max-width: 100%; max-height: 220px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft); cursor: zoom-in; display: block;
+}
+.kv-inline { display: grid; grid-template-columns: minmax(90px, max-content) 1fr; gap: 3px 12px; font-size: 12px; }
+.kv-inline .ik { color: var(--text-faint); font-family: var(--mono); }
+.kv-inline .iv { word-break: break-word; }
+
+.notice { font-size: 12px; color: var(--text-dim); background: var(--blue-bg); border: 1px solid rgba(79,140,255,.3); padding: 8px 10px; border-radius: var(--radius-sm); margin-bottom: 10px; }
+::selection { background: rgba(79,140,255,.35); }
 </style>
 </head>
 <body>
-<h1>YODAW Mission Operator</h1>
-<div class="row">
-<label for="goal">Mission goal</label><br />
-<textarea id="goal" placeholder="Describe the coding mission goal"></textarea>
-</div>
-<div class="row">
-<label for="repo">Repo path (optional)</label><br />
-<input id="repo" type="text" style="width:100%" placeholder="/path/to/repo" />
-</div>
-<div class="row">
-<button id="submit">Submit mission</button>
-<button id="cancel" disabled>Cancel</button>
-<button id="retry" disabled>Retry</button>
-<button id="copy" disabled>Copy result</button>
-</div>
-<div class="row">Mission: <span id="missionId">none</span></div>
-<div class="row">Status: <span id="status">idle</span></div>
-<h2>Evidence / log</h2>
-<pre id="log">No mission submitted.</pre>
-<h2>Final result</h2>
-<pre id="result">None yet.</pre>
-<script>
-const goalEl = document.getElementById('goal');
-const repoEl = document.getElementById('repo');
-const missionEl = document.getElementById('missionId');
-const statusEl = document.getElementById('status');
-const logEl = document.getElementById('log');
-const resultEl = document.getElementById('result');
-const submitBtn = document.getElementById('submit');
-const cancelBtn = document.getElementById('cancel');
-const retryBtn = document.getElementById('retry');
-const copyBtn = document.getElementById('copy');
-let missionId = null;
-let timer = null;
+<header>
+  <div class="brand">YODAW<span class="accent"> Mission Console</span></div>
+  <div class="header-right">
+    <span class="chip" id="serviceChip" title="Service status"><span class="dot"></span><span id="serviceTxt">checking…</span></span>
+    <span class="chip" id="authChip" title="Auth mode">auth: <span id="authMode">…</span></span>
+    <span class="chip" title="Missions by status" id="countsChip"></span>
+  </div>
+</header>
 
-async function fetchJSON(url, opts) {
-  const res = await fetch(url, opts);
-  const text = await res.text();
+<div class="layout">
+  <aside>
+    <section class="panel">
+      <h2>New mission</h2>
+      <div class="composer-body">
+        <div class="field">
+          <label for="goal">Goal</label>
+          <textarea id="goal" placeholder="Describe the coding mission… (Enter submits, Shift+Enter for a new line)"></textarea>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label for="repo">Repo path (optional)</label>
+            <input id="repo" type="text" placeholder="/path/to/repo" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="cap">Capability</label>
+            <select id="cap"></select>
+          </div>
+        </div>
+        <button id="submit" class="btn-primary" disabled>Submit mission</button>
+        <div class="hint" id="composerHint">Loading capabilities…</div>
+        <div class="hint" id="idemHint" style="display:none"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Recent missions <span class="spacer"><button id="refresh" class="btn-icon" title="Refresh list">refresh</button></span></h2>
+      <ul id="history"><li id="history-empty">No missions yet.</li></ul>
+    </section>
+  </aside>
+
+  <section class="panel" id="detail">
+    <div id="detail-empty">
+      <div class="big">⌘</div>
+      <div>Submit a mission to get started, or pick one from recent missions.</div>
+    </div>
+    <div id="detail-body" style="display:none">
+      <div class="detail-head">
+        <div class="meta">
+          <div class="mission-id" id="missionId">–</div>
+          <div class="mission-goal" id="missionGoal"></div>
+        </div>
+        <span class="badge" id="statusBadge">–</span>
+      </div>
+      <div class="meta-grid" id="metaGrid"></div>
+      <div class="actions">
+        <button id="cancelBtn" class="btn danger" disabled>Cancel</button>
+        <button id="retryBtn" class="btn ok" disabled>Retry</button>
+        <button id="copyResultBtn" class="btn" disabled>Copy result</button>
+      </div>
+      <div id="errorBanner"><div class="err-title" id="errorTitle"></div><div class="err-detail" id="errorDetail"></div></div>
+      <div id="missionError"><div class="err-title" id="missionErrorTitle"></div><div class="err-detail" id="missionErrorDetail"></div></div>
+      <div id="progressWrap">
+        <div class="stage-row">
+          <span class="stage-label"><span id="stageLabel">–</span></span>
+          <span class="stage-note" id="stageNote"></span>
+        </div>
+        <div class="track"><div class="bar" id="progressBar"></div></div>
+        <div class="segments" id="segments"></div>
+      </div>
+      <div class="tabs">
+        <button class="tab on" data-tab="result">Result <span class="n" id="resultCount"></span></button>
+        <button class="tab" data-tab="events">Events <span class="n" id="eventsCount"></span></button>
+        <button class="tab" data-tab="evidence">Evidence <span class="n" id="evidenceCount"></span></button>
+      </div>
+      <div class="tab-body">
+        <div id="tab-result">
+          <div class="copy-row"><span class="label">Final structured result</span><button id="copyResult2" class="btn-icon">copy</button></div>
+          <pre class="json" id="resultJson">Waiting for result…</pre>
+        </div>
+        <div id="tab-events" style="display:none"><ul id="events"></ul></div>
+        <div id="tab-evidence" style="display:none"><ul id="evidence"></ul></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const TERMINAL = new Set(["PASS", "FAIL", "BLOCKED", "BLOCKED_EXTERNAL", "CANCELLED"]);
+const ACTIVE = new Set(["QUEUED", "OBSERVING", "PLANNING", "EXECUTING", "VERIFYING", "RECOVERING", "RUNNING"]);
+const STAGES = ["QUEUED", "OBSERVING", "PLANNING", "EXECUTING", "VERIFYING", "RECOVERING"];
+
+const state = {
+  mission: null,
+  events: [],
+  evidence: [],
+  timer: null,
+  busy: null,
+  capabilities: ["repo-code", "code"],
+  goalDraft: "",
+  history: [],
+};
+
+/* ---------- api helper ---------- */
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
   let body = null;
-  try { body = text ? JSON.parse(text) : null; } catch (e) { body = {raw: text}; }
-  if (!res.ok) throw new Error((body && (body.detail || body.error)) || res.statusText);
+  const text = await res.text();
+  if (text) { try { body = JSON.parse(text); } catch { body = { raw: text }; } }
+  if (!res.ok) {
+    const err = new Error(body && body.detail ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail)) : (body && body.title ? body.title : res.statusText));
+    err.status = res.status;
+    err.envelope = body;
+    throw err;
+  }
   return body;
 }
 
-async function poll() {
-  if (!missionId) return;
-  const mission = await fetchJSON('/api/v1/missions/' + missionId);
-  statusEl.textContent = mission.status;
-  resultEl.textContent = JSON.stringify(mission.result || {}, null, 2);
-  const ev = await fetchJSON('/api/v1/missions/' + missionId + '/evidence');
-  logEl.textContent = JSON.stringify(ev.evidence || [], null, 2).slice(0, 20000);
-  const terminal = ['PASS', 'FAIL', 'BLOCKED', 'BLOCKED_EXTERNAL', 'CANCELLED'];
-  const done = terminal.includes(mission.status);
-  cancelBtn.disabled = done || !missionId;
-  retryBtn.disabled = !done;
-  copyBtn.disabled = !done;
-  if (done && timer) { clearInterval(timer); timer = null; }
+function showError(title, detail) {
+  $("errorTitle").textContent = title;
+  $("errorDetail").textContent = detail || "";
+  $("errorBanner").classList.add("show");
+}
+function clearError() { $("errorBanner").classList.remove("show"); }
+
+function copyText(text) {
+  const fallback = () => {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch {}
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(fallback);
+  } else fallback();
 }
 
-submitBtn.onclick = async () => {
+/* ---------- service status ---------- */
+async function refreshStatus() {
+  try {
+    const s = await api("/api/v1/status");
+    const chip = $("serviceChip");
+    chip.classList.toggle("ok", s.status === "READY");
+    chip.classList.toggle("bad", s.status !== "READY");
+    $("serviceTxt").textContent = (s.status || "UNKNOWN").toLowerCase();
+    $("authMode").textContent = s.auth || "?";
+    const counts = s.missions || {};
+    const parts = Object.entries(counts)
+      .filter(([, v]) => v > 0)
+      .map(([k, v]) => `${k}:${v}`).join("  ");
+    $("countsChip").textContent = parts || "no missions";
+  } catch { /* header stays heuristic */ }
+}
+
+/* ---------- capabilities ---------- */
+async function loadCapabilities() {
+  try {
+    const caps = await api("/api/v1/capabilities");
+    if (caps && Array.isArray(caps.capabilities)) {
+      const all = [];
+      for (const w of caps.capabilities) for (const c of (w.capabilities || [])) if (!all.includes(c)) all.push(c);
+      if (all.length) state.capabilities = all;
+    }
+  } catch { /* keep defaults */ }
+  const sel = $("cap");
+  sel.innerHTML = "";
+  for (const c of state.capabilities) {
+    const o = document.createElement("option");
+    o.value = c; o.textContent = c;
+    sel.appendChild(o);
+  }
+  $("composerHint").textContent = "Submit against the public /api/v1 API. Press Enter to send.";
+  updateSubmit();
+}
+
+/* ---------- composer ---------- */
+const goalEl = $("goal"), repoEl = $("repo"), capEl = $("cap");
+goalEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitMission(); }
+});
+goalEl.addEventListener("input", updateSubmit);
+repoEl.addEventListener("input", updateSubmit);
+
+function contentKey() {
+  const s = `${goalEl.value.trim()}\u0000${repoEl.value.trim()}\u0000${capEl.value}`;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
+  return `ui-${(h >>> 0).toString(16)}`;
+}
+function updateSubmit() {
+  const ok = goalEl.value.trim().length > 0;
+  $("submit").disabled = !ok || state.busy === "submit";
+  $("idemHint").textContent = ok ? `idempotency key: ${contentKey()}` : "";
+  $("idemHint").style.display = ok ? "" : "none";
+}
+
+async function submitMission() {
   const goal = goalEl.value.trim();
-  if (!goal) { alert('Enter a mission goal'); return; }
-  const body = {goal: goal, capability: 'repo-code', metadata: {dry_run: false}};
-  if (repoEl.value.trim()) body.repo_path = repoEl.value.trim();
-  const created = await fetchJSON('/api/v1/missions', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
+  if (!goal) return;
+  clearError();
+  state.busy = "submit";
+  updateSubmit();
+  const body = { goal, capability: capEl.value, metadata: { dry_run: false } };
+  if (repoEl.value.trim()) body.repo_path = repoEl.value.trim().replace(/\/+$/, "");
+  body.idempotency_key = contentKey();
+  try {
+    const created = await api("/api/v1/missions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const id = created.mission_id || created.id;
+    if (created.replayed) {
+      showError("Already submitted", `Idempotency replay: this mission text was submitted before as ${id}.`);
+    }
+    loadMission(id, { goal });
+    loadHistory();
+  } catch (err) {
+    showError(err.envelope && err.envelope.title ? err.envelope.title : `Submit failed (HTTP ${err.status || "network"})`, err.message);
+  } finally {
+    state.busy = null;
+    updateSubmit();
+  }
+}
+
+/* ---------- mission detail ---------- */
+async function loadMission(id, hint) {
+  stopPoll();
+  clearError();
+  state.events = [];
+  state.evidence = [];
+  $("detail-empty").style.display = "none";
+  $("detail-body").style.display = "block";
+  try {
+    const m = await api(`/api/v1/missions/${id}`);
+    if (hint && hint.goal && !m.goal) m.goal = hint.goal;
+    state.mission = m;
+    await refreshDetail();
+    if (!TERMINAL.has(m.status)) startPoll();
+  } catch (err) {
+    renderDetailEmpty();
+    showError(err.envelope && err.envelope.title ? err.envelope.title : `Could not load mission (HTTP ${err.status || "network"})`, err.message);
+  }
+}
+
+function renderDetailEmpty() {
+  state.mission = null; state.events = []; state.evidence = [];
+  $("detail-empty").style.display = "";
+  $("detail-body").style.display = "none";
+}
+
+function startPoll() {
+  stopPoll();
+  state.timer = setInterval(async () => {
+    if (!state.mission) return;
+    try {
+      const m = await api(`/api/v1/missions/${state.mission.id}`);
+      const wasTerminal = TERMINAL.has((state.mission && state.mission.status) || "");
+      state.mission = m;
+      await refreshDetail();
+      if (TERMINAL.has(m.status)) { stopPoll(); clearError(); await loadHistory(); }
+      else if (wasTerminal) startPoll();
+    } catch (err) {
+      if (err.status === 404) { stopPoll(); showError("Mission not found", err.message); }
+      else showError(`Poll failed (HTTP ${err.status || "network"})`, err.message);
+    }
+  }, 1500);
+}
+function stopPoll() { if (state.timer) { clearInterval(state.timer); state.timer = null; } }
+
+async function refreshDetail() {
+  const m = state.mission;
+  $("missionId").textContent = m.mission_id || m.id;
+  $("missionGoal").textContent = m.goal || "";
+  $("missionGoal").classList.toggle("none", !m.goal);
+
+  const badge = $("statusBadge");
+  badge.textContent = m.status || "UNKNOWN";
+  badge.className = "badge " + (m.status || "UNKNOWN");
+
+  renderMeta(m);
+  renderProgress(m);
+  renderMissionError(m);
+
+  // Action affordances from real API state only.
+  const active = !TERMINAL.has(m.status);
+  $("cancelBtn").disabled = !active || state.busy === "cancel";
+  const retryable = TERMINAL.has(m.status) && m.status !== "PASS";
+  $("retryBtn").disabled = !retryable || state.busy === "retry";
+  const hasResult = m.result && Object.keys(m.result).length > 0;
+  $("copyResultBtn").disabled = !hasResult;
+  $("copyResult2").style.display = hasResult ? "" : "none";
+
+  $("resultJson").textContent = hasResult ? JSON.stringify(m.result, null, 2) : "Waiting for result…";
+  $("resultCount").textContent = hasResult ? "" : "pending";
+
+  const [events, evidence] = await Promise.all([
+    api(`/api/v1/missions/${m.id}/events`),
+    api(`/api/v1/missions/${m.id}/evidence`),
+  ]);
+  state.events = (events && events.events) || [];
+  state.evidence = (evidence && evidence.evidence) || [];
+  renderProgress(m);
+  renderEvents();
+  renderEvidence();
+}
+
+function renderMeta(m) {
+  const rows = [
+    ["id", m.mission_id || m.id, true],
+    ["created", m.created_at || "–"],
+    ["finished", m.finished_at || "–"],
+    ["attempt", m.attempts != null ? `${m.attempts}/${m.max_attempts ?? m.attempt ?? "∞"}` : String(m.attempt ?? "–")],
+    ["worker", m.worker || "unassigned"],
+    ["capability", m.capability || "–"],
+    ["priority", m.priority != null ? String(m.priority) : "–"],
+    ["client", m.client_id || "local"],
+  ];
+  $("metaGrid").innerHTML = rows.map(([k, v, mono]) =>
+    `<div class="kv"><div class="k">${k}</div><div class="v${mono ? " mono" : ""}">${escapeHtml(String(v))}</div></div>`
+  ).join("");
+}
+
+function renderProgress(m) {
+  const events = state.events || [];
+  const evStages = { "mission.observing": 1, "mission.planning": 2, "mission.executing": 3 };
+  let evStage = 0;
+  for (const e of events) {
+    const t = e.event_type || "";
+    if (t in evStages) evStage = Math.max(evStage, evStages[t]);
+    if (t.startsWith("validation.")) evStage = Math.max(evStage, 4);
+    if (t === "mission.recovered" || t === "recovery") evStage = Math.max(evStage, 5);
+  }
+  const status = m.status || "QUEUED";
+  const statusIdx = STAGES.indexOf(status);
+  const stage = TERMINAL.has(status) ? STAGES.length : Math.max(statusIdx, evStage, 0);
+  $("progressBar").style.width = `${(stage / STAGES.length) * 100}%`;
+  $("progressBar").classList.toggle("done", status === "PASS");
+  $("progressBar").classList.toggle("fail", status === "FAIL");
+  $("progressBar").classList.toggle("blk", status === "BLOCKED" || status === "BLOCKED_EXTERNAL");
+  $("stageLabel").textContent = TERMINAL.has(status) ? status : STAGES[stage] || status;
+  const times = events.filter((e) => e.timestamp).map((e) => e.timestamp);
+  if (TERMINAL.has(status) && m.finished_at) $("stageNote").textContent = `finished ${m.finished_at}`;
+  else if (times.length) $("stageNote").textContent = `last event ${times[times.length - 1]}`;
+  else $("stageNote").textContent = m.updated_at ? `updated ${m.updated_at}` : "";
+  $("segments").innerHTML = STAGES.map((s, i) =>
+    `<div class="seg${i <= stage ? " on" : ""}${status === "PASS" ? " done" : ""}" title="${s}"></div>`
+  ).join("");
+}
+
+function renderMissionError(m) {
+  const err = m.result && m.result.error;
+  if (err) {
+    $("missionErrorTitle").textContent = `Mission ${m.status}: ${err.type || "Error"}`;
+    $("missionErrorDetail").textContent = err.message || (typeof err === "string" ? err : JSON.stringify(err));
+    $("missionError").classList.add("show");
+  } else {
+    $("missionError").classList.remove("show");
+  }
+}
+
+/* ---------- tabs ---------- */
+document.querySelectorAll(".tab").forEach((t) => {
+  t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("on"));
+    t.classList.add("on");
+    ["result", "events", "evidence"].forEach((n) => {
+      $("tab-" + n).style.display = n === t.dataset.tab ? "" : "none";
+    });
   });
-  missionId = created.mission_id || created.id;
-  missionEl.textContent = missionId;
-  statusEl.textContent = created.status;
-  cancelBtn.disabled = false;
-  retryBtn.disabled = true;
-  copyBtn.disabled = true;
-  if (timer) clearInterval(timer);
-  timer = setInterval(poll, 1500);
-  poll();
-};
+});
 
-cancelBtn.onclick = async () => {
-  if (!missionId) return;
-  await fetchJSON('/api/v1/missions/' + missionId + '/cancel', {method: 'POST'});
-  poll();
-};
+/* ---------- events ---------- */
+function renderEvents() {
+  const ev = state.events;
+  $("eventsCount").textContent = ev.length;
+  if (!ev.length) {
+    $("events").innerHTML = `<li class="empty">No events recorded yet.</li>`;
+    return;
+  }
+  $("events").innerHTML = ev.map((e, i) => {
+    const data = e.data && Object.keys(e.data).length ? e.data : null;
+    return `<li>
+      <div class="ev-head">
+        <span class="ev-type">${escapeHtml(e.event_type || "event")}</span>
+        <span class="ev-time">${escapeHtml(e.timestamp || "")}</span>
+        <button class="btn-icon ev-toggle" data-i="${i}">${data ? "show" : ""}</button>
+      </div>
+      ${data ? `<div class="ev-data" id="evData-${i}"><pre class="json">${escapeHtml(JSON.stringify(data, null, 2))}</pre></div>` : ""}
+    </li>`;
+  }).join("");
+  document.querySelectorAll(".ev-toggle").forEach((b) => {
+    b.addEventListener("click", () => {
+      const d = $("evData-" + b.dataset.i);
+      const open = d.classList.toggle("open");
+      b.textContent = open ? "hide" : "show";
+    });
+  });
+}
 
-retryBtn.onclick = async () => {
-  if (!missionId) return;
-  const retried = await fetchJSON('/api/v1/missions/' + missionId + '/retry', {method: 'POST'});
-  missionId = retried.mission_id;
-  missionEl.textContent = missionId;
-  if (timer) clearInterval(timer);
-  timer = setInterval(poll, 1500);
-  poll();
-};
+/* ---------- evidence ---------- */
+function collectStrings(obj, pred, out, depth = 0) {
+  if (depth > 5 || obj == null || typeof obj !== "object") return out;
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === "string") { if (pred(k, v)) out.push([k, v]); }
+    else if (Array.isArray(v) || typeof v === "object") collectStrings(v, pred, out, depth + 1);
+  }
+  return out;
+}
+function collectFileChips(item) {
+  const chips = new Set();
+  collectStrings(item, (k, v) => /file|path|worktree|repo/.test(k), []).forEach(([, v]) => {
+    if (!/^(data:image|https?:)/.test(v) && v.length < 300) chips.add(v);
+  });
+  for (const k of ["files", "edited_files", "touched_files", "failed_files", "restored_files", "list"]) {
+    const v = item[k];
+    if (Array.isArray(v)) for (const f of v) if (typeof f === "string" && f.length < 300) chips.add(f);
+  }
+  return [...chips];
+}
+function collectImages(item) {
+  return collectStrings(item, (k, v) => /^(data:image\/|https?:\/\/.*\.(png|jpe?g|gif|webp|bmp)([?#]|$))/i.test(v.trim()), []);
+}
 
-copyBtn.onclick = async () => {
-  await navigator.clipboard.writeText(resultEl.textContent);
-};
+function isCommand(item) {
+  return item && typeof item.cmd === "string" && typeof item.returncode === "number";
+}
+function card(title, inner, extra = "") {
+  return `<li>${extra}<div class="ev-card-head"><span class="ev-kind">${title}</span></div>${inner}</li>`;
+}
+
+function renderEvidence() {
+  const ev = state.evidence;
+  $("evidenceCount").textContent = ev.length;
+  if (!ev.length) {
+    $("evidence").innerHTML = `<li class="empty">No evidence recorded yet.</li>`;
+    return;
+  }
+  const parts = ev.map((item, i) => renderEvidenceItem(item, i)).join("");
+  $("evidence").innerHTML = parts;
+}
+
+function renderEvidenceItem(item, i) {
+  const type = item.type || (isCommand(item) ? "command" : "evidence");
+  const esc = (s) => escapeHtml(s);
+  const copy = `<button class="btn-icon" data-copy="${i}" title="Copy raw JSON">copy json</button>`;
+
+  // Screenshot / image preview when the evidence actually provides one.
+  const images = collectImages(item);
+  if (images.length) {
+    const imgs = images.map(([, src]) =>
+      `<a href="${esc(src)}" target="_blank" rel="noopener" title="Open full size"><img class="preview" src="${esc(src)}" alt="${esc(type)} preview" /></a>`
+    ).join("");
+    return card(`<span class="tag">${esc(type)}</span> — image${images.length > 1 ? "s" : ""}`, `${imgs}${copy}`, "");
+  }
+
+  // Command results (git, tests, etc).
+  if (isCommand(item)) {
+    const exitCls = item.returncode === 0 ? "ok" : "bad";
+    const outHtml = [];
+    if (item.stdout) outHtml.push(`<div class="output-block"><div class="ob-label">stdout</div><pre class="output">${esc(item.stdout)}</pre></div>`);
+    if (item.stderr) outHtml.push(`<div class="output-block"><div class="ob-label err">stderr</div><pre class="output">${esc(item.stderr)}</pre></div>`);
+    if (!outHtml.length) outHtml.push(`<div class="output-block"><div class="ob-label">no output</div></div>`);
+    return card(
+      `<span class="tag">command</span> — exit <span class="exit ${exitCls}">${item.returncode}</span>`,
+      `<div class="cmd-line">${esc(item.cmd)}</div>${outHtml.join("")}${copy}`,
+      ""
+    );
+  }
+
+  // Diff text.
+  if (typeof item.diff === "string" && item.diff.trim()) {
+    const files = collectFileChips(item);
+    const chips = files.length ? `<div class="file-chips">${[...files].map((f) => `<span class="file-chip">${esc(f)}</span>`).join("")}</div>` : "";
+    return card(`<span class="tag">${esc(type)}</span> — diff`, `${chips}<pre class="diff">${esc(item.diff)}</pre>${copy}`, "");
+  }
+
+  // Anything else: readout of scalar fields + raw JSON.
+  const files = collectFileChips(item);
+  const chips = files.length ? `<div class="file-chips">${files.map((f) => `<span class="file-chip">${esc(f)}</span>`).join("")}</div>` : "";
+  const kvs = Object.entries(item)
+    .filter(([k]) => !["type", "timestamp"].includes(k))
+    .filter(([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")
+    .slice(0, 8)
+    .map(([k, v]) => `<div class="ik">${esc(k)}</div><div class="iv">${esc(String(v))}</div>`)
+    .join("");
+  const json = `<pre class="json">${esc(JSON.stringify(item, null, 2))}</pre>`;
+  return card(
+    `<span class="tag">${esc(type)}</span>${item.timestamp ? " — " + esc(item.timestamp) : ""}`,
+    `${chips}${kvs ? `<div class="kv-inline">${kvs}</div>` : ""}${copy}`,
+    `<details><summary class="ev-toggle">show raw</summary>${json}</details>`
+  );
+}
+
+/* ---------- generic ---------- */
+// Re-show the copy button for raw JSON per evidence card.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-copy]");
+  if (!b) return;
+  const item = state.evidence[Number(b.dataset.copy)];
+  if (item) copyText(JSON.stringify(item, null, 2));
+});
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("#missionIdCopy");
+  if (b && state.mission) copyText(state.mission.mission_id || state.mission.id);
+});
+$("copyResultBtn").addEventListener("click", () => {
+  if (state.mission && state.mission.result) copyText(JSON.stringify(state.mission.result, null, 2));
+});
+$("copyResult2").addEventListener("click", () => {
+  if (state.mission && state.mission.result) copyText(JSON.stringify(state.mission.result, null, 2));
+});
+
+$("cancelBtn").addEventListener("click", async () => {
+  const m = state.mission;
+  if (!m) return;
+  state.busy = "cancel";
+  $("cancelBtn").disabled = true;
+  try {
+    const r = await api(`/api/v1/missions/${m.id}/cancel`, { method: "POST" });
+    if (r.status === "CANCELLED") {
+      showError("Cancelled", "Mission was cancelled before execution started.");
+    } else if (r.status === "CANCELLING") {
+      showError("Cancelling", "Cancellation requested; the worker will stop at the next checkpoint.");
+    }
+    startPoll();
+  } catch (err) {
+    if (err.status === 409) {
+      showError("Cannot cancel", err.message);
+      startPoll();
+    } else {
+      showError(`Cancel failed (HTTP ${err.status || "network"})`, err.message);
+    }
+  } finally {
+    state.busy = null;
+    updateSubmit();
+  }
+});
+
+$("retryBtn").addEventListener("click", async () => {
+  const m = state.mission;
+  if (!m) return;
+  state.busy = "retry";
+  $("retryBtn").disabled = true;
+  try {
+    const r = await api(`/api/v1/missions/${m.id}/retry`, { method: "POST" });
+    await loadMission(r.mission_id, { goal: m.goal });
+    await loadHistory();
+  } catch (err) {
+    if (err.status === 409) showError("Cannot retry", err.message);
+    else showError(`Retry failed (HTTP ${err.status || "network"})`, err.message);
+  } finally {
+    state.busy = null;
+    $("retryBtn").disabled = !state.mission || !TERMINAL.has(state.mission.status) || state.mission.status === "PASS";
+  }
+});
+
+/* ---------- history ---------- */
+async function loadHistory() {
+  try {
+    const list = await api("/api/v1/missions?limit=50&offset=0");
+    state.history = Array.isArray(list) ? list : [];
+  } catch { state.history = []; }
+  const el = $("history");
+  if (!state.history.length) {
+    el.innerHTML = `<li id="history-empty">No missions yet.</li>`;
+    return;
+  }
+  const current = state.mission && state.mission.id;
+  el.innerHTML = state.history.map((m) => {
+    const goal = m.goal || `${m.capability || "mission"} ${m.mission_id || m.id}`;
+    const time = m.created_at || "";
+    return `<li class="${current === (m.mission_id || m.id) ? "active" : ""}" data-id="${escapeHtml(m.mission_id || m.id)}">
+      <span class="badge ${escapeHtml(m.status || "UNKNOWN")}">${escapeHtml(m.status || "?")}</span>
+      <span class="h-goal" title="${escapeHtml(goal)}">${escapeHtml(goal)}</span>
+      <span class="h-time">${escapeHtml(time.slice(0, 16))}</span>
+    </li>`;
+  }).join("");
+  el.querySelectorAll("li[data-id]").forEach((li) => {
+    li.addEventListener("click", () => loadMission(li.dataset.id));
+  });
+}
+$("refresh").addEventListener("click", loadHistory);
+
+/* ---------- helpers ---------- */
+// mission id copy control is injected into the header row
+(function injectCopy() {
+  const idRow = document.querySelector(".mission-id");
+  if (!idRow) return;
+  const b = document.createElement("button");
+  b.id = "missionIdCopy"; b.className = "btn-icon"; b.title = "Copy mission id"; b.textContent = "copy";
+  idRow.appendChild(b);
+})();
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ---------- boot ---------- */
+refreshStatus();
+setInterval(refreshStatus, 5000);
+loadCapabilities();
+loadHistory();
 </script>
 </body>
 </html>
