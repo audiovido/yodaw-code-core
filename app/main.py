@@ -643,11 +643,13 @@ def readiness():
 @app.get("/api/v1/version")
 def version():
     """API version and metadata."""
+    from app.product.version import describe
+    version_info = describe()
     return {
         "api_version": API_VERSION,
         "title": API_TITLE,
-        "service_version": "0.3.0",
-        "build": __import__("os").environ.get("YODAW_BUILD_SHA", "dev"),
+        "service_version": version_info.get("product_version", "0.3.0"),
+        "build": version_info.get("commit", "dev"),
     }
 
 @app.get("/api/v1/workers")

@@ -8,3 +8,4 @@ workspace/*
 !workspace/.gitkeep
 .env
 .DS_Store
+dist/
