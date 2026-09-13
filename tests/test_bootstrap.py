@@ -51,7 +51,7 @@ def test_get_system_info():
     assert "platform" in info
     assert "architecture" in info
     assert "processor" in info
-    
+
     # On macOS, check for additional fields
     if info["platform"] == "Darwin":
         assert "macos_version" in info
@@ -64,18 +64,18 @@ def test_get_commit_sha(tmp_path):
     # Initialize a git repo in temp directory
     repo_dir = tmp_path / "test_repo"
     repo_dir.mkdir()
-    
+
     # Initialize git
     subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
-    
+
     # Create a file and commit
     test_file = repo_dir / "test.txt"
     test_file.write_text("test")
     subprocess.run(["git", "add", "test.txt"], cwd=repo_dir, check=True)
     subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir, check=True)
-    
+
     # Test getting the SHA
     sha = get_commit_sha(repo_dir)
     assert len(sha) == 40  # SHA-1 hash length
@@ -87,18 +87,18 @@ def test_get_branch_name(tmp_path):
     # Initialize a git repo in temp directory
     repo_dir = tmp_path / "test_repo"
     repo_dir.mkdir()
-    
+
     # Initialize git
     subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
-    
+
     # Create a file and commit
     test_file = repo_dir / "test.txt"
     test_file.write_text("test")
     subprocess.run(["git", "add", "test.txt"], cwd=repo_dir, check=True)
     subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir, check=True)
-    
+
     # Test getting the branch name
     branch = get_branch_name(repo_dir)
     assert branch == "main" or branch == "master"
@@ -108,7 +108,7 @@ def test_create_directories(tmp_path):
     """Test directory creation."""
     install_dir = tmp_path / "install"
     bin_dir, lib_dir, var_dir = create_directories(install_dir)
-    
+
     assert bin_dir.exists()
     assert lib_dir.exists()
     assert var_dir.exists()
@@ -121,9 +121,9 @@ def test_create_virtualenv(tmp_path):
     """Test virtual environment creation."""
     lib_dir = tmp_path / "lib"
     lib_dir.mkdir()
-    
+
     venv_path = create_virtualenv(lib_dir)
-    
+
     assert venv_path.exists()
     assert (venv_path / "bin" / "python").exists()
     assert (venv_path / "bin" / "pip").exists()
@@ -135,7 +135,7 @@ def test_create_version_file(tmp_path):
     lib_dir.mkdir()
     yodaw_dir = lib_dir / "yodaw"
     yodaw_dir.mkdir()
-    
+
     commit_sha = "a1b2c3d4e5f6789012345678901234567890abcd"
     branch_name = "test-branch"
     system_info = {
@@ -143,12 +143,12 @@ def test_create_version_file(tmp_path):
         "architecture": "arm64",
         "macos_version": "14.0"
     }
-    
+
     create_version_file(lib_dir, commit_sha, branch_name, system_info)
-    
+
     version_file = yodaw_dir / "version.py"
     assert version_file.exists()
-    
+
     content = version_file.read_text()
     assert "__version__ = \"0.4.0\"" in content
     assert f"__commit__ = \"{commit_sha}\"" in content
@@ -169,13 +169,13 @@ def test_create_wrapper_script(tmp_path):
     (venv_dir / "bin").mkdir()
     (venv_dir / "bin" / "python").write_text("#!/bin/sh\nexec python3.12 \"$@\"")
     (venv_dir / "bin" / "python").chmod(0o755)
-    
+
     create_wrapper_script(bin_dir, lib_dir)
-    
+
     wrapper_path = bin_dir / "yodaw"
     assert wrapper_path.exists()
     assert wrapper_path.stat().st_mode & 0o755 == 0o755  # Check executable
-    
+
     content = wrapper_path.read_text()
     assert "#!/usr/bin/env bash" in content
     assert "VENV_PYTHON" in content
@@ -187,13 +187,13 @@ def test_create_uninstall_script(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     install_dir = tmp_path / "install"
-    
+
     create_uninstall_script(bin_dir, install_dir)
-    
+
     uninstall_path = bin_dir / "yodaw-uninstall"
     assert uninstall_path.exists()
     assert uninstall_path.stat().st_mode & 0o755 == 0o755  # Check executable
-    
+
     content = uninstall_path.read_text()
     assert "#!/usr/bin/env bash" in content
     assert "INSTALL_DIR" in content
@@ -206,7 +206,7 @@ def test_check_writable_directory(tmp_path):
     writable_dir = tmp_path / "writable"
     assert check_writable_directory(writable_dir) is True
     assert writable_dir.exists()
-    
+
     # Clean up
     shutil.rmtree(writable_dir)
 
@@ -218,10 +218,10 @@ def test_check_port_available():
     with socket.socket() as s:
         s.bind(("", 0))
         port = s.getsockname()[1]
-    
+
     # This port should be available right after binding and closing
     assert check_port_available("127.0.0.1", port) is True
-    
+
     # Test with a port that's likely unavailable (though this is not guaranteed)
     # We'll skip this as it's flaky
 
@@ -230,16 +230,16 @@ def test_perform_dependency_checks(tmp_path):
     """Test dependency checks performance."""
     install_dir = tmp_path / "install"
     checks, system_info = perform_dependency_checks(install_dir)
-    
+
     # Should return a dict with expected keys
-    expected_keys = ["python_312", "git", "platform", "macos_version", "architecture", 
+    expected_keys = ["python_312", "git", "platform", "macos_version", "architecture",
                      "writable_bin", "writable_lib", "writable_var", "port_available"]
-    
+
     for key in expected_keys:
         assert key in checks
         # Values should be boolean
         assert isinstance(checks[key], bool)
-    
+
     # System info should have expected keys
     assert "platform" in system_info
     assert "architecture" in system_info
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     test_check_python_version()
     test_check_git()
     test_get_system_info()
-    
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         test_get_commit_sha(tmp_path)
@@ -295,7 +295,7 @@ if __name__ == "__main__":
         test_check_writable_directory(tmp_path)
         test_check_port_available()
         test_perform_dependency_checks(tmp_path)
-    
+
     test_bootstrap_script_help()
     test_bootstrap_check_deps_only(tmp_path)
     print("All tests passed!")

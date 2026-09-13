@@ -383,7 +383,7 @@ class RequestIdLogFilter(logging.Filter):
 
 app = FastAPI(
     title="YODAW Code Core",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -649,7 +649,7 @@ def version():
         "api_version": API_VERSION,
         "title": API_TITLE,
         "product_name": version_info.get("product_name", "YODAW Coder"),
-        "service_version": version_info.get("product_version", "0.3.0"),
+        "service_version": version_info.get("product_version", "0.4.0"),
         "build": version_info.get("commit", "dev"),
     }
 

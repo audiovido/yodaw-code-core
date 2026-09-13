@@ -31,14 +31,14 @@ The release tarball contains:
 Each release includes version metadata in two places:
 
 1. **Inside the tarball**: `yodaw/version.py` contains:
-   - `__version__`: Product version (e.g., "0.1.0")
+   - `__version__`: Product version (e.g., "0.4.0")
    - `__commit__`: Git commit SHA
    - `__branch__`: Git branch name
    - Build metadata (platform, architecture, timestamp)
 
 2. **Separate VERSION file**: In the distribution directory alongside the tarball:
    ```
-   0.1.0
+   0.4.0
    commit: cf6cf2a6ec167f95a1feb587f9c70684e3e2b1ec
    branch: yodaw/product-packaging
    platform: Darwin
@@ -48,7 +48,7 @@ Each release includes version metadata in two places:
 ### Reproducible Builds
 
 The build process aims for reproducibility by:
-- Using a fixed version number (0.1.0) that should be updated manually for releases
+- Using a fixed version number (0.4.0) that should be updated manually for releases
 - Including the exact commit SHA used for the build
 - Recording build platform and timestamp
 - Excluding non-essential files that vary between development environments
@@ -56,9 +56,9 @@ The build process aims for reproducibility by:
 ### Manual Version Updates
 
 To prepare a new release:
-1. Update the version in `scripts/bootstrap.py` (search for `__version__ = "0.1.0"`)
+1. Update the version constant (`__version__`) in `scripts/bootstrap.py`
 2. Commit the change
-3. Tag the commit: `git tag v0.1.0`
+3. Tag the commit: `git tag v0.4.0`
 4. Run the release build command
 5. Distribute the resulting tarball
 
@@ -68,7 +68,7 @@ To verify a release artifact:
 
 ```bash
 # Extract and check version
-tar -xzf yodaw-0.1.0.tar.gz
+tar -xzf yodaw-0.4.0.tar.gz
 cat yodaw-0.1.0/yodaw/version.py
 
 # Or check the separate VERSION file

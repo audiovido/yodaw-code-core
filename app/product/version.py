@@ -118,7 +118,7 @@ def describe(source_dir: Optional[Path] = None) -> Dict[str, Any]:
     # Add runtime information
     version_info.update(
         {
-            "product_version": version_info.get("__version__", "0.1.0"),
+            "product_version": version_info.get("__version__", "0.4.0"),
             "runtime_platform": platform.system(),
             "runtime_platform_release": platform.release(),
             "runtime_platform_version": platform.version(),

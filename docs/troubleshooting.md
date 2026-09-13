@@ -13,7 +13,7 @@
 ### Installation Issues
 
 **Issue**: Bootstrap script fails during dependency installation
-**Solution**: 
+**Solution**:
 1. Check your internet connection
 2. Ensure you have pip installed: `python3.12 -m ensurepip --upgrade`
 3. Try with `--skip-deps` and install manually: `pip install -r requirements.txt`
@@ -95,13 +95,13 @@
 ### macOS Specific Issues
 
 **Issue**: "Operation not permitted" errors
-**Solution**: 
+**Solution**:
 1. Check if you're trying to install to a protected directory
 2. Use a user-writable location like `~/.yodaw` or `/tmp/yodaw-install`
 3. Avoid system directories like `/usr/local` without proper permissions
 
 **Issue**: Python framework not found
-**Solution**: 
+**Solution**:
 1. Ensure you installed the official Python 3.12 from python.org
 2. Or use Homebrew: `brew install python@3.12`
 3. The system Python on macOS is often too old
