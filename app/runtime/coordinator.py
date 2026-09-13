@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.models import Mission, MissionStatus, TERMINAL_STATUSES
+from app.storage.db import connect
 from app.storage.sqlite_store import (
     InvalidStateError,
     MissionStore,
@@ -776,7 +777,7 @@ class Coordinator:
     def _block_dependent_missions(self, failed_mission_id: str):
         """Block missions that depend on the failed mission."""
         print(f"DEBUG: _block_dependent_missions called for failed_mission_id={failed_mission_id}")
-        with connect(self.path) as db:
+        with connect(self.store.path) as db:
             # Find missions that have this mission as a dependency
             # We need to scan all missions and check their metadata for dependencies
             cursor = db.execute(
@@ -825,7 +826,7 @@ class Coordinator:
                             ),
                         )
                         # Record the blocking event
-                        self.record_event(
+                        self.store.record_event(
                             mission_id,
                             "mission.blocked",
                             attempt=mission.attempt,

@@ -4,17 +4,21 @@ import os
 import time
 from typing import Optional
 
-from app.workers.base import WorkerResult
+from app.workers.base import Worker, WorkerResult
 from app.workers.repo_code_worker import CancelContext, RepoCodeWorker
 
-class CodeWorker:
+class CodeWorker(Worker):
     """Deterministic local worker for the 'code' capability."""
 
+    name = "code-bud"
     capabilities = {"code"}
 
     def execute(self, goal: str, metadata: Optional[dict] = None) -> dict:
         # Small delay to allow cancellation to be processed if requested immediately
         time.sleep(0.1)
+        # Handle None metadata
+        if metadata is None:
+            metadata = {}
         # Check for cancellation if we have the necessary metadata
         if metadata and "mission_id" in metadata and "_event_store" in metadata:
             try:
@@ -57,3 +61,10 @@ class CodeWorker:
                 error=None,
                 retryable=False,
             )
+
+    def health(self):
+        return {
+            "name": self.name,
+            "status": "READY",
+            "capabilities": sorted(self.capabilities),
+        }
