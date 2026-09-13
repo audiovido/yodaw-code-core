@@ -9,14 +9,19 @@ class RepoCache:
     """Simple mtime+size keyed cache with explicit invalidation."""
 
     def __init__(self) -> None:
-        self._store: dict[Hashable, tuple[tuple[float, int], Any]] = {}
+        self._store: dict[Hashable, tuple[tuple[tuple[str, ...], float, int], Any]] = {}
 
     def _key(self, root: Union[str, os.PathLike], name: str) -> tuple[str, str]:
         """Build a cache key from root and entry name."""
         return (str(Path(root)), name)
 
-    def fingerprint(self, root: Union[str, os.PathLike], paths: list[str]) -> tuple[float, int]:
-        """Combine max mtime and total size over the given relative paths."""
+    def fingerprint(self, root: Union[str, os.PathLike], paths: list[str]) -> tuple[tuple[str, ...], float, int]:
+        """Combine sorted path set, max mtime, and total size over the given relative paths.
+
+        The path set is part of the fingerprint so two entries never
+        alias just because their files share identical mtimes and
+        sizes (and so an empty path set invalidates on file changes).
+        """
         base = Path(root)
         max_mtime = 0.0
         total_size = 0
@@ -27,7 +32,7 @@ class RepoCache:
                 total_size += stat.st_size
             except OSError:
                 max_mtime = max(max_mtime, -1.0)
-        return (max_mtime, total_size)
+        return (tuple(sorted(paths)), max_mtime, total_size)
 
     def get(self, root: Union[str, os.PathLike], name: str, paths: list[str]) -> Union[Any, None]:
         """Return cached value if the fingerprint still matches, else None."""
