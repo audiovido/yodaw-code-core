@@ -69,7 +69,7 @@ File locations (first match wins):
 
 ```toml
 [llm]
-provider = "auto"   # auto | ollama | openai | anthropic
+provider = "auto"   # auto | ollama | openai | anthropic | 9router
 mode     = "auto"   # auto | local | remote
 model    = "auto"   # model id, or "auto" for the provider default
 # base_url = "..."            # override the provider endpoint
@@ -89,6 +89,24 @@ Environment variables always win over the file (`YODAW_LLM_PROVIDER`,
 `YODAW_HOST`, `YODAW_PORT`, `YODAW_LOG_LEVEL`). Keys live in
 environment variables only — the file names the variable, and neither
 the file nor logs ever contain the secret.
+
+### 9Router (native)
+
+9Router is a local AI router (40+ backend providers behind one
+OpenAI-compatible endpoint). Zero-touch setup — no manual env exports
+for provider/model/endpoint:
+
+```bash
+npm install -g 9router
+9router                                    # dashboard: http://127.0.0.1:20128
+export NINEROUTER_API_KEY='<dashboard key>'
+yodaw setup-9router                        # probe, detect model, persist, verify
+yodaw models                               # combos + models + default
+```
+
+Details, fallback chains, SQLite repair, and the human acceptance
+checklist: `docs/ninerouter_acceptance.md`. Automated evidence:
+`python scripts/ninerouter_e2e.py all`.
 
 ## Quick Health Check
 

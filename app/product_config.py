@@ -35,7 +35,7 @@ except ModuleNotFoundError:  # pragma: no cover - 3.9 fallback
 
 REDACTED = "[REDACTED]"
 
-PROVIDERS = ("auto", "ollama", "openai", "anthropic")
+PROVIDERS = ("auto", "ollama", "openai", "anthropic", "9router")
 MODES = ("auto", "local", "remote")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
@@ -43,18 +43,23 @@ MODEL_DEFAULTS = {
     "ollama": "qwen2.5-coder:7b",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-20250514",
+    # "auto" for 9Router means: detect at runtime via GET
+    # /v1/models (combos preferred). It is a valid persisted value.
+    "9router": "auto",
 }
 
 BASE_URL_DEFAULTS = {
     "ollama": "http://127.0.0.1:11434",
     "openai": "https://api.openai.com",
     "anthropic": "https://api.anthropic.com",
+    "9router": "http://127.0.0.1:20128",
 }
 
 API_KEY_ENV_DEFAULTS = {
     "ollama": "",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "9router": "NINEROUTER_API_KEY",
 }
 
 # Environment variables this layer reads (legacy and new).
@@ -312,7 +317,7 @@ def load_product_config(path: Optional[str] = None) -> ProductConfig:
         or os.environ.get(api_key_env)
         or ""
     )
-    needs_key = provider in ("openai", "anthropic") and not _is_loopback(base_url)
+    needs_key = provider in ("openai", "anthropic", "9router") and not _is_loopback(base_url)
     if needs_key and not api_key:
         raise ConfigError(
             f"{where} selects provider {provider!r}, which requires "
@@ -350,7 +355,7 @@ def load_product_config(path: Optional[str] = None) -> ProductConfig:
     warnings: list[str] = []
     if (
         mode == "local"
-        and provider in ("openai", "anthropic")
+        and provider in ("openai", "anthropic", "9router")
         and not _is_loopback(base_url)
     ):
         warnings.append(
@@ -361,6 +366,13 @@ def load_product_config(path: Optional[str] = None) -> ProductConfig:
         warnings.append(
             f"local endpoint {base_url!r} has no API key; local "
             "servers usually do not require one"
+        )
+    if provider == "9router" and not api_key:
+        warnings.append(
+            "9Router usually requires its dashboard API key even on "
+            "localhost; copy it from "
+            f"{base_url.rstrip('/')}/dashboard into the "
+            f"{api_key_env or 'NINEROUTER_API_KEY'} environment variable"
         )
 
     return ProductConfig(
@@ -454,13 +466,16 @@ _TEMPLATE = """\
 # variable that holds the key.
 
 [llm]
-# provider: ollama | openai | anthropic | auto
+# provider: ollama | openai | anthropic | 9router | auto
+# 9router = local 9Router daemon (http://127.0.0.1:20128); run
+# `yodaw setup-9router` for zero-touch provisioning.
 provider = "auto"
 
 # mode: local (machine-local endpoint) | remote (hosted API) | auto
 mode = "auto"
 
 # model: model identifier, or "auto" for the provider default
+# (for 9router, "auto" detects combos/models from GET /v1/models)
 model = "auto"
 
 # base_url: override the provider endpoint (optional)
@@ -468,6 +483,7 @@ model = "auto"
 
 # api_key_env: environment variable holding the key (not the key)
 # api_key_env = "OPENAI_API_KEY"
+# 9router default: NINEROUTER_API_KEY (copy from the dashboard)
 
 [server]
 profile = "local"
@@ -511,6 +527,110 @@ def _same_file(target: str) -> bool:
             return handle.read().startswith("# YODAW configuration")
     except OSError:
         return False
+
+
+# ------------------------------------------------------------
+# Persistent LLM updates (zero-touch provisioning)
+# ------------------------------------------------------------
+
+_LLM_KEYS = ("provider", "mode", "model", "base_url", "api_key_env")
+_KNOWN_SECTIONS = ("llm", "server", "logging")
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def _dump_toml(data: dict) -> str:
+    """Serialize our small config schema back to TOML.
+
+    Only string/int/bool scalars in tables are supported, which is
+    exactly what this schema uses. Known sections keep a stable
+    order; anything else is preserved verbatim after them.
+    """
+    lines = ["# YODAW configuration", ""]
+    seen: set[str] = set()
+    for section in (*_KNOWN_SECTIONS, *sorted(data)):
+        if section in seen:
+            continue
+        seen.add(section)
+        table = data.get(section)
+        if not isinstance(table, dict):
+            continue
+        if section == "llm":
+            keys = [k for k in _LLM_KEYS if k in table]
+            keys += sorted(k for k in table if k not in _LLM_KEYS)
+        else:
+            keys = sorted(table)
+        if not keys and section not in _KNOWN_SECTIONS:
+            continue
+        lines.append(f"[{section}]")
+        for key in keys:
+            lines.append(f"{key} = {_toml_value(table[key])}")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def write_llm_config(
+    path: Optional[str] = None,
+    *,
+    provider: Optional[str] = None,
+    mode: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key_env: Optional[str] = None,
+) -> str:
+    """Persist [llm] keys into the config file (create or update).
+
+    Missing files are created from the default template first, so
+    provisioning never requires manual file editing or env exports
+    for provider/model/endpoint selection. Secrets are never written:
+    only the ``api_key_env`` variable *name* is stored. Other
+    sections are preserved. Returns the path written.
+    """
+    updates = {
+        "provider": provider,
+        "mode": mode,
+        "model": model,
+        "base_url": base_url,
+        "api_key_env": api_key_env,
+    }
+    updates = {k: v for k, v in updates.items() if v is not None}
+
+    if provider is not None and provider not in PROVIDERS:
+        raise ConfigError(
+            f"invalid provider {provider!r}; expected one of: "
+            f"{', '.join(PROVIDERS)}"
+        )
+    if mode is not None and mode not in MODES:
+        raise ConfigError(
+            f"invalid mode {mode!r}; expected one of: {', '.join(MODES)}"
+        )
+
+    target = path or config_file_candidates()[0]
+    if not os.path.isfile(target):
+        write_default_config(target, force=True)
+
+    data = _load_toml(target)
+    llm = dict(data.get("llm") or {})
+    llm.update(updates)
+    data["llm"] = llm
+
+    directory = os.path.dirname(target) or "."
+    os.makedirs(directory, exist_ok=True)
+    with open(target, "w") as handle:
+        handle.write(_dump_toml(data))
+
+    # Fail fast on our own write: the file must load cleanly.
+    load_product_config(target)
+    return target
 
 
 # ------------------------------------------------------------
