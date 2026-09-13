@@ -581,7 +581,6 @@ class RepoCodeWorker(Worker):
     def execute(self, goal: str, metadata: Optional[dict] = None) -> WorkerResult:
         metadata = metadata or {}
         evidence = []
-        evidence.append({"type": "debug", "message": "WORKER EXECUTE STARTED", "goal": goal})
 
         repo_path = (
             metadata.get("repo_path")
@@ -650,27 +649,6 @@ class RepoCodeWorker(Worker):
                         "replace": replace_text,
                     }
                 ]
-
-        # If we still don't have explicit_edits, try to deduce from the goal for simple file modification.
-        if explicit_edits is None and goal.startswith("Modify ") and " to say " in goal:
-            parts = goal.split(" to say ", 1)
-            if len(parts) == 2:
-                file_part = parts[0][len("Modify "):].strip()
-                new_content = parts[1].strip()
-                repo_path = metadata.get("repo_path")
-                if repo_path and os.path.exists(repo_path):
-                    file_path = os.path.join(repo_path, file_part)
-                    if os.path.exists(file_path):
-                        try:
-                            with open(file_path, 'r') as f:
-                                original_content = f.read()
-                            explicit_edits = [{
-                                "target_file": file_part,
-                                "find": original_content,
-                                "replace": new_content,
-                            }]
-                        except Exception:
-                            pass
 
         is_llm_mission = explicit_edits is None
 

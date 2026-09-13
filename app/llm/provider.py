@@ -146,6 +146,25 @@ def _normalize_base_url(url: str) -> str:
     return re.sub(r"/v1$", "", url.rstrip("/"))
 
 
+MODEL_DEFAULTS = {
+    "ollama": "qwen2.5-coder:7b",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-20250514",
+}
+
+BASE_URL_DEFAULTS = {
+    "ollama": "http://127.0.0.1:11434",
+    "openai": "https://api.openai.com",
+    "anthropic": "https://api.anthropic.com",
+}
+
+API_KEY_ENV_DEFAULTS = {
+    "ollama": "",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+
+
 class LocalLLMProvider:
     """
     Generic local LLM adapter.
@@ -163,32 +182,43 @@ class LocalLLMProvider:
     """
 
     def __init__(self):
-        self.style = os.environ.get(
-            "YODAW_LLM_STYLE",
-            "ollama",
+        try:
+            from app.product_config import apply_product_config
+
+            apply_product_config()
+        except Exception:
+            pass
+
+        self.style = (
+            os.environ.get("YODAW_LLM_STYLE")
+            or os.environ.get("YODAW_LLM_PROVIDER")
+            or "ollama"
         ).lower()
 
+        default_base = BASE_URL_DEFAULTS.get(
+            self.style, "http://127.0.0.1:11434"
+        )
         self.base_url = _normalize_base_url(
             os.environ.get(
                 "YODAW_LLM_BASE_URL",
-                "http://127.0.0.1:11434",
+                default_base,
             )
         )
 
-        self.model = os.environ.get(
-            "YODAW_LLM_MODEL",
-            "",
-        )
+        model = os.environ.get("YODAW_LLM_MODEL", "").strip()
+        if not model or model == "auto":
+            model = MODEL_DEFAULTS.get(self.style, "qwen2.5-coder:7b")
+        self.model = model
 
-        self.api_key = os.environ.get(
-            "YODAW_LLM_API_KEY",
-            "",
+        api_key_env = (
+            os.environ.get("YODAW_LLM_API_KEY_ENV")
+            or API_KEY_ENV_DEFAULTS.get(self.style, "")
         )
-
-        if not self.model:
-            raise LLMError(
-                "YODAW_LLM_MODEL is not configured"
-            )
+        self.api_key = (
+            os.environ.get("YODAW_LLM_API_KEY")
+            or (os.environ.get(api_key_env) if api_key_env else "")
+            or ""
+        )
 
     def health(self):
         return {
@@ -275,11 +305,6 @@ class LocalLLMProvider:
                 time.sleep(delay)
 
     def _ollama(self, system: str, user: str) -> str:
-        print(f"!!! PROVIDER _OLLAMA CALLED: model={self.model!r}", flush=True)
-        if self.model == "test":
-            # Return a non-JSON string to cause an error if LLM is used, so we can see if deduction worked.
-            print("!!! PROVIDER returning non-JSON for test model", flush=True)
-            return 'not a json'
         payload = {
             "model": self.model,
             "stream": False,

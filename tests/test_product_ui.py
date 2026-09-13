@@ -253,13 +253,19 @@ def test_real_acceptance_flow_submit_to_evidence():
         git("commit", "-m", "baseline with failing test")
 
         # Submit deterministic repair mission
-        goal = "Modify calc.py to say def add(a, b):\n    return a + b\n"
+        goal = "Fix failing calculator test"
         resp = client.post(
             "/api/v1/missions",
             json={
                 "goal": goal,
                 "capability": "repo-code",
                 "repo_path": str(repo),
+                "metadata": {
+                    "repo_path": str(repo),
+                    "target_file": "calc.py",
+                    "find": "return a - b",
+                    "replace": "return a + b",
+                },
             },
         )
         assert resp.status_code == 200
