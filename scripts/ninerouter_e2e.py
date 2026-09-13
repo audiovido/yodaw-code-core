@@ -224,6 +224,14 @@ def _make_repo(root: Path) -> Path:
     repo = root / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     (repo / "app.py").write_text("def greet():\n    return 'hi'\n")
+    # A real test pins the acceptance criterion: PASS requires the
+    # model to produce the exact expected content, not just any edit.
+    (repo / "test_app.py").write_text(
+        "from app import greet\n\n"
+        "def test_greet():\n"
+        "    assert greet() == 'hello'\n"
+    )
+    (repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
     subprocess.run(
         ["git", "init", "-q"],
         cwd=repo,
@@ -288,6 +296,7 @@ def cmd_mission(args):
         os.environ["YODAW_LLM_STYLE"] = "9router"
         os.environ["YODAW_LLM_BASE_URL"] = base
         os.environ["YODAW_LLM_MODEL"] = model
+        os.environ["YODAW_ENABLE_GITHUB"] = "false"
         if key:
             os.environ["YODAW_LLM_API_KEY"] = key
 
@@ -364,6 +373,7 @@ def cmd_fallback(args):
             "YODAW_LLM_BASE_URL",
             "YODAW_LLM_MODEL",
             "YODAW_LLM_FALLBACKS",
+            "YODAW_LLM_FALLBACK_MODELS",
             "YODAW_PROVIDER_MAX_RETRIES",
             "YODAW_PROVIDER_BACKOFF_SECONDS",
             "YODAW_LLM_TIMEOUT_SECONDS",

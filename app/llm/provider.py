@@ -215,6 +215,28 @@ def fallback_styles() -> list[str]:
     return ordered
 
 
+def fallback_models() -> list[str]:
+    """Ordered fallback models from YODAW_LLM_FALLBACK_MODELS.
+
+    Comma-separated model/route ids (for the 9router style these
+    are ``provider/model`` routes, e.g.
+    ``ollama-local/qwen3:0.6b``). Empty entries are dropped and
+    duplicates collapse to first occurrence; the primary model
+    itself is skipped when the chain is built so listing it here
+    is harmless.
+    """
+    raw = os.environ.get("YODAW_LLM_FALLBACK_MODELS", "")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
 class LocalLLMProvider:
     """
     Generic local LLM adapter.
@@ -231,6 +253,9 @@ class LocalLLMProvider:
       YODAW_LLM_MODEL=<model-name>
       YODAW_LLM_API_KEY=<optional>
       YODAW_LLM_FALLBACKS=<comma-separated styles, optional>
+      YODAW_LLM_FALLBACK_MODELS=<comma-separated 9router
+        routes, optional; each retryable failure fails over to
+        the next route instead of hammering one dead route>
 
     Explicit constructor arguments override the environment (used by
     the fallback chain to build sibling providers with per-style
@@ -385,25 +410,51 @@ class LocalLLMProvider:
         url: str,
         payload: dict,
         headers: Optional[dict] = None,
+        payloads: Optional[list[dict]] = None,
     ) -> dict:
         """
         Stage 8.6: bounded retries with exponential backoff and
         jitter for transient provider faults. Every attempt is
         logged for evidence; classification decides retryability.
+
+        Failover: when ``payloads`` (a per-attempt model chain)
+        is given, attempt N uses
+        ``payloads[min(N - 1, len(payloads) - 1)]`` so each
+        retryable failure fails over to the next route instead
+        of hammering one dead route. Without ``payloads`` every
+        attempt posts ``payload`` (legacy behavior).
         """
         max_retries, base_backoff = provider_retry_config()
+        sequence = payloads if payloads else [payload]
 
         attempt = 0
+        previous_model: Optional[str] = None
 
         while True:
             attempt += 1
             started = time.monotonic()
+            used = sequence[min(attempt - 1, len(sequence) - 1)]
+            model = (
+                used.get("model") if isinstance(used, dict) else None
+            )
             record = {"provider_attempt": attempt, "url": url}
+            if model:
+                record["model"] = model
+            if previous_model and model and model != previous_model:
+                _log_attempt(
+                    {
+                        "provider_model_fallback": True,
+                        "from": previous_model,
+                        "to": model,
+                        "attempt": attempt,
+                    }
+                )
+            previous_model = model or previous_model
 
             try:
                 response = httpx.post(
                     url,
-                    json=payload,
+                    json=used,
                     headers=headers,
                     timeout=llm_timeout_seconds(),
                 )
@@ -522,11 +573,23 @@ class LocalLLMProvider:
             except ninerouter.NinerouterError as exc:
                 raise LLMError(str(exc)) from exc
 
+        # Route failover chain: the primary model first, then each
+        # YODAW_LLM_FALLBACK_MODELS route once. A route that times
+        # out or 5xx-fails is abandoned for the next route on the
+        # following attempt instead of being retried blindly.
+        chain = [model]
+        for name in fallback_models():
+            if name != model and name not in chain:
+                chain.append(name)
+
         url, payload, headers = ninerouter.build_chat_request(
             self.base_url, model, system, user, self.api_key
         )
+        payloads = [dict(payload, model=name) for name in chain]
 
-        data = self._chat_with_retry(url, payload, headers=headers)
+        data = self._chat_with_retry(
+            url, payload, headers=headers, payloads=payloads
+        )
 
         try:
             return ninerouter.parse_chat_response(data)

@@ -284,13 +284,32 @@ def build_failure_context(
     test_results: list,
     diff_text: str,
     touched_files: list,
+    prepare_error: Optional[dict] = None,
 ) -> dict:
-    return {
+    context = {
         "attempt": attempt,
         "tests": test_results,
         "diff": diff_text,
         "touched_files": touched_files,
     }
+
+    if prepare_error is not None:
+        context["prepare_error"] = prepare_error
+
+    return context
+
+
+# Prepare-time failures that mean the PLAN is wrong (bad text or
+# bad path reference), so an LLM mission may spend retry budget on
+# a corrective plan. Containment/shape violations (path escape,
+# malformed plan) always fail closed with no LLM retry.
+REPAIRABLE_PREPARE_ERRORS = frozenset(
+    {
+        "FindTextMissing",
+        "TargetNotFound",
+        "TargetNotFile",
+    }
+)
 
 
 def collect_learning_lessons(
@@ -838,6 +857,7 @@ class RepoCodeWorker(Worker):
             attempt = 0
             previous_plan = None
             repair_error = None
+            failure_prepare_error = None
 
             while True:
                 if attempt > 0:
@@ -1041,6 +1061,7 @@ class RepoCodeWorker(Worker):
                                 test_results=failure_test_results,
                                 diff_text=failure_diff_text,
                                 touched_files=failure_touched_files,
+                                prepare_error=failure_prepare_error,
                             ),
                             lessons=lessons,
                         )
@@ -1138,6 +1159,71 @@ class RepoCodeWorker(Worker):
                 )
 
                 if prepare_error is not None:
+                    prepare_type = (
+                        prepare_error.get("error") or {}
+                    ).get("type", "")
+
+                    if (
+                        is_llm_mission
+                        and prepare_type in REPAIRABLE_PREPARE_ERRORS
+                    ):
+                        if retries < max_retries:
+                            # The plan references wrong text or a
+                            # wrong path: nothing was written, so
+                            # feed the application failure back to
+                            # the Coder Brain as a corrective
+                            # attempt instead of failing the
+                            # mission on a near-miss plan.
+                            evidence.append(
+                                {
+                                    "type": "prepare_failure",
+                                    "attempt": attempt,
+                                    "retry": retries,
+                                    "error": prepare_error.get(
+                                        "error"
+                                    ),
+                                    "output": prepare_error.get(
+                                        "output"
+                                    ),
+                                    "timestamp": now_iso(),
+                                }
+                            )
+
+                            failure_test_results = []
+                            failure_diff_text = ""
+                            failure_touched_files = [
+                                edit.get("target_file")
+                                for edit in edits
+                                if isinstance(edit, dict)
+                                and edit.get("target_file")
+                            ]
+                            failure_prepare_error = {
+                                "error": prepare_error.get("error"),
+                                "output": prepare_error.get(
+                                    "output"
+                                ),
+                            }
+
+                            retries += 1
+                            attempt += 1
+
+                            continue
+
+                        repair_error = {
+                            "type": "RetryExhausted",
+                            "message": (
+                                "Plan could not be applied and "
+                                "retry budget is exhausted"
+                            ),
+                            "attempt": attempt,
+                            "retry": retries,
+                            "prepare_error": prepare_error.get(
+                                "error"
+                            ),
+                        }
+
+                        break
+
                     cleanup_worktree(
                         worktree,
                         repo,
@@ -1256,6 +1342,7 @@ class RepoCodeWorker(Worker):
                 failure_test_results = test_results
                 failure_diff_text = diff_result["stdout"]
                 failure_touched_files = touched_files
+                failure_prepare_error = None
 
                 restore_originals(
                     worktree,

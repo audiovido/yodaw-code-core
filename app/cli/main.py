@@ -380,8 +380,9 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
     models = probe.get("models", [])
     combos = probe.get("combos", [])
     detected = probe.get("default_model")
+    requested = getattr(args, "model", None)
 
-    if detected is None:
+    if detected is None and not (requested and requested.strip() != "auto"):
         message = probe.get(
             "warning",
             "9Router reports no models and no combos.",
@@ -396,8 +397,18 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
             print(f"setup-9router: {message}", file=sys.stderr)
         return EXIT_TASK_FAILURE
 
-    requested = getattr(args, "model", None)
-    model = detected if not requested else requested.strip()
+    if detected is None:
+        # Empty inventory with an explicit --model pin: some 9Router
+        # versions omit connected providers (e.g. ollama-local) from
+        # /v1/models. Trust the pin; verification still proves it.
+        print(
+            "warning: 9Router inventory is empty; trusting --model "
+            "pin (verification will prove it)",
+            file=sys.stderr,
+        )
+        model = requested.strip()
+    else:
+        model = detected if not requested else requested.strip()
     if model and model != "auto":
         known = set(models) | set(combos)
         if model not in known:

@@ -762,6 +762,48 @@ def test_setup_9router_json_and_verify(tmp_path, monkeypatch, capsys):
     assert payload["verified"] is True
 
 
+def test_setup_9router_empty_inventory_with_pin(tmp_path, monkeypatch, capsys):
+    from app.cli.main import main as cli_main
+
+    def fake_detect(base_url, api_key, timeout=10.0):
+        return {
+            "cli": "/usr/local/bin/9router",
+            "cli_installed": True,
+            "reachable": True,
+            "api_key_set": True,
+            "base_url": "http://127.0.0.1:20128",
+            "probe": {
+                "ok": True,
+                "models": [],
+                "combos": [],
+                "default_model": None,
+                "warning": "9Router reports no models and no combos.",
+                "base_url": "http://127.0.0.1:20128",
+            },
+        }
+
+    monkeypatch.setattr(
+        ninerouter_module, "detect_install", fake_detect
+    )
+    target = str(tmp_path / "config.toml")
+    # No pin -> honest failure.
+    assert cli_main(["setup-9router", "--path", target, "--no-verify"]) == 1
+    capsys.readouterr()
+    # Explicit pin bypasses the empty inventory (ollama-local quirk).
+    assert (
+        cli_main(
+            [
+                "setup-9router", "--path", target, "--no-verify",
+                "--model", "ollama-local/qwen2.5-coder:0.5b",
+            ]
+        )
+        == 0
+    )
+    cfg = load_product_config(target)
+    assert cfg.model == "ollama-local/qwen2.5-coder:0.5b"
+    capsys.readouterr()
+
+
 def test_setup_9router_unreachable(monkeypatch, capsys):
     from app.cli.main import main as cli_main
 

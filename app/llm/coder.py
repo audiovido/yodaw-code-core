@@ -394,6 +394,32 @@ def generate_repair_plan(
     context = build_repo_context(worktree)
     lessons = lessons or build_lessons_context(goal)
 
+    prepare_error = failure_context.get("prepare_error")
+
+    if prepare_error:
+        prepare_block = f"""
+EDIT APPLICATION FAILURE (no tests ran — the plan could not be
+applied to the files above):
+
+{json.dumps(prepare_error, indent=2)}
+"""
+        closing = (
+            "The previous plan could not even be applied. Diagnose "
+            "the application failure from the error above, match "
+            "file text EXACTLY (whitespace and newlines included) "
+            "using the repository content, then return the smallest "
+            "safe JSON corrective plan.\n\n"
+            "Do NOT repeat the same broken plan."
+        )
+    else:
+        prepare_block = ""
+        closing = (
+            "The previous attempt failed validation. Diagnose the "
+            "failure from the test output and the diff, then return "
+            "the smallest safe JSON corrective plan.\n\n"
+            "Do NOT repeat the same broken plan."
+        )
+
     user_prompt = f"""
 CODING GOAL:
 
@@ -410,16 +436,12 @@ FAILED TEST RESULTS:
 FAILED DIFF:
 
 {failure_context.get("diff", "")}
-
+{prepare_block}
 REPOSITORY CONTENT:
 
 {context}
 {lessons}
-The previous attempt failed validation. Diagnose the failure from
-the test output and the diff, then return the smallest safe JSON
-corrective plan.
-
-Do NOT repeat the same broken plan.
+{closing}
 """.strip()
 
     raw = provider.chat(

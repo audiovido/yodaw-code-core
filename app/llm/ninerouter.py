@@ -189,7 +189,10 @@ def pick_default_model(models: list[str], combos: list[str]) -> str:
     raise NinerouterError(
         "9Router reports no models and no combos. Connect a provider "
         "in the dashboard (Providers -> Connect Kiro AI or OpenCode "
-        "Free), then retry."
+        "Free), then retry. If a provider IS connected (e.g. "
+        "ollama-local, whose models some 9Router versions omit from "
+        "/v1/models), pin the model explicitly instead of auto: "
+        "`yodaw setup-9router --model <provider/model>`."
     )
 
 
