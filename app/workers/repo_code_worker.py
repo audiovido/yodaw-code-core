@@ -1,14 +1,26 @@
 import os
 import shutil
-import subprocess
-import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime, timezone
 from typing import Optional
 
 from app.runtime.repo_identity import RepoNotAllowed, ensure_authorized
 from app.workers.base import Worker, WorkerResult
-from app.workers.python_runtime import resolve_python_executable
+from app.workers import (
+    diff_guard,
+    edit_engine,
+    safe_subprocess,
+    validation,
+    worktree_guard,
+)
+from app.workers.mission_evidence import now_iso
+from app.workers.worker_errors import (
+    MissionCancelled,
+    MissionTimeout,
+    ToolMissingError,
+)
 from app.llm.coder import generate_edit_plan, generate_repair_plan
 from app.learning.retrieval import (
     format_lessons,
@@ -16,30 +28,41 @@ from app.learning.retrieval import (
 )
 from app.llm.provider import pop_attempt_log
 
-
-class MissionCancelled(Exception):
-    """Raised at cancellation checkpoints inside the worker."""
-
+# Edit engine is the single source of truth for every file mutation.
+read_text_preserve = edit_engine.read_text_preserve
+write_text_preserve = edit_engine.write_text_preserve
+find_relaxed_unique_match = edit_engine.find_relaxed_unique_match
+normalize_edits = edit_engine.normalize_edits
+prepare_edits = edit_engine.prepare_edits
+apply_edits = edit_engine.apply_edits
+restore_originals = edit_engine.restore_originals
 
 class CancelContext:
     """
-    Stage 8.4/8.8: cancellation and event context for one
+    Stage 8.4/8.8: cancellation, deadline, and event context for one
     executing mission.
 
     cancel_check() raises MissionCancelled when cancellation was
-    requested; the worker calls it at every checkpoint (before
-    LLM calls, before applying edits, before validation, between
-    repair attempts, before commit) so a cancelled mission never
-    commits and never keeps running.
+    requested and MissionTimeout when the mission deadline expired;
+    the worker calls it at every checkpoint (before LLM calls,
+    before applying edits, before validation, between repair
+    attempts, before commit) so a cancelled or timed-out mission
+    never commits and never keeps running.
 
     emit() persists structured mission events for observability;
     it must never break mission execution.
     """
 
-    def __init__(self, mission_id: Optional[str], store=None):
+    def __init__(self, mission_id: Optional[str], store=None, timeout_seconds=None):
         self.mission_id = mission_id
         self.store = store
         self.cancel_requested = False
+        self.deadline = None
+        if timeout_seconds:
+            try:
+                self.deadline = time.monotonic() + float(timeout_seconds)
+            except (TypeError, ValueError):
+                self.deadline = None
         if mission_id and store is not None:
             try:
                 existing = store.get(mission_id)
@@ -80,6 +103,12 @@ class CancelContext:
     def cancel_check(self, at: str = ""):
         self.refresh()
 
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise MissionTimeout(
+                "mission exceeded its deadline at %s"
+                % (at or "checkpoint")
+            )
+
         if self.cancel_requested:
             raise MissionCancelled(at or "checkpoint")
 
@@ -99,6 +128,35 @@ class CancelContext:
             pass
 
 
+class _MissionRuntime:
+    """Minimal per-mission runtime bound to the calling thread.
+
+    Kept thread-local so the long-lived worker functions (`run`,
+    `run_validation`) pick up the mission's deadline and
+    cancellation without changing their legacy signatures, which
+    existing tests and monkeypatch seams depend on.
+    """
+
+    __slots__ = ("cancel_check", "deadline")
+
+    def __init__(self, cancel_check, deadline):
+        self.cancel_check = cancel_check
+        self.deadline = deadline
+
+
+_local = threading.local()
+
+
+@contextmanager
+def _mission_runtime(ctx: CancelContext):
+    previous = getattr(_local, "runtime", None)
+    _local.runtime = _MissionRuntime(ctx.cancel_check, ctx.deadline)
+    try:
+        yield
+    finally:
+        _local.runtime = previous
+
+
 def provider_attempt_evidence() -> list[dict]:
     """Stage 8.6: surface provider attempts as evidence."""
     attempts = pop_attempt_log()
@@ -115,337 +173,71 @@ def provider_attempt_evidence() -> list[dict]:
     ]
 
 
-class ToolMissingError(RuntimeError):
-    """A validation tool is not available in the environment."""
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
 def which(tool: str):
     return shutil.which(tool)
 
 
-def read_text_preserve(path: Path) -> str:
-    """Read file text without newline translation so CRLF files
-    keep their exact line endings in memory."""
-    with path.open("r", newline="") as handle:
-        return handle.read()
+DEFAULT_COMMAND_TIMEOUT = 300
 
 
-def write_text_preserve(path: Path, text: str) -> None:
-    """Write file text without newline translation so untouched
-    regions keep their original line endings byte-for-byte."""
-    with path.open("w", newline="") as handle:
-        handle.write(text)
+def run(cmd, cwd=None, timeout=DEFAULT_COMMAND_TIMEOUT, env=None):
+    """Run one command as one bounded, cancellable unit.
 
+    Inside a mission (thread-local runtime bound) the mission's
+    deadline and cancellation apply to the whole process group:
+    timeout or cancellation kills the tree before any exception
+    propagates, and a deadline-expiring run raises MissionTimeout so
+    no commit path can ever observe a timed-out result as success.
+    Outside a mission this is a plain bounded subprocess run with
+    the same result shape.
 
-def run(cmd, cwd=None, timeout=300):
-    proc = subprocess.run(
+    The signature (cmd, cwd, timeout) is a legacy test seam;
+    monkeypatched runners in the suite depend on it.
+    """
+    runtime = getattr(_local, "runtime", None)
+
+    if runtime is None:
+        return safe_subprocess.run(cmd, cwd=cwd, timeout=timeout, env=env)
+
+    effective = timeout
+    deadline_bound = False
+
+    if runtime.deadline is not None:
+        remaining = runtime.deadline - time.monotonic()
+
+        if remaining <= 0:
+            raise MissionTimeout(
+                "mission deadline already exceeded before: %s" % cmd
+            )
+
+        if remaining < timeout:
+            effective = remaining
+            deadline_bound = True
+
+    result = safe_subprocess.run(
         cmd,
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
+        timeout=effective,
+        cancel_check=runtime.cancel_check,
+        env=env,
     )
 
-    return {
-        "cmd": " ".join(cmd),
-        "cwd": str(cwd) if cwd else None,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "returncode": proc.returncode,
-        "timestamp": now_iso(),
-    }
+    if result.get("timed_out") and deadline_bound:
+        raise MissionTimeout(
+            "mission exceeded its deadline during: %s"
+            % result.get("cmd", cmd)
+        )
 
-
-def find_relaxed_unique_match(original: str, needle: str):
-    """
-    Find a unique multiline match while ignoring leading/trailing
-    whitespace on each line. Returns the exact source slice so the
-    replacement still applies to real repository text.
-    """
-    needle_lines = needle.strip().splitlines()
-    if not needle_lines:
-        return None
-
-    original_lines = original.splitlines(keepends=True)
-    normalized_needle = [line.strip() for line in needle_lines]
-
-    matches = []
-
-    for start in range(len(original_lines)):
-        end = start + len(normalized_needle)
-
-        if end > len(original_lines):
-            break
-
-        candidate = original_lines[start:end]
-
-        if [line.strip() for line in candidate] == normalized_needle:
-            matches.append("".join(candidate))
-
-    if len(matches) == 1:
-        return matches[0]
-
-    return None
+    return result
 
 
 def detect_test_commands(worktree: Path):
-    commands = []
+    """Language-aware validation detection (validation module).
 
-    if (
-        (worktree / "pytest.ini").exists()
-        or (worktree / "tests").exists()
-        or (worktree / "pyproject.toml").exists()
-    ):
-        # Run under the interpreter that is executing YODAW itself
-        # instead of relying on a PATH lookup; this avoids confusing
-        # failures when 'python' is not on PATH while never
-        # hardcoding a user-specific environment path.
-        commands.append(
-            [
-                resolve_python_executable(),
-                "-B",
-                "-m",
-                "pytest",
-                "-q",
-                "-p",
-                "no:cacheprovider",
-            ]
-        )
-
-    if (worktree / "package.json").exists():
-        if not which("npm"):
-            raise ToolMissingError(
-                "npm executable not found on PATH; "
-                "cannot run JavaScript validation"
-            )
-
-        commands.append(["npm", "test", "--", "--runInBand"])
-
-    return commands
-
-
-def normalize_edits(plan: dict) -> Optional[list]:
+    Delegates with the worker's own `which` so the existing
+    monkeypatch seam on this module keeps working.
     """
-    Accept either the structured multi-edit plan or the legacy
-    Stage 6 single-edit shape and return an edits list, or None
-    when the plan carries no recognizable edit payload.
-    """
-    if not isinstance(plan, dict):
-        return None
-
-    edits = plan.get("edits")
-
-    if isinstance(edits, list):
-        return edits
-
-    legacy_target = plan.get("target_file")
-    legacy_find = plan.get("find")
-    legacy_replace = plan.get("replace")
-
-    if legacy_target and legacy_find is not None and legacy_replace is not None:
-        return [
-            {
-                "target_file": legacy_target,
-                "find": legacy_find,
-                "replace": legacy_replace,
-            }
-        ]
-
-    return None
-
-
-def prepare_edits(
-    worktree: Path,
-    edits: list,
-    evidence: list,
-):
-    """
-    Validate every edit and stage all resulting file contents in
-    memory. Nothing is written until every edit is known-valid.
-
-    Returns (original_contents, staged_contents, prepared_edits,
-    touched_files, error) where error is None on success.
-    """
-    staged_contents = {}
-    original_contents = {}
-    prepared_edits = []
-    touched_files = []
-
-    for index, edit in enumerate(edits):
-        if not isinstance(edit, dict):
-            return None, None, None, None, {
-                "output": {"edit_index": index},
-                "error": {
-                    "type": "InvalidEditPlan",
-                    "message": f"Edit {index} is not an object",
-                },
-            }
-
-        required = ("target_file", "find", "replace")
-        missing = [key for key in required if key not in edit]
-
-        if missing:
-            return None, None, None, None, {
-                "output": {"edit_index": index},
-                "error": {
-                    "type": "InvalidEditPlan",
-                    "message": f"Edit {index} missing fields: {missing}",
-                },
-            }
-
-        target_file = edit["target_file"]
-        find_text = edit["find"]
-        replace_text = edit["replace"]
-
-        target = (worktree / target_file).resolve()
-
-        if worktree.resolve() not in target.parents:
-            return None, None, None, None, {
-                "output": {
-                    "edit_index": index,
-                    "target_file": target_file,
-                },
-                "error": {
-                    "type": "PathEscapeError",
-                    "message": f"{target_file} escapes isolated worktree",
-                },
-            }
-
-        if not target.exists():
-            return None, None, None, None, {
-                "output": {
-                    "edit_index": index,
-                    "target_file": str(target),
-                },
-                "error": {
-                    "type": "TargetNotFound",
-                    "message": f"{target_file} does not exist",
-                },
-            }
-
-        if not target.is_file():
-            return None, None, None, None, {
-                "output": {
-                    "edit_index": index,
-                    "target_file": str(target),
-                },
-                "error": {
-                    "type": "TargetNotFile",
-                    "message": f"{target_file} is not a file",
-                },
-            }
-
-        if target_file not in original_contents:
-            original_contents[target_file] = read_text_preserve(target)
-
-        current = staged_contents.get(
-            target_file,
-            original_contents[target_file],
-        )
-
-        actual_find_text = find_text
-
-        if find_text not in current:
-            actual_find_text = find_relaxed_unique_match(
-                current,
-                find_text,
-            )
-
-            if actual_find_text is not None:
-                evidence.append(
-                    {
-                        "type": "relaxed_match",
-                        "file": target_file,
-                        "requested_find": find_text,
-                        "actual_find": actual_find_text,
-                        "edit_index": index,
-                        "timestamp": now_iso(),
-                    }
-                )
-
-        if actual_find_text is None or actual_find_text not in current:
-            return None, None, None, None, {
-                "output": {
-                    "edit_index": index,
-                    "target_file": target_file,
-                },
-                "error": {
-                    "type": "FindTextMissing",
-                    "message": (
-                        "Requested source text was not found "
-                        "as an exact or unique relaxed match"
-                    ),
-                },
-            }
-
-        modified = current.replace(
-            actual_find_text,
-            replace_text,
-            1,
-        )
-
-        staged_contents[target_file] = modified
-
-        if target_file not in touched_files:
-            touched_files.append(target_file)
-
-        prepared_edits.append(
-            {
-                "edit_index": index,
-                "target_file": target_file,
-                "find": find_text,
-                "actual_find": actual_find_text,
-                "replace": replace_text,
-            }
-        )
-
-    return (
-        original_contents,
-        staged_contents,
-        prepared_edits,
-        touched_files,
-        None,
-    )
-
-
-def apply_edits(worktree: Path, staged_contents: dict, touched_files: list):
-    """
-    Atomic apply: every edit is already known-valid, so every
-    touched file can now be written.
-    """
-    for target_file in touched_files:
-        target = (worktree / target_file).resolve()
-        write_text_preserve(target, staged_contents[target_file])
-
-
-def restore_originals(
-    worktree: Path,
-    original_contents: dict,
-    evidence: list,
-    retry: int,
-):
-    """
-    Revert ALL edits by restoring every touched file's original
-    text. Must always run after a failed validation so no
-    half-validated change is ever left behind.
-    """
-    for edited_file, original_text in original_contents.items():
-        edited_path = (worktree / edited_file).resolve()
-        write_text_preserve(edited_path, original_text)
-
-    evidence.append(
-        {
-            "type": "recovery",
-            "action": "revert_failed_edits",
-            "files": list(original_contents.keys()),
-            "retry": retry,
-            "timestamp": now_iso(),
-        }
-    )
+    return validation.detect_test_commands(worktree, tool_check=which)
 
 
 def run_validation(
@@ -456,6 +248,13 @@ def run_validation(
     """
     Run every detected test command once and return
     (passed, results).
+
+    - Each command runs bounded (1MB output cap) through `run`,
+      so the mission deadline and cancellation apply mid-command.
+    - A selected validation tool must exist; a missing executable
+      is an explicit ToolMissingError, never a silent skip.
+    - No test commands => not passed: an empty validation plan
+      must never produce a vacuous pass.
     """
     results = []
 
@@ -473,8 +272,9 @@ def run_validation(
         results.append(result)
 
     passed = all(
-        item["returncode"] == 0 for item in results
-    ) if results else True
+        item.get("returncode") == 0 and not item.get("timed_out")
+        for item in results
+    ) if results else False
 
     return passed, results
 
@@ -551,7 +351,7 @@ def cleanup_worktree(
     failed: bool,
 ):
     """
-    Safe worktree lifecycle cleanup.
+    Safe worktree lifecycle cleanup (worktree guard policy).
 
     Policy:
     - keep_worktree=True keeps the worktree for any outcome.
@@ -562,78 +362,209 @@ def cleanup_worktree(
     Cleanup failure must never hide the original mission result;
     it is recorded as worktree_cleanup_error evidence instead.
     """
-    if keep_worktree:
-        action = "kept_by_request"
-    elif failed:
-        action = "kept_failed_for_debugging"
-    else:
-        action = "removed"
-
-    evidence.append(
-        {
-            "type": "worktree_cleanup",
-            "action": action,
-            "worktree": str(worktree),
-            "timestamp": now_iso(),
-        }
+    worktree_guard.cleanup(
+        repo,
+        worktree,
+        keep=keep_worktree,
+        failed=failed,
+        run=run,
+        evidence=evidence,
     )
 
-    if action != "removed":
-        return
 
-    try:
-        remove_result = run(
-            ["git", "worktree", "remove", "--force", str(worktree)],
-            cwd=repo,
+def worktree_is_clean(worktree: Path) -> bool:
+    return worktree_guard.worktree_is_clean(worktree, run=run)
+
+
+# -------------------------------------------------------------
+# evidence_report: one consistent terminal report per outcome.
+# -------------------------------------------------------------
+
+EVENT_DIFF_LIMIT = 8 * 1024
+EVENT_COMMANDS_LIMIT = 200
+_EVENT_WARNINGS_LIMIT = 100
+
+_TEST_RUNNER_MARKERS = (
+    "pytest",
+    "npm test",
+    "go test",
+    "cargo test",
+    "mvn",
+    "gradle",
+    "dotnet",
+    "swift test",
+    "ctest",
+    "make test",
+    "bash -n",
+    "sh -n",
+    "sqlite3",
+)
+
+
+def _run_results(evidence: list) -> list:
+    return [
+        item
+        for item in evidence
+        if isinstance(item, dict)
+        and isinstance(item.get("returncode"), int)
+        and item.get("cmd")
+    ]
+
+
+def _validation_results(evidence: list) -> list:
+    seen = set()
+    results = []
+
+    for item in _run_results(evidence):
+        cmd = item.get("cmd")
+
+        if not any(marker in cmd for marker in _TEST_RUNNER_MARKERS):
+            continue
+
+        if cmd in seen:
+            continue
+
+        seen.add(cmd)
+        results.append(
+            {
+                "cmd": cmd,
+                "returncode": item.get("returncode"),
+                "timed_out": bool(item.get("timed_out")),
+                "cancelled": bool(item.get("cancelled")),
+                "interpretation": validation.interpret_result(item),
+            }
         )
-        evidence.append(remove_result)
 
-        if remove_result["returncode"] != 0:
-            evidence.append(
-                {
-                    "type": "worktree_cleanup_error",
-                    "worktree": str(worktree),
-                    "error": (
-                        "git worktree remove failed; "
-                        "used filesystem fallback"
-                    ),
-                    "timestamp": now_iso(),
-                }
-            )
+    return results
 
-            shutil.rmtree(worktree, ignore_errors=True)
 
-        prune_result = run(
-            ["git", "worktree", "prune"],
-            cwd=repo,
-        )
-        evidence.append(prune_result)
+def _diff_summary(evidence: list, output: dict) -> str:
+    text = output.get("diff")
 
-    except Exception as exc:
+    if not isinstance(text, str) or not text:
+        diffs = [
+            item.get("stdout", "")
+            for item in _run_results(evidence)
+            if "git diff" in item.get("cmd", "")
+        ]
+        text = diffs[-1] if diffs else ""
+
+    if len(text) > EVENT_DIFF_LIMIT:
+        text = text[:EVENT_DIFF_LIMIT] + "\n... (truncated)"
+
+    return text
+
+
+def _report_warnings(evidence: list) -> list:
+    warnings = []
+
+    for item in evidence:
+        if not isinstance(item, dict) or item.get("type") != "diff_scan":
+            continue
+        report = item.get("report") or {}
+
+        for warning in report.get("warnings", []) or []:
+            if warning not in warnings:
+                warnings.append(warning)
+
+    return warnings[:_EVENT_WARNINGS_LIMIT]
+
+
+def build_evidence_report(
+    evidence: list,
+    output: dict,
+    terminal: str,
+) -> dict:
+    """Deterministic report of exactly what this mission observed.
+
+    No value is invented: unknown fields stay null/empty and are
+    derived from real evidence or the worker output.
+    """
+    output = output or {}
+    commands = []
+
+    for item in _run_results(evidence):
+        cmd = item.get("cmd")
+
+        if cmd and cmd not in commands:
+            commands.append(cmd)
+
+    files_changed = list(output.get("target_files") or [])
+
+    if not files_changed:
+        for item in evidence:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "edit"
+                and item.get("file")
+            ):
+                path = item["file"]
+
+                if path not in files_changed:
+                    files_changed.append(path)
+
+    return {
+        "terminal": terminal,
+        "commands": commands[:EVENT_COMMANDS_LIMIT],
+        "files_changed": files_changed,
+        "test_results": _validation_results(evidence),
+        "diff_summary": _diff_summary(evidence, output),
+        "commit_sha": output.get("commit_sha"),
+        "working_tree_clean": output.get("working_tree_clean"),
+        "warnings": _report_warnings(evidence),
+    }
+
+
+def _terminal_for(success: bool, error: Optional[dict], terminal: Optional[str]) -> str:
+    if terminal:
+        return terminal
+    if success:
+        return "PASS"
+    err_type = (error or {}).get("type", "")
+
+    if err_type == "Cancelled":
+        return "CANCELLED"
+
+    if err_type in ("LLMBlocked", "ToolMissingError"):
+        return "BLOCKED"
+
+    return "FAIL"
+
+
+def _terminal_result(
+    success: bool,
+    output: dict,
+    evidence: list,
+    error: Optional[dict],
+    retryable: bool,
+    terminal: Optional[str] = None,
+) -> WorkerResult:
+    """Build a WorkerResult with a bounded evidence_report attached."""
+    report = build_evidence_report(
+        evidence,
+        output,
+        _terminal_for(success, error, terminal),
+    )
+
+    if isinstance(evidence, list):
         evidence.append(
             {
-                "type": "worktree_cleanup_error",
-                "worktree": str(worktree),
-                "error": str(exc),
+                "type": "evidence_report",
+                "evidence_report": report,
                 "timestamp": now_iso(),
             }
         )
 
-        try:
-            shutil.rmtree(worktree, ignore_errors=True)
-            run(["git", "worktree", "prune"], cwd=repo)
-        except Exception:
-            # Cleanup is best-effort; the mission result stands.
-            pass
+    if isinstance(output, dict):
+        output["evidence_report"] = report
 
-
-def worktree_is_clean(worktree: Path) -> bool:
-    status = run(
-        ["git", "status", "--short"],
-        cwd=worktree,
+    return WorkerResult(
+        success=success,
+        output=output,
+        evidence=evidence,
+        error=error,
+        retryable=retryable,
     )
-
-    return status["returncode"] == 0 and not status["stdout"].strip()
 
 
 class RepoCodeWorker(Worker):
@@ -658,7 +589,7 @@ class RepoCodeWorker(Worker):
         )
 
         if not repo_path:
-            return WorkerResult(
+            return _terminal_result(
                 success=False,
                 output={},
                 evidence=[],
@@ -676,7 +607,7 @@ class RepoCodeWorker(Worker):
         try:
             repo = Path(ensure_authorized(repo_path))
         except RepoNotAllowed as exc:
-            return WorkerResult(
+            return _terminal_result(
                 success=False,
                 output={},
                 evidence=[],
@@ -688,7 +619,7 @@ class RepoCodeWorker(Worker):
             )
 
         if not (repo / ".git").exists():
-            return WorkerResult(
+            return _terminal_result(
                 success=False,
                 output={"repo": str(repo)},
                 evidence=[],
@@ -743,27 +674,13 @@ class RepoCodeWorker(Worker):
 
         is_llm_mission = explicit_edits is None
 
-        worktree_root = Path("workspace").resolve()
-        worktree_root.mkdir(exist_ok=True)
-
-        branch_name = (
-            metadata.get("branch_name")
-            or f"yodaw/task-{int(datetime.now().timestamp())}"
-        )
-
-        worktree = worktree_root / f"repo_{int(datetime.now().timestamp())}"
-        # Ensure the worktree directory does not exist (remove if it does)
-        if worktree.exists():
-            shutil.rmtree(worktree, ignore_errors=True)
-
-        max_retries = int(metadata.get("max_retries", 1))
-        retries = 0
         mission_id = metadata.get("mission_id")
-        keep_worktree = bool(metadata.get("keep_worktree", False))
+        timeout_seconds = metadata.get("timeout_seconds")
 
         ctx = CancelContext(
-            metadata.get("mission_id"),
+            mission_id,
             metadata.get("_event_store"),
+            timeout_seconds=timeout_seconds,
         )
         ctx.emit(
             "worker.started",
@@ -778,59 +695,80 @@ class RepoCodeWorker(Worker):
             ctx.emit("mission.cancelled", attempt=0, data={"while": "claimed"})
             raise
 
+        with _mission_runtime(ctx):
+            # Everything below runs with the mission's deadline and
+            # cancellation bound to every bounded subprocess.
+            return self._execute_mission(
+                goal,
+                metadata,
+                ctx,
+                repo,
+                evidence,
+                explicit_edits,
+                is_llm_mission,
+            )
+
+    def _execute_mission(
+        self,
+        goal: str,
+        metadata: dict,
+        ctx: CancelContext,
+        repo: Path,
+        evidence: list,
+        explicit_edits,
+        is_llm_mission: bool,
+    ) -> WorkerResult:
+        worktree_root = Path("workspace").resolve()
+        worktree_root.mkdir(exist_ok=True)
+
+        branch_name = metadata.get("branch_name")
+        max_retries = int(metadata.get("max_retries", 1))
+        retries = 0
+        mission_id = metadata.get("mission_id")
+        keep_worktree = bool(metadata.get("keep_worktree", False))
+        worktree = None
+
         try:
-            source_status = run(
-                ["git", "status", "--short"],
-                cwd=repo,
+            # Unique worktree + branch allocation with base-SHA
+            # pinning and stale leftovers cleanup (worktree guard).
+            # Dirty-source detection lives inside allocate, so a
+            # dirty repo is rejected before any worktree is created.
+            allocate = worktree_guard.allocate(
+                repo,
+                worktree_root,
+                branch_name=branch_name,
+                run=run,
             )
-            evidence.append(source_status)
-
-            if source_status["stdout"].strip():
-                return WorkerResult(
-                    success=False,
-                    output={"repo": str(repo)},
-                    evidence=evidence,
-                    error={
-                        "type": "DirtyRepo",
-                        "message": "Source repository has uncommitted changes",
-                    },
-                    retryable=False,
-                )
-
-            base_sha = run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo,
+            evidence.append(
+                {
+                    "type": "worktree_allocate",
+                    "worktree": (
+                        str(allocate["worktree"])
+                        if allocate["worktree"] is not None
+                        else None
+                    ),
+                    "branch": allocate["branch"],
+                    "base_sha": allocate["base_sha"],
+                    "stale_removed": allocate["stale_removed"],
+                    "timestamp": now_iso(),
+                }
             )
-            evidence.append(base_sha)
 
-            wt_result = run(
-                [
-                    "git",
-                    "worktree",
-                    "add",
-                    "-b",
-                    branch_name,
-                    str(worktree),
-                    "HEAD",
-                ],
-                cwd=repo,
-            )
-            evidence.append(wt_result)
-
-            if wt_result["returncode"] != 0:
-                return WorkerResult(
+            if allocate["error"] is not None:
+                return _terminal_result(
                     success=False,
                     output={
                         "repo": str(repo),
                         "branch": branch_name,
                     },
                     evidence=evidence,
-                    error={
-                        "type": "WorktreeError",
-                        "message": wt_result["stderr"] or wt_result["stdout"],
-                    },
+                    error=allocate["error"],
                     retryable=False,
                 )
+
+            worktree = allocate["worktree"]
+            branch_name = allocate["branch"]
+            base_sha = allocate["base_sha"]
 
             inspect_result = run(
                 ["find", ".", "-maxdepth", "2", "-type", "f"],
@@ -849,7 +787,6 @@ class RepoCodeWorker(Worker):
             # the next plan is requested. Only a final PASS may
             # produce the single mission commit.
             # -------------------------------------------------
-            
 
             # Detect validation tooling once, before any edit is
             # applied, so a missing tool fails fast with a clear
@@ -865,7 +802,7 @@ class RepoCodeWorker(Worker):
                     failed=True,
                 )
 
-                return WorkerResult(
+                return _terminal_result(
                     success=False,
                     output={
                         "goal": goal,
@@ -879,7 +816,17 @@ class RepoCodeWorker(Worker):
                         "message": str(exc),
                     },
                     retryable=False,
+                    terminal="BLOCKED",
                 )
+
+            if not test_commands:
+                # No test runner detected. This is not a vacuous
+                # pass: the mission refuses PASS, but containment
+                # errors from the plan (path escape, missing text)
+                # are surfaced first inside the attempt loop.
+                no_tests_detected = True
+            else:
+                no_tests_detected = False
 
             lessons = ""
 
@@ -931,14 +878,14 @@ class RepoCodeWorker(Worker):
                                     failed=True,
                                 )
 
-                                return WorkerResult(
+                                return _terminal_result(
                                     success=False,
                                     output={
                                         "goal": goal,
                                         "repo": str(repo),
                                         "worktree": str(worktree),
                                         "branch": branch_name,
-                                        "base_sha": base_sha["stdout"].strip(),
+                                        "base_sha": base_sha,
                                         "tests_passed": False,
                                         "retries": retries,
                                         "attempts": 1,
@@ -950,6 +897,36 @@ class RepoCodeWorker(Worker):
                                         "attempt": 0,
                                     },
                                     retryable=False,
+                                    terminal="CANCELLED",
+                                )
+
+                            if isinstance(exc, MissionTimeout):
+                                cleanup_worktree(
+                                    worktree,
+                                    repo,
+                                    keep_worktree,
+                                    evidence,
+                                    failed=True,
+                                )
+
+                                return _terminal_result(
+                                    success=False,
+                                    output={
+                                        "goal": goal,
+                                        "repo": str(repo),
+                                        "worktree": str(worktree),
+                                        "branch": branch_name,
+                                        "base_sha": base_sha,
+                                        "tests_passed": False,
+                                    },
+                                    evidence=evidence,
+                                    error={
+                                        "type": "Timeout",
+                                        "message": str(exc),
+                                        "attempt": 0,
+                                    },
+                                    retryable=False,
+                                    terminal="TIMEOUT",
                                 )
 
                             cleanup_worktree(
@@ -960,14 +937,14 @@ class RepoCodeWorker(Worker):
                                 failed=True,
                             )
 
-                            return WorkerResult(
+                            return _terminal_result(
                                 success=False,
                                 output={
                                     "goal": goal,
                                     "repo": str(repo),
                                     "worktree": str(worktree),
                                     "branch": branch_name,
-                                    "base_sha": base_sha["stdout"].strip(),
+                                    "base_sha": base_sha,
                                     "tests_passed": False,
                                     "retries": retries,
                                     "attempts": 1,
@@ -999,7 +976,7 @@ class RepoCodeWorker(Worker):
                                 failed=True,
                             )
 
-                            return WorkerResult(
+                            return _terminal_result(
                                 success=False,
                                 output={
                                     "goal": goal,
@@ -1017,6 +994,7 @@ class RepoCodeWorker(Worker):
                                     ),
                                 },
                                 retryable=False,
+                                terminal="BLOCKED",
                             )
 
                         edits = normalize_edits(llm_plan)
@@ -1040,6 +1018,15 @@ class RepoCodeWorker(Worker):
                         except MissionCancelled as exc:
                             repair_error = {
                                 "type": "Cancelled",
+                                "message": str(exc),
+                                "attempt": attempt,
+                                "retry": retries,
+                            }
+
+                            break
+                        except MissionTimeout as exc:
+                            repair_error = {
+                                "type": "Timeout",
                                 "message": str(exc),
                                 "attempt": attempt,
                                 "retry": retries,
@@ -1073,6 +1060,9 @@ class RepoCodeWorker(Worker):
 
                             break
 
+                        if isinstance(exc, MissionTimeout):
+                            raise
+
                         repair_error = {
                             "type": "LLMError",
                             "message": str(exc),
@@ -1101,7 +1091,7 @@ class RepoCodeWorker(Worker):
                             failed=True,
                         )
 
-                        return WorkerResult(
+                        return _terminal_result(
                             success=False,
                             output={
                                 "goal": goal,
@@ -1119,13 +1109,14 @@ class RepoCodeWorker(Worker):
                                 ),
                             },
                             retryable=False,
+                            terminal="BLOCKED",
                         )
 
                     previous_plan = repair_plan
                     edits = normalize_edits(repair_plan)
 
                 if not isinstance(edits, list) or not edits:
-                    return WorkerResult(
+                    return _terminal_result(
                         success=False,
                         output={},
                         evidence=evidence,
@@ -1160,7 +1151,7 @@ class RepoCodeWorker(Worker):
                     output = {"worktree": str(worktree)}
                     output.update(prepare_error["output"])
 
-                    return WorkerResult(
+                    return _terminal_result(
                         success=False,
                         output=output,
                         evidence=evidence,
@@ -1170,10 +1161,45 @@ class RepoCodeWorker(Worker):
 
                 ctx.cancel_check(f"before_apply_attempt_{attempt}")
 
+                if no_tests_detected:
+                    # The plan is safe (containment validated), but
+                    # with no test runner an empty validation plan
+                    # must never silently pass a mission: refuse the
+                    # pass and commit nothing.
+                    cleanup_worktree(
+                        worktree,
+                        repo,
+                        keep_worktree,
+                        evidence,
+                        failed=True,
+                    )
+
+                    return _terminal_result(
+                        success=False,
+                        output={
+                            "goal": goal,
+                            "repo": str(repo),
+                            "worktree": str(worktree),
+                            "branch": branch_name,
+                            "base_sha": base_sha,
+                            "tests_passed": False,
+                            "tests_detected": 0,
+                        },
+                        evidence=evidence,
+                        error={
+                            "type": "NoTestsDetected",
+                            "message": (
+                                "no test runner detected; refusing "
+                                "a zero-test pass"
+                            ),
+                        },
+                        retryable=False,
+                    )
+
                 apply_edits(
                     worktree,
+                    prepared_edits,
                     staged_contents,
-                    touched_files,
                 )
 
                 ctx.emit(
@@ -1188,8 +1214,9 @@ class RepoCodeWorker(Worker):
                             "type": "edit",
                             "edit_index": item["edit_index"],
                             "file": item["target_file"],
-                            "find": item["find"],
-                            "replace": item["replace"],
+                            "find": item.get("find"),
+                            "replace": item.get("replace"),
+                            "action": item.get("action", "edit"),
                             "timestamp": now_iso(),
                         }
                     )
@@ -1235,6 +1262,7 @@ class RepoCodeWorker(Worker):
                 restore_originals(
                     worktree,
                     original_contents,
+                    prepared_edits,
                     evidence,
                     retries,
                 )
@@ -1259,14 +1287,14 @@ class RepoCodeWorker(Worker):
                         failed=True,
                     )
 
-                    return WorkerResult(
+                    return _terminal_result(
                         success=False,
                         output={
                             "goal": goal,
                             "repo": str(repo),
                             "worktree": str(worktree),
                             "branch": branch_name,
-                            "base_sha": base_sha["stdout"].strip(),
+                            "base_sha": base_sha,
                             "tests_passed": False,
                             "retries": retries,
                             "attempts": attempt + 1,
@@ -1313,14 +1341,14 @@ class RepoCodeWorker(Worker):
                     failed=True,
                 )
 
-                return WorkerResult(
+                return _terminal_result(
                     success=False,
                     output={
                         "goal": goal,
                         "repo": str(repo),
                         "worktree": str(worktree),
                         "branch": branch_name,
-                        "base_sha": base_sha["stdout"].strip(),
+                        "base_sha": base_sha,
                         "tests_passed": False,
                         "retries": retries,
                         "attempts": attempt + 1,
@@ -1341,14 +1369,14 @@ class RepoCodeWorker(Worker):
                     failed=True,
                 )
 
-                return WorkerResult(
+                return _terminal_result(
                     success=False,
                     output={
                         "goal": goal,
                         "repo": str(repo),
                         "worktree": str(worktree),
                         "branch": branch_name,
-                        "base_sha": base_sha["stdout"].strip(),
+                        "base_sha": base_sha,
                         "tests_passed": False,
                         "retries": retries,
                         "attempts": attempt + 1,
@@ -1377,7 +1405,7 @@ class RepoCodeWorker(Worker):
                     failed=True,
                 )
 
-                return WorkerResult(
+                return _terminal_result(
                     success=False,
                     output={
                         "goal": goal,
@@ -1409,6 +1437,108 @@ class RepoCodeWorker(Worker):
             # repository untouched: no commit, no merge, no push.
             ctx.cancel_check("before_commit")
 
+            # Commit fence: the source repository must not have
+            # moved off the pinned base SHA while this mission ran.
+            try:
+                worktree_guard.verify_commit_fence(
+                    repo,
+                    worktree,
+                    base_sha=base_sha,
+                    run=run,
+                    expect_clean=False,
+                )
+            except worktree_guard.FenceViolation as exc:
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
+                return _terminal_result(
+                    success=False,
+                    output={
+                        "repo": str(repo),
+                        "worktree": str(worktree),
+                        "branch": branch_name,
+                        "base_sha": base_sha,
+                    },
+                    evidence=evidence,
+                    error={
+                        "type": "FenceViolation",
+                        "message": str(exc),
+                    },
+                    retryable=False,
+                )
+
+            # Secret / credential guard: nothing staged may contain
+            # detected credentials; warnings (artifacts) are recorded
+            # but advisory.
+            staged_diff = run(
+                ["git", "diff", "--cached"],
+                cwd=worktree,
+            )
+            evidence.append(staged_diff)
+
+            staged_scan = diff_guard.scan(staged_diff.get("stdout", ""))
+            path_scan = diff_guard.scan_paths(touched_files)
+            merged_scan = {
+                "blocking": staged_scan["blocking"] + [
+                    finding
+                    for finding in path_scan["blocking"]
+                    if finding not in staged_scan["blocking"]
+                ],
+                "warnings": staged_scan["warnings"] + [
+                    finding
+                    for finding in path_scan["warnings"]
+                    if finding not in staged_scan["warnings"]
+                ],
+                "ok": not (
+                    staged_scan["blocking"] or path_scan["blocking"]
+                ),
+            }
+            evidence.append(
+                {
+                    "type": "diff_scan",
+                    "report": merged_scan,
+                    "timestamp": now_iso(),
+                }
+            )
+
+            if merged_scan["blocking"]:
+                # The worktree (and its full evidence) is preserved
+                # for inspection; nothing is committed.
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
+                return _terminal_result(
+                    success=False,
+                    output={
+                        "repo": str(repo),
+                        "worktree": str(worktree),
+                        "branch": branch_name,
+                        "base_sha": base_sha,
+                        "secret_blocked": True,
+                        "diff_scan": merged_scan,
+                    },
+                    evidence=evidence,
+                    error={
+                        "type": "SecretBlocked",
+                        "message": (
+                            "staged changes contain detected "
+                            "credentials; nothing committed"
+                        ),
+                        "blocking": merged_scan["blocking"],
+                    },
+                    retryable=False,
+                )
+
             commit_message = metadata.get(
                 "commit_message",
                 f"yodaw: {goal[:72]}",
@@ -1429,7 +1559,7 @@ class RepoCodeWorker(Worker):
                     failed=True,
                 )
 
-                return WorkerResult(
+                return _terminal_result(
                     success=False,
                     output={
                         "repo": str(repo),
@@ -1467,14 +1597,14 @@ class RepoCodeWorker(Worker):
                 failed=False,
             )
 
-            return WorkerResult(
+            return _terminal_result(
                 success=True,
                 output={
                     "goal": goal,
                     "repo": str(repo),
                     "worktree": str(worktree),
                     "branch": branch_name,
-                    "base_sha": base_sha["stdout"].strip(),
+                    "base_sha": base_sha,
                     "commit_sha": sha_result["stdout"].strip(),
                     # Legacy field retained for compatibility.
                     "target_file": (
@@ -1492,7 +1622,41 @@ class RepoCodeWorker(Worker):
                     "working_tree_clean": final_status["stdout"].strip() == "",
                 },
                 evidence=evidence,
+                error=None,
                 retryable=False,
+            )
+
+        except MissionTimeout as exc:
+            ctx.emit(
+                "mission.timed_out",
+                attempt=0,
+                at="worker_execution",
+            )
+
+            cleanup_worktree(
+                worktree,
+                repo,
+                keep_worktree,
+                evidence,
+                failed=True,
+            )
+
+            return _terminal_result(
+                success=False,
+                output={
+                    "goal": goal,
+                    "repo": str(repo),
+                    "worktree": str(worktree),
+                    "branch": branch_name,
+                },
+                evidence=evidence,
+                error={
+                    "type": "Timeout",
+                    "message": str(exc),
+                    "at": "worker_execution",
+                },
+                retryable=False,
+                terminal="TIMEOUT",
             )
 
         except Exception as exc:
@@ -1513,7 +1677,7 @@ class RepoCodeWorker(Worker):
                     failed=True,
                 )
 
-                return WorkerResult(
+                return _terminal_result(
                     success=False,
                     output={
                         "goal": goal,
@@ -1527,6 +1691,7 @@ class RepoCodeWorker(Worker):
                         "message": str(exc),
                     },
                     retryable=False,
+                    terminal="CANCELLED",
                 )
 
             # Unhandled worker failure: still record the worktree
@@ -1539,7 +1704,7 @@ class RepoCodeWorker(Worker):
                 failed=True,
             )
 
-            return WorkerResult(
+            return _terminal_result(
                 success=False,
                 output={
                     "goal": goal,

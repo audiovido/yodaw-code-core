@@ -34,6 +34,15 @@ SQL_SYNTAX_CHECK = (
 )
 
 
+def _has_python_test_files(worktree: Path) -> bool:
+    """True when any python test file exists under the worktree."""
+    for path in worktree.rglob("*.py"):
+        if path.name.startswith("test_") or path.name.endswith("_test.py"):
+            return True
+
+    return False
+
+
 def detect_test_commands(
     worktree,
     *,
@@ -51,6 +60,16 @@ def detect_test_commands(
     # Python
     python_markers = ("pytest.ini", "tests", "pyproject.toml", "setup.py")
     if any((worktree / marker).exists() for marker in python_markers):
+        commands.append(
+            [
+                python_executable or resolve_python_executable(),
+                *PYTEST_CMD_TEMPLATE,
+            ]
+        )
+    elif _has_python_test_files(worktree):
+        # A repository with test_*.py / *_test.py files still runs
+        # pytest even without a marker file; a missing interpreter
+        # fails explicitly during execution, never silently.
         commands.append(
             [
                 python_executable or resolve_python_executable(),

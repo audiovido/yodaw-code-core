@@ -57,6 +57,8 @@ def test_atomic_multi_file_execution(tmp_path):
         "    assert helper() == 20\n"
     )
 
+    (repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
+
     git(repo, "add", ".")
     git(repo, "commit", "-m", "baseline")
 
@@ -125,6 +127,7 @@ def test_invalid_second_edit_does_not_apply_first(tmp_path):
 
     (repo / "a.py").write_text("VALUE = 1\n")
     (repo / "b.py").write_text("VALUE = 10\n")
+    (repo / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
 
     git(repo, "add", ".")
     git(repo, "commit", "-m", "baseline")

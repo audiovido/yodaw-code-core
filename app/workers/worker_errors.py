@@ -19,3 +19,6 @@ class ToolMissingError(RuntimeError):
 
 class SubprocessTimeout(TimeoutError):
     """A bounded subprocess exceeded its deadline and was terminated."""
+
+class MissionTimeout(TimeoutError):
+    """The mission's own deadline expired; no commit may follow."""
