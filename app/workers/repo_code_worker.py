@@ -21,7 +21,11 @@ from app.workers.worker_errors import (
     MissionTimeout,
     ToolMissingError,
 )
-from app.llm.coder import generate_edit_plan, generate_repair_plan
+from app.llm.coder import (
+    PlanParseError,
+    generate_edit_plan,
+    generate_repair_plan,
+)
 from app.learning.retrieval import (
     format_lessons,
     retrieve_relevant_learnings,
@@ -947,6 +951,50 @@ class RepoCodeWorker(Worker):
                                     terminal="TIMEOUT",
                                 )
 
+                            if isinstance(exc, PlanParseError):
+                                evidence.append(
+                                    {
+                                        "type": "plan_parse_failure",
+                                        "attempt": 0,
+                                        "retry": retries,
+                                        "parse_attempts": exc.attempts,
+                                        "raw_snippet": exc.raw_snippet,
+                                        "error": str(exc)[:500],
+                                        "timestamp": now_iso(),
+                                    }
+                                )
+
+                                cleanup_worktree(
+                                    worktree,
+                                    repo,
+                                    keep_worktree,
+                                    evidence,
+                                    failed=True,
+                                )
+
+                                return _terminal_result(
+                                    success=False,
+                                    output={
+                                        "goal": goal,
+                                        "repo": str(repo),
+                                        "worktree": str(worktree),
+                                        "branch": branch_name,
+                                        "base_sha": base_sha,
+                                        "tests_passed": False,
+                                        "retries": retries,
+                                        "attempts": 1,
+                                    },
+                                    evidence=evidence,
+                                    error={
+                                        "type": "PlanParseError",
+                                        "message": str(exc),
+                                        "attempt": 0,
+                                        "retry": retries,
+                                        "parse_attempts": exc.attempts,
+                                    },
+                                    retryable=True,
+                                )
+
                             cleanup_worktree(
                                 worktree,
                                 repo,
@@ -1082,12 +1130,34 @@ class RepoCodeWorker(Worker):
                         if isinstance(exc, MissionTimeout):
                             raise
 
+                        if isinstance(exc, PlanParseError):
+                            evidence.append(
+                                {
+                                    "type": "plan_parse_failure",
+                                    "attempt": attempt,
+                                    "retry": retries,
+                                    "parse_attempts": exc.attempts,
+                                    "raw_snippet": exc.raw_snippet,
+                                    "error": str(exc)[:500],
+                                    "timestamp": now_iso(),
+                                }
+                            )
+
                         repair_error = {
-                            "type": "LLMError",
+                            "type": (
+                                "PlanParseError"
+                                if isinstance(exc, PlanParseError)
+                                else "LLMError"
+                            ),
                             "message": str(exc),
                             "attempt": attempt,
                             "retry": retries,
                         }
+
+                        if isinstance(exc, PlanParseError):
+                            repair_error["parse_attempts"] = (
+                                exc.attempts
+                            )
 
                         break
 

@@ -73,12 +73,13 @@ def build_chat_request(
     system: str,
     user: str,
     api_key: str = "",
+    stream: bool = False,
 ) -> tuple[str, dict, dict]:
     """Build the OpenAI-compatible chat request 9Router expects."""
     url = f"{normalize_base_url(base_url)}{CHAT_PATH}"
     payload = {
         "model": model,
-        "stream": False,
+        "stream": stream,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": system},

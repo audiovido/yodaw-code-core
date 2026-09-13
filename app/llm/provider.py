@@ -33,6 +33,22 @@ def llm_keep_alive() -> str:
     )
 
 
+_STREAM_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def llm_stream_enabled() -> bool:
+    """Whether OpenAI-compatible styles stream SSE responses.
+
+    Streaming keeps slow providers alive through intermediaries
+    (headers arrive with the first token instead of only at
+    completion). Default off: legacy single-shot behavior.
+    """
+    return (
+        os.environ.get("YODAW_LLM_STREAM", "").strip().lower()
+        in _STREAM_TRUTHY
+    )
+
+
 def provider_retry_config() -> tuple[int, float]:
     """
     Stage 8.6 provider resilience configuration.
@@ -114,6 +130,13 @@ def _is_retryable(exc: Exception) -> bool:
         return True
 
     if isinstance(exc, httpx.ConnectError):
+        return True
+
+    stream_errors = getattr(httpx, "StreamError", ())
+
+    if stream_errors and isinstance(exc, stream_errors):
+        # Mid-stream transport failure: the attempt never ran to
+        # completion, so retrying the whole request is safe.
         return True
 
     if isinstance(exc, httpx.HTTPStatusError):
@@ -237,15 +260,131 @@ def fallback_models() -> list[str]:
     return ordered
 
 
+def accumulate_openai_stream(response) -> tuple[str, int]:
+    """Accumulate one OpenAI-style SSE chat stream into text.
+
+    Returns (content, chunk_count). Tolerates ping/comment
+    lines, blank frames, and both ``delta.content`` and
+    ``message.content`` chunk shapes; stops at ``data: [DONE]``.
+    Raises LLMError on a mid-stream error object or when the
+    stream yields no content at all.
+    """
+    parts: list[str] = []
+    chunks = 0
+
+    for raw_line in response.iter_lines():
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = raw_line
+        line = line.strip()
+
+        if not line or line.startswith(":"):
+            continue
+
+        if not line.startswith("data:"):
+            continue
+
+        data = line[5:].strip()
+
+        if data == "[DONE]":
+            break
+
+        try:
+            event = json.loads(data)
+        except ValueError:
+            continue
+
+        if isinstance(event, dict) and event.get("error"):
+            raise LLMError(
+                f"streamed chat error: {event.get('error')}"
+            )
+
+        try:
+            choices = event.get("choices") or []
+            first = choices[0] if choices else {}
+            delta = (
+                first.get("delta") or first.get("message") or {}
+            )
+            piece = delta.get("content") or ""
+        except (AttributeError, IndexError, TypeError):
+            continue
+
+        if piece:
+            chunks += 1
+            parts.append(piece)
+
+    content = "".join(parts)
+
+    if not content:
+        raise LLMError("streamed chat response was empty")
+
+    return content, chunks
+
+
+def accumulate_ollama_stream(response) -> tuple[str, int]:
+    """Accumulate one Ollama NDJSON chat stream into text.
+
+    Returns (content, chunk_count). Each line carries
+    ``{"message": {"content": ...}, "done": bool}``; blank and
+    malformed lines are tolerated. Raises LLMError on a
+    mid-stream error object or when the stream yields no
+    content at all.
+    """
+    parts: list[str] = []
+    chunks = 0
+
+    for raw_line in response.iter_lines():
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = raw_line
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+
+        if isinstance(event, dict) and event.get("error"):
+            raise LLMError(
+                f"streamed Ollama error: {event.get('error')}"
+            )
+
+        try:
+            message = event.get("message") or {}
+            piece = message.get("content") or ""
+        except (AttributeError, TypeError):
+            continue
+
+        if piece:
+            chunks += 1
+            parts.append(piece)
+
+        if isinstance(event, dict) and event.get("done"):
+            break
+
+    content = "".join(parts)
+
+    if not content:
+        raise LLMError("streamed Ollama response was empty")
+
+    return content, chunks
+
+
 class LocalLLMProvider:
     """
     Generic local LLM adapter.
 
     Supports:
-      - Ollama native /api/chat
+      - Ollama native /api/chat (streaming optional too)
       - OpenAI-compatible /v1/chat/completions
       - Anthropic /v1/messages
-      - 9Router OpenAI-compatible /v1/chat/completions (stream=false)
+      - 9Router OpenAI-compatible /v1/chat/completions
+        (streaming optional via YODAW_LLM_STREAM)
 
     Configuration:
       YODAW_LLM_STYLE=ollama|openai|anthropic|9router
@@ -256,6 +395,8 @@ class LocalLLMProvider:
       YODAW_LLM_FALLBACK_MODELS=<comma-separated 9router
         routes, optional; each retryable failure fails over to
         the next route instead of hammering one dead route>
+      YODAW_LLM_STREAM=1|true (optional; stream SSE for the
+        openai/9router styles instead of single-shot)
 
     Explicit constructor arguments override the environment (used by
     the fallback chain to build sibling providers with per-style
@@ -411,7 +552,9 @@ class LocalLLMProvider:
         payload: dict,
         headers: Optional[dict] = None,
         payloads: Optional[list[dict]] = None,
-    ) -> dict:
+        stream: bool = False,
+        stream_parser=None,
+    ) -> dict | str:
         """
         Stage 8.6: bounded retries with exponential backoff and
         jitter for transient provider faults. Every attempt is
@@ -423,6 +566,13 @@ class LocalLLMProvider:
         retryable failure fails over to the next route instead
         of hammering one dead route. Without ``payloads`` every
         attempt posts ``payload`` (legacy behavior).
+
+        Streaming: when ``stream`` is true each attempt posts
+        with ``stream: true`` and the accumulated text is
+        returned instead of the decoded JSON body. Retries,
+        backoff, failover, and evidence behave identically.
+        ``stream_parser`` selects the frame accumulator
+        (OpenAI SSE by default, Ollama NDJSON for that style).
         """
         max_retries, base_backoff = provider_retry_config()
         sequence = payloads if payloads else [payload]
@@ -452,6 +602,23 @@ class LocalLLMProvider:
             previous_model = model or previous_model
 
             try:
+                if stream:
+                    request_payload = dict(used, stream=True)
+                    parser = stream_parser or accumulate_openai_stream
+                    content, chunk_count = self._post_stream_text(
+                        url, request_payload, headers, parser=parser
+                    )
+
+                    record["status"] = 200
+                    record["stream"] = True
+                    record["stream_chunks"] = chunk_count
+                    record["duration_s"] = round(
+                        time.monotonic() - started, 3
+                    )
+                    _log_attempt(record)
+
+                    return content
+
                 response = httpx.post(
                     url,
                     json=used,
@@ -493,10 +660,43 @@ class LocalLLMProvider:
                 )
                 time.sleep(delay)
 
+    def _post_stream_text(
+        self,
+        url: str,
+        payload: dict,
+        headers: Optional[dict],
+        parser=accumulate_openai_stream,
+    ) -> tuple[str, int]:
+        """POST a streaming chat request; return (text, chunks).
+
+        Headers arrive with the first token, so slow providers
+        stay alive through intermediaries that time out
+        headerless single-shot responses. Transport failures
+        mid-stream propagate for the retry classifier.
+        """
+        streamer = getattr(httpx, "stream", None)
+
+        if streamer is None:
+            raise LLMError(
+                "streaming requested but this httpx layer has no "
+                "stream support"
+            )
+
+        with streamer(
+            "POST",
+            url,
+            json=payload,
+            headers=headers,
+            timeout=llm_timeout_seconds(),
+        ) as response:
+            response.raise_for_status()
+            return parser(response)
+
     def _ollama(self, system: str, user: str) -> str:
+        stream_enabled = llm_stream_enabled()
         payload = {
             "model": self.model,
-            "stream": False,
+            "stream": stream_enabled,
             "format": "json",
             "keep_alive": llm_keep_alive(),
             "messages": [
@@ -514,7 +714,17 @@ class LocalLLMProvider:
         data = self._chat_with_retry(
             f"{self.base_url}/api/chat",
             payload,
+            stream=stream_enabled,
+            stream_parser=accumulate_ollama_stream,
         )
+
+        if stream_enabled:
+            if not isinstance(data, str):
+                raise LLMError(
+                    "streamed Ollama response malformed: "
+                    "expected text"
+                )
+            return data
 
         try:
             return data["message"]["content"]
@@ -548,11 +758,22 @@ class LocalLLMProvider:
             ],
         }
 
+        stream_enabled = llm_stream_enabled()
+
         data = self._chat_with_retry(
             f"{self.base_url}/v1/chat/completions",
             payload,
             headers=headers,
+            stream=stream_enabled,
         )
+
+        if stream_enabled:
+            if not isinstance(data, str):
+                raise LLMError(
+                    "streamed OpenAI-compatible response "
+                    "malformed: expected text"
+                )
+            return data
 
         try:
             return data["choices"][0]["message"]["content"]
@@ -587,9 +808,23 @@ class LocalLLMProvider:
         )
         payloads = [dict(payload, model=name) for name in chain]
 
+        stream_enabled = llm_stream_enabled()
+
         data = self._chat_with_retry(
-            url, payload, headers=headers, payloads=payloads
+            url,
+            payload,
+            headers=headers,
+            payloads=payloads,
+            stream=stream_enabled,
         )
+
+        if stream_enabled:
+            if not isinstance(data, str):
+                raise LLMError(
+                    "9Router streamed response malformed: "
+                    "expected text"
+                )
+            return data
 
         try:
             return ninerouter.parse_chat_response(data)

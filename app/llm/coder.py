@@ -314,12 +314,101 @@ def parse_plan(raw: str) -> dict:
     return plan
 
 
+class PlanParseError(LLMError):
+    """A model plan that stayed unparseable after bounded recovery.
+
+    Carries the number of chat attempts spent and a bounded
+    snippet of the last raw output for evidence.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        attempts: int = 0,
+        raw_snippet: str = "",
+    ):
+        super().__init__(message)
+        self.attempts = attempts
+        self.raw_snippet = raw_snippet
+
+
+def parse_recovery_config() -> int:
+    """Bounded re-prompts after an unparseable plan (default 2)."""
+    try:
+        retries = int(
+            os.environ.get(
+                "YODAW_CODER_PARSE_RETRIES",
+                "2",
+            )
+        )
+    except ValueError:
+        retries = 2
+
+    return max(0, retries)
+
+
+RAW_SNIPPET_LIMIT = 2000
+
+
+def _format_recovery_followup(raw: str, error: Exception) -> str:
+    """Follow-up demanding JSON after an unparseable response."""
+    return (
+        "\n\nPREVIOUS RESPONSE (could not be parsed as JSON):\n\n"
+        f"{raw[:RAW_SNIPPET_LIMIT]}\n\nPARSE ERROR:\n\n{error}\n\n"
+        "Respond with ONLY a single JSON object: no markdown "
+        "fences, no prose, no explanation."
+    )
+
+
+def chat_for_plan(
+    provider,
+    system: str,
+    user: str,
+    parse_retries=None,
+) -> dict:
+    """Chat, then parse, with bounded re-prompts on invalid JSON.
+
+    Each re-prompt carries the previous raw output plus the parse
+    error, so the retry prompt always differs from the failed one
+    (a bare retry would reproduce a deterministic failure).
+    Transport LLMError from the chat itself propagates untouched;
+    only parse failures are retried, then PlanParseError.
+    """
+    if parse_retries is None:
+        parse_retries = parse_recovery_config()
+
+    current_user = user
+    attempts = 0
+    last_raw = ""
+
+    while True:
+        attempts += 1
+        raw = provider.chat(system, current_user)
+        last_raw = raw if isinstance(raw, str) else str(raw)
+
+        try:
+            return parse_plan(last_raw)
+        except LLMError as exc:
+            if attempts > parse_retries:
+                raise PlanParseError(
+                    f"Coder plan stayed unparseable after "
+                    f"{attempts} attempt(s): {exc}",
+                    attempts=attempts,
+                    raw_snippet=last_raw[:RAW_SNIPPET_LIMIT],
+                ) from exc
+
+            current_user = user + _format_recovery_followup(
+                last_raw, exc
+            )
+
+
 def generate_edit_plan(
     goal: str,
     worktree: Path,
     provider=None,
     lessons: str = "",
     cancel_check=None,
+    parse_retries=None,
 ) -> dict:
 
     if cancel_check:
@@ -368,12 +457,12 @@ Priority:
 Return the safest minimal JSON edit plan.
 """.strip()
 
-    raw = provider.chat(
+    return chat_for_plan(
+        provider,
         SYSTEM_PROMPT,
         user_prompt,
+        parse_retries=parse_retries,
     )
-
-    return parse_plan(raw)
 
 
 def generate_repair_plan(
@@ -384,6 +473,7 @@ def generate_repair_plan(
     provider=None,
     lessons: str = "",
     cancel_check=None,
+    parse_retries=None,
 ) -> dict:
 
     if cancel_check:
@@ -444,9 +534,9 @@ REPOSITORY CONTENT:
 {closing}
 """.strip()
 
-    raw = provider.chat(
+    return chat_for_plan(
+        provider,
         REPAIR_SYSTEM_PROMPT,
         user_prompt,
+        parse_retries=parse_retries,
     )
-    
-    return parse_plan(raw)
