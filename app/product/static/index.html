@@ -95,6 +95,11 @@ aside { display: flex; flex-direction: column; gap: 16px; align-self: start; pos
   .layout { grid-template-columns: 1fr; }
   aside { position: static; }
 }
+@media (max-width: 600px) {
+  .row2 { grid-template-columns: 1fr; }
+  header { flex-wrap: wrap; gap: 8px; }
+  .header-right { margin-left: 0; width: 100%; justify-content: space-between; }
+}
 
 /* ---------- composer ---------- */
 .composer-body { padding: 14px 16px 16px; }
@@ -343,7 +348,7 @@ img.preview {
           <div class="mission-id" id="missionId">–</div>
           <div class="mission-goal" id="missionGoal"></div>
         </div>
-        <span class="badge" id="statusBadge">–</span>
+        <span class="badge" id="statusBadge" role="status" aria-live="polite">–</span>
       </div>
       <div class="meta-grid" id="metaGrid"></div>
       <div class="actions">
@@ -351,20 +356,20 @@ img.preview {
         <button id="retryBtn" class="btn ok" disabled>Retry</button>
         <button id="copyResultBtn" class="btn" disabled>Copy result</button>
       </div>
-      <div id="errorBanner"><div class="err-title" id="errorTitle"></div><div class="err-detail" id="errorDetail"></div></div>
-      <div id="missionError"><div class="err-title" id="missionErrorTitle"></div><div class="err-detail" id="missionErrorDetail"></div></div>
+      <div id="errorBanner" role="alert" aria-live="assertive"><div class="err-title" id="errorTitle"></div><div class="err-detail" id="errorDetail"></div></div>
+      <div id="missionError" role="alert" aria-live="assertive"><div class="err-title" id="missionErrorTitle"></div><div class="err-detail" id="missionErrorDetail"></div></div>
       <div id="progressWrap">
         <div class="stage-row">
           <span class="stage-label"><span id="stageLabel">–</span></span>
           <span class="stage-note" id="stageNote"></span>
         </div>
-        <div class="track"><div class="bar" id="progressBar"></div></div>
+        <div class="track"><div class="bar" id="progressBar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div></div>
         <div class="segments" id="segments"></div>
       </div>
-      <div class="tabs">
-        <button class="tab on" data-tab="result">Result <span class="n" id="resultCount"></span></button>
-        <button class="tab" data-tab="events">Events <span class="n" id="eventsCount"></span></button>
-        <button class="tab" data-tab="evidence">Evidence <span class="n" id="evidenceCount"></span></button>
+      <div class="tabs" role="tablist">
+        <button class="tab on" role="tab" aria-selected="true" data-tab="result">Result <span class="n" id="resultCount"></span></button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="events">Events <span class="n" id="eventsCount"></span></button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="evidence">Evidence <span class="n" id="evidenceCount"></span></button>
       </div>
       <div class="tab-body">
         <div id="tab-result">
@@ -444,7 +449,13 @@ async function refreshStatus() {
       .filter(([, v]) => v > 0)
       .map(([k, v]) => `${k}:${v}`).join("  ");
     $("countsChip").textContent = parts || "no missions";
-  } catch { /* header stays heuristic */ }
+  } catch {
+    const chip = $("serviceChip");
+    chip.classList.remove("ok");
+    chip.classList.add("bad");
+    $("serviceTxt").textContent = "offline";
+    $("countsChip").textContent = "offline";
+  }
 }
 
 /* ---------- capabilities ---------- */
@@ -469,12 +480,14 @@ async function loadCapabilities() {
 }
 
 /* ---------- composer ---------- */
-const goalEl = $("goal"), repoEl = $("repo"), capEl = $("cap");
+const goalEl = $("goal"), repoEl = $("repo"), capEl = $("cap"), submitBtn = $("submit");
 goalEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitMission(); }
 });
 goalEl.addEventListener("input", updateSubmit);
 repoEl.addEventListener("input", updateSubmit);
+capEl.addEventListener("change", updateSubmit);
+submitBtn.addEventListener("click", submitMission);
 
 function contentKey() {
   const s = `${goalEl.value.trim()}\u0000${repoEl.value.trim()}\u0000${capEl.value}`;
@@ -484,14 +497,14 @@ function contentKey() {
 }
 function updateSubmit() {
   const ok = goalEl.value.trim().length > 0;
-  $("submit").disabled = !ok || state.busy === "submit";
+  submitBtn.disabled = !ok || state.busy === "submit";
   $("idemHint").textContent = ok ? `idempotency key: ${contentKey()}` : "";
   $("idemHint").style.display = ok ? "" : "none";
 }
 
 async function submitMission() {
   const goal = goalEl.value.trim();
-  if (!goal) return;
+  if (!goal || state.busy) return;
   clearError();
   state.busy = "submit";
   updateSubmit();
@@ -549,7 +562,7 @@ function startPoll() {
   state.timer = setInterval(async () => {
     if (!state.mission) return;
     try {
-      const m = await api(`/api/v1/missions/${state.mission.id}`);
+      const m = await api(`/api/v1/missions/${state.mission.id || state.mission.mission_id}`);
       const wasTerminal = TERMINAL.has((state.mission && state.mission.status) || "");
       state.mission = m;
       await refreshDetail();
@@ -590,8 +603,8 @@ async function refreshDetail() {
   $("resultCount").textContent = hasResult ? "" : "pending";
 
   const [events, evidence] = await Promise.all([
-    api(`/api/v1/missions/${m.id}/events`),
-    api(`/api/v1/missions/${m.id}/evidence`),
+    api(`/api/v1/missions/${m.id || m.mission_id}/events`).catch(() => ({ events: [] })),
+    api(`/api/v1/missions/${m.id || m.mission_id}/evidence`).catch(() => ({ evidence: [] })),
   ]);
   state.events = (events && events.events) || [];
   state.evidence = (evidence && evidence.evidence) || [];
@@ -629,7 +642,9 @@ function renderProgress(m) {
   const status = m.status || "QUEUED";
   const statusIdx = STAGES.indexOf(status);
   const stage = TERMINAL.has(status) ? STAGES.length : Math.max(statusIdx, evStage, 0);
-  $("progressBar").style.width = `${(stage / STAGES.length) * 100}%`;
+  const progressPct = Math.round((stage / STAGES.length) * 100);
+  $("progressBar").style.width = `${progressPct}%`;
+  $("progressBar").setAttribute("aria-valuenow", String(progressPct));
   $("progressBar").classList.toggle("done", status === "PASS");
   $("progressBar").classList.toggle("fail", status === "FAIL");
   $("progressBar").classList.toggle("blk", status === "BLOCKED" || status === "BLOCKED_EXTERNAL");
@@ -657,8 +672,12 @@ function renderMissionError(m) {
 /* ---------- tabs ---------- */
 document.querySelectorAll(".tab").forEach((t) => {
   t.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("on"));
+    document.querySelectorAll(".tab").forEach((x) => {
+      x.classList.remove("on");
+      x.setAttribute("aria-selected", "false");
+    });
     t.classList.add("on");
+    t.setAttribute("aria-selected", "true");
     ["result", "events", "evidence"].forEach((n) => {
       $("tab-" + n).style.display = n === t.dataset.tab ? "" : "none";
     });
@@ -812,7 +831,8 @@ $("cancelBtn").addEventListener("click", async () => {
   state.busy = "cancel";
   $("cancelBtn").disabled = true;
   try {
-    const r = await api(`/api/v1/missions/${m.id}/cancel`, { method: "POST" });
+    const id = m.mission_id || m.id;
+    const r = await api(`/api/v1/missions/${id}/cancel`, { method: "POST" });
     if (r.status === "CANCELLED") {
       showError("Cancelled", "Mission was cancelled before execution started.");
     } else if (r.status === "CANCELLING") {
@@ -838,8 +858,10 @@ $("retryBtn").addEventListener("click", async () => {
   state.busy = "retry";
   $("retryBtn").disabled = true;
   try {
-    const r = await api(`/api/v1/missions/${m.id}/retry`, { method: "POST" });
-    await loadMission(r.mission_id, { goal: m.goal });
+    const id = m.mission_id || m.id;
+    const r = await api(`/api/v1/missions/${id}/retry`, { method: "POST" });
+    const newId = r.mission_id || r.id;
+    await loadMission(newId, { goal: m.goal });
     await loadHistory();
   } catch (err) {
     if (err.status === 409) showError("Cannot retry", err.message);
