@@ -136,6 +136,25 @@ class LLMError(RuntimeError):
     pass
 
 
+MODEL_DEFAULTS = {
+    "ollama": "qwen2.5-coder:7b",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-20250514",
+}
+
+BASE_URL_DEFAULTS = {
+    "ollama": "http://127.0.0.1:11434",
+    "openai": "https://api.openai.com",
+    "anthropic": "https://api.anthropic.com",
+}
+
+API_KEY_ENV_DEFAULTS = {
+    "ollama": "",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+
+
 class LocalLLMProvider:
     """
     Generic local LLM adapter.
@@ -258,11 +277,6 @@ class LocalLLMProvider:
                 time.sleep(delay)
 
     def _ollama(self, system: str, user: str) -> str:
-        print(f"!!! PROVIDER _OLLAMA CALLED: model={self.model!r}", flush=True)
-        if self.model == "test":
-            # Return a non-JSON string to cause an error if LLM is used, so we can see if deduction worked.
-            print("!!! PROVIDER returning non-JSON for test model", flush=True)
-            return 'not a json'
         payload = {
             "model": self.model,
             "stream": False,

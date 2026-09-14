@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -202,19 +203,34 @@ def build_repo_context(worktree: Path, max_chars: int = 24000) -> str:
 def parse_plan(raw: str) -> dict:
     text = raw.strip()
 
-    if text.startswith("```"):
-        text = text.strip("`")
-
-        if text.startswith("json"):
-            text = text[4:].strip()
+    # Extract JSON from markdown fence if present anywhere in the response
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+    elif text.startswith("```"):
+        candidate = text.strip("`")
+        if candidate.startswith("json"):
+            candidate = candidate[4:].strip()
+    else:
+        candidate = text
 
     try:
-        plan = json.loads(text)
-
-    except json.JSONDecodeError as exc:
-        raise LLMError(
-            f"Coder returned invalid JSON: {exc}"
-        ) from exc
+        plan = json.loads(candidate)
+    except json.JSONDecodeError:
+        # Fallback: attempt to find the outer-most JSON object in the text
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                plan = json.loads(candidate[start : end + 1])
+            except json.JSONDecodeError as exc:
+                raise LLMError(
+                    f"Coder returned invalid JSON: {exc}"
+                ) from exc
+        else:
+            raise LLMError(
+                f"Coder returned invalid JSON: could not parse JSON object"
+            )
 
     action = plan.get("action")
 

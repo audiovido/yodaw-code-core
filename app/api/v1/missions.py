@@ -170,6 +170,7 @@ def submit_product_mission(
         replay = check_idempotent_replay(store, scope, key, principal)
         if replay is not None:
             return replay, True
+    print(f"API: request.capability={request.capability!r}", flush=True)
     metadata = build_metadata(request)
     mission = Mission(
         goal=request.goal,
@@ -179,6 +180,7 @@ def submit_product_mission(
         priority=principal.priority,
         idempotency_key=key,
     )
+    print(f"API: mission.capability={mission.capability!r}", flush=True)
     claimed_id = mission.id
     if key and hasattr(store, "submit_idempotent_mission"):
         if request.dry_run:

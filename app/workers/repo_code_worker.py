@@ -654,7 +654,6 @@ class RepoCodeWorker(Worker):
         print(f"DEBUG: right after enter", flush=True)
         metadata = metadata or {}
         evidence = []
-        evidence.append({"type": "debug", "message": "WORKER EXECUTE STARTED", "goal": goal})
 
         repo_path = (
             metadata.get("repo_path")
@@ -707,6 +706,7 @@ class RepoCodeWorker(Worker):
 
         print(f"DEBUG worker: past git check", flush=True)
         print(f"DEBUG worker: about to print goal debugs", flush=True)
+        explicit_edits = None
         # Debug prints
         print(f"DEBUG worker: goal={goal!r}", flush=True)
         print(f"DEBUG worker: metadata={metadata!r}", flush=True)
