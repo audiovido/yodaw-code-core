@@ -137,6 +137,15 @@ def ensure_authorized(repo_path: str | os.PathLike | None) -> str | None:
     if canonical is None:
         return None
 
+    # Never admit the filesystem root as a mission target, in any
+    # posture. Without configured roots the server is documented as
+    # accepting any *repository* path; `/` is not a repository and a
+    # worktree could otherwise be carved out of the whole disk.
+    if canonical.rstrip(os.sep) in ("", "/"):
+        raise RepoNotAllowed(
+            "the filesystem root is not an authorized repository target"
+        )
+
     roots = authorized_repo_roots()
 
     if roots and not is_within_roots(canonical, roots):

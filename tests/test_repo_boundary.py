@@ -218,6 +218,27 @@ def test_no_roots_configured_imposes_no_bound(monkeypatch, tmp_path):
     assert ensure_authorized(str(tmp_path / "anywhere")) is not None
 
 
+def test_filesystem_root_never_admitted(monkeypatch):
+    """Least privilege: the OS root is not a repository target, always."""
+    monkeypatch.delenv("YODAW_REPO_ROOTS", raising=False)
+
+    for spelling in ("/", "//", "/.", "/./"):
+        with pytest.raises(RepoNotAllowed) as exc:
+            ensure_authorized(spelling)
+        assert "root" in str(exc.value)
+
+
+def test_filesystem_root_refused_even_with_roots(monkeypatch, tmp_path):
+    root = tmp_path / "allowed"
+    root.mkdir()
+    monkeypatch.setenv("YODAW_REPO_ROOTS", str(root))
+
+    with pytest.raises(RepoNotAllowed):
+        ensure_authorized("/")
+
+    assert ensure_authorized(str(root)) is not None
+
+
 def test_roots_allow_inside_and_deny_outside(monkeypatch, tmp_path):
     root = tmp_path / "allowed"
     root.mkdir()
