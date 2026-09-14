@@ -186,6 +186,21 @@ def detect_test_commands(
     return commands
 
 
+def _pytest_zero_actual_tests(output: str) -> bool:
+    """Return True if pytest output indicates zero passed and zero failed tests.
+
+    This catches the case where all tests are skipped (returncode 0)
+    but no actual test assertions ran.
+    """
+    import re
+    # Look for patterns like "N passed", "M failed"
+    passed_match = re.search(r'(\d+)\s+passed', output)
+    failed_match = re.search(r'(\d+)\s+failed', output)
+    passed_count = int(passed_match.group(1)) if passed_match else 0
+    failed_count = int(failed_match.group(1)) if failed_match else 0
+    return passed_count == 0 and failed_count == 0 and ('passed' in output or 'failed' in output)
+
+
 def run_validation(
     worktree,
     evidence: list,
@@ -201,6 +216,7 @@ def run_validation(
       clear diagnostic (never a silent skip).
     - No commands => passed True (no tests to fail).
     - A timed-out or non-zero result is a failure.
+    - If pytest ran but zero passed/failed tests (all skipped), treat as failure.
     """
     results = []
 
@@ -226,6 +242,28 @@ def run_validation(
         item["returncode"] == 0 and not item["timed_out"]
         for item in results
     ) if results else True
+
+    # Additional guard: if any command used pytest and it saw zero
+    # passed/failed tests, treat as failure (all-skipped suite).
+    if passed:
+        for i, cmd in enumerate(test_commands):
+            if isinstance(cmd, (list, tuple)):
+                cmd_str = " ".join(cmd)
+            else:
+                cmd_str = str(cmd)
+            if "pytest" in cmd_str:
+                out = results[i].get("stdout", "") + results[i].get("stderr", "")
+                if _pytest_zero_actual_tests(out):
+                    passed = False
+                    # Add evidence that the test suite had zero actual tests
+                    evidence.append(
+                        {
+                            "type": "validation_zero_actual_tests",
+                            "cmd": cmd_str,
+                            "timestamp": now_iso(),
+                        }
+                    )
+                    break
 
     return passed, results
 
