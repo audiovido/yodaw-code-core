@@ -247,6 +247,14 @@ if [ -z "${YODAW_CONFIG:-}" ] && [ -f "$_BOOTSTRAP_CONFIG" ]; then
     export YODAW_CONFIG="$_BOOTSTRAP_CONFIG"
 fi
 
+# The 9Router daemon this install owns runs against an install-private
+# data dir (var/9router). Persist it so re-running `setup-9router`
+# re-provisions THAT daemon instead of silently targeting ~/.9router.
+_BOOTSTRAP_9ROUTER_DATA="$SCRIPT_DIR/../var/9router"
+if [ -z "${DATA_DIR:-}" ] && [ -d "$_BOOTSTRAP_9ROUTER_DATA" ]; then
+    export DATA_DIR="$_BOOTSTRAP_9ROUTER_DATA"
+fi
+
 case "${1:-run}" in
     version)
         "$VENV_PYTHON" -c "
