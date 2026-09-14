@@ -339,6 +339,49 @@ def test_stream_failover_rotates_route(monkeypatch, stream_env):
     )
 
 
+def test_stream_response_closes_on_parser_raise(monkeypatch, stream_env):
+    """_post_stream_text must close the stream deterministically even
+    when the frame parser raises mid-stream (no reliance on GC)."""
+    state = {"exited": False}
+    captured = []
+
+    class ClosingStream(FakeStreamResponse):
+        def __exit__(self, *args):
+            state["exited"] = True
+            return False
+
+    def respond():
+        return ClosingStream(lines=[SSE_DONE])  # parser sees no content
+
+    fake = types.SimpleNamespace()
+    fake.TimeoutException = httpx.TimeoutException
+    fake.ConnectError = httpx.ConnectError
+    fake.HTTPStatusError = httpx.HTTPStatusError
+    fake.StreamError = httpx.StreamError
+
+    def stream(method, url, json=None, headers=None, timeout=None):
+        captured.append(json)
+        return respond()
+
+    fake.stream = stream
+    monkeypatch.setattr(provider_module, "httpx", fake)
+    pop_attempt_log()
+
+    provider = LocalLLMProvider(
+        style="9router",
+        base_url="http://fake",
+        model="r-primary",
+        api_key="key",
+    )
+
+    # Empty body raises LLMError from the accumulator...
+    with pytest.raises(LLMError):
+        provider._ninerouter("system", "user")
+
+    # ...but the response handle was still closed deterministically.
+    assert state["exited"] is True
+
+
 def test_stream_without_support_is_terminal(monkeypatch, stream_env):
     captured = []
     fake = types.SimpleNamespace()

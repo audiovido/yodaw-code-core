@@ -238,6 +238,47 @@ def test_attempt_log_records_route_per_attempt(
     assert attempts[0]["model"] == "route-primary"
 
 
+def test_total_attempts_bounded_by_max_retries(
+    monkeypatch,
+):
+    """Retry amplification ceiling: a permanently dead 9Router with
+    a route chain must stop after exactly max_retries+1 attempts —
+    never one attempt per route times retries."""
+    monkeypatch.setenv("YODAW_PROVIDER_MAX_RETRIES", "2")
+    monkeypatch.setenv("YODAW_PROVIDER_BACKOFF_SECONDS", "0")
+    monkeypatch.setenv("YODAW_LLM_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv(
+        "YODAW_LLM_FALLBACK_MODELS",
+        "route-b,route-c,route-d",
+    )
+
+    captured = []
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        raise httpx.HTTPStatusError(
+            "down",
+            request=request,
+            response=httpx.Response(503, request=request),
+        )
+
+    with pytest.raises(Exception):
+        run_ninerouter_chat(handler, monkeypatch, captured)
+
+    # 3 routes in the chain, max_retries=2 => at most 3 posts total
+    # (attempt 1..3), never 3 routes x 3 retries = 9.
+    assert len(attempts) == 3, f"amplified retries: {len(attempts)}"
+    # The chain must rotate routes, not hammer route-primary blindly.
+    assert [j["model"] for j in captured] == [
+        "route-primary",
+        "route-b",
+        "route-c",
+    ]
+
+    pop_attempt_log()
+
+
 # ----------------------------------------------------------
 # Worker repair on unappliable LLM plans
 # ----------------------------------------------------------
