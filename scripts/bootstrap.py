@@ -15,20 +15,54 @@ import json
 import platform
 import socket
 from pathlib import Path
+from typing import Optional
 
 __version__ = "0.4.0"
 
-def check_python_version():
-    """Check that Python 3.12 is available."""
+def _python_version(candidate: str) -> Optional[str]:
+    """Run `<candidate> --version`; return the version line or None."""
     try:
-        output = subprocess.check_output(["python3.12", "--version"], text=True)
-        if not output.startswith("Python 3.12"):
-            print(f"Error: Python 3.12 required, found: {output.strip()}")
-            return False
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: Python 3.12 not found. Please install Python 3.12.")
-        return False
-    return True
+        output = subprocess.check_output(
+            [candidate, "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    return output.strip() or None
+
+
+def resolve_python312() -> Optional[str]:
+    """Locate a usable Python 3.12 interpreter.
+
+    Prefers the interpreter actually running this installer, then
+    common `python3.12`/`python3` names on PATH. Version output is
+    read from stdout and stderr because CPython builds differ on
+    which stream `--version` uses.
+    """
+    candidates = [sys.executable, "python3.12", "python3", "python"]
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        version = _python_version(candidate)
+        if version and version.startswith("Python 3.12"):
+            return candidate
+    return None
+
+
+def check_python_version():
+    """Check that a Python 3.12 interpreter is available."""
+    found = resolve_python312()
+    if found is not None:
+        return True
+    print(
+        "Error: Python 3.12 required. Install Python 3.12 (or run "
+        "this installer with a Python 3.12 interpreter). "
+        f"Running interpreter reports: {sys.version.split()[0]}"
+    )
+    return False
 
 def check_git():
     """Check that git is available."""
@@ -174,9 +208,18 @@ def copy_source(source_dir, dest_dir, exclude_patterns=None):
             shutil.copy2(item, target)
 
 def create_virtualenv(lib_dir):
-    """Create a virtual environment in the lib directory."""
+    """Create a virtual environment in the lib directory.
+
+    Uses the resolved Python 3.12 interpreter (the running one when it
+    is 3.12, otherwise the first 3.12 found) so the venv always matches
+    the version the dependency check validated.
+    """
     venv_path = lib_dir / ".venv"
-    venv.create(venv_path, with_pip=True)
+    python = resolve_python312() or sys.executable
+    if os.path.abspath(python) == os.path.abspath(sys.executable):
+        venv.create(venv_path, with_pip=True)
+    else:
+        subprocess.check_call([python, "-m", "venv", str(venv_path)])
     return venv_path
 
 def install_dependencies(venv_path, lib_dir):

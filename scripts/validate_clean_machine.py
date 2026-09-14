@@ -85,8 +85,11 @@ def main():
         # Step 3: Run bootstrap/install
         print("\n=== Step 3: Running bootstrap/install ===")
         env = os.environ.copy()
-        # Ensure we use python3.12
-        env["PATH"] = f"/usr/local/opt/python@3.12/bin:{env.get('PATH', '')}"
+        # Prefer a Homebrew python@3.12 when present; never assume a
+        # developer-machine layout exists on the target machine.
+        brew312 = Path("/usr/local/opt/python@3.12/bin")
+        if brew312.is_dir():
+            env["PATH"] = f"{brew312}:{env.get('PATH', '')}"
 
         result = run_command([
             sys.executable, "scripts/bootstrap.py",

@@ -28,6 +28,8 @@ from scripts.bootstrap import (
     check_writable_directory,
     check_port_available,
     perform_dependency_checks,
+    resolve_python312,
+    _python_version,
 )
 
 
@@ -37,6 +39,62 @@ def test_check_python_version():
     # We can't easily test the failure case without mocking
     result = check_python_version()
     assert result is True, "Should detect Python 3.12+"
+
+
+def test_resolve_python312_prefers_running_interpreter(monkeypatch):
+    """A running 3.12 interpreter passes even with no python3.12 on PATH."""
+    import scripts.bootstrap as bootstrap
+
+    monkeypatch.setattr(sys, "executable", "/fake/bin/python312")
+    monkeypatch.setattr(
+        bootstrap,
+        "_python_version",
+        lambda cand: "Python 3.12.14" if cand == "/fake/bin/python312" else None,
+    )
+    assert bootstrap.resolve_python312() == "/fake/bin/python312"
+    assert bootstrap.check_python_version() is True
+
+
+def test_resolve_python312_falls_back_to_python3_12_name(monkeypatch):
+    import scripts.bootstrap as bootstrap
+
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3.9")
+    monkeypatch.setattr(
+        bootstrap,
+        "_python_version",
+        lambda cand: (
+            "Python 3.12.14" if cand == "python3.12" else
+            "Python 3.9.6" if cand == "python3" else None
+        ),
+    )
+    assert bootstrap.resolve_python312() == "python3.12"
+
+
+def test_check_python_version_false_when_only_old_interpreter(monkeypatch):
+    import scripts.bootstrap as bootstrap
+
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3.9")
+    monkeypatch.setattr(
+        bootstrap,
+        "_python_version",
+        lambda cand: "Python 3.9.6",
+    )
+    assert bootstrap.check_python_version() is False
+
+
+def test_python_version_reads_merged_stderr(monkeypatch):
+    """Version output must be captured even when CPython writes to stderr."""
+    import scripts.bootstrap as bootstrap
+
+    captured = {}
+
+    def fake_check_output(cmd, text=False, stderr=None):
+        captured["stderr"] = stderr
+        return "Python 3.12.14\n"
+
+    monkeypatch.setattr(bootstrap.subprocess, "check_output", fake_check_output)
+    assert bootstrap._python_version("python3.12") == "Python 3.12.14"
+    assert captured["stderr"] == subprocess.STDOUT
 
 
 def test_check_git():
