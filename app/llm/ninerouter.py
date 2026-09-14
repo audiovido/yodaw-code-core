@@ -858,30 +858,60 @@ def delete_gateway_key(
     )
 
 
+CHAT_VALIDATION_MAX_TOKENS = 1
+
+
 def validate_gateway_key(
     api_key: str,
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = ADMIN_TIMEOUT_SECONDS,
+    model: Optional[str] = None,
 ) -> bool:
-    """True when the Bearer key can read the model inventory.
+    """True when the Bearer key authenticates against the gateway.
 
-    401/403 mean missing/invalid/revoked (rotation warranted); any
-    other outcome is inconclusive and is treated as valid so a
-    transient inventory error cannot trigger a key rotation.
+    Shipping 9Router enforces ``requireApiKey`` on chat completions
+    (401 for missing/unknown/revoked keys) while leaving the model
+    inventory open, so the cheapest trustworthy proof is a
+    max_tokens=1 chat. When no model is wired yet the proof is
+    inconclusive and the key is treated as valid - a missing route
+    must never trigger credential rotation.
+
+    Only 401/403 means invalid; every other outcome (5xx, timeout,
+    empty inventory) returns True so transient faults never mint
+    replacement keys.
     """
-    if not (api_key or "").strip():
+    key = (api_key or "").strip()
+    if not key:
         return False
-    url = f"{normalize_base_url(base_url)}{MODELS_PATH}"
+    root = normalize_base_url(base_url)
+
+    chosen = (model or "").strip()
+    if not chosen or chosen == "auto":
+        try:
+            listing = list_models(root, key, timeout=timeout)
+            inventory = listing["combos"] + listing["models"]
+            chosen = inventory[0] if inventory else ""
+        except NinerouterError:
+            return True  # inconclusive: do not rotate
+    if not chosen:
+        return True  # no route to prove against: do not rotate
+
+    url = f"{root}{CHAT_PATH}"
+    payload = {
+        "model": chosen,
+        "max_tokens": CHAT_VALIDATION_MAX_TOKENS,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
     try:
-        response = httpx.get(
-            url, headers=_auth_headers(api_key), timeout=timeout
+        response = httpx.post(
+            url,
+            json=payload,
+            headers=_auth_headers(key),
+            timeout=timeout,
         )
     except Exception:
         return True
-    status = getattr(response, "status_code", 200)
-    if status in (401, 403):
-        return False
-    return status < 500
+    return getattr(response, "status_code", 200) not in (401, 403)
 
 
 def provision_gateway_key(

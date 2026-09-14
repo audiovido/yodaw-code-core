@@ -1172,10 +1172,8 @@ def _admin_fake_httpx(state):
 
     def get(url, headers, timeout):
         if url.endswith("/v1/models"):
-            if headers.get("Authorization") == f"Bearer {state['valid_key']}":
-                return _response({"data": []})
             return _response(
-                {"error": "invalid api key"}, status=401, url=url
+                {"data": [{"id": "local/smollm2-135m"}]}
             )
         if url.endswith("/api/keys"):
             return _response({"keys": state["keys"]})
@@ -1188,6 +1186,17 @@ def _admin_fake_httpx(state):
         raise AssertionError(f"unexpected GET {url}")
 
     def post(url, body, headers, timeout):
+        if url.endswith("/v1/chat/completions"):
+            auth = headers.get("Authorization")
+            if auth == f"Bearer {state['valid_key']}":
+                return _response(
+                    {"choices": [{"message": {"content": "ok"}}]},
+                    method="POST", url=url,
+                )
+            return _response(
+                {"error": "invalid api key"}, status=401,
+                method="POST", url=url,
+            )
         if url.endswith("/api/keys"):
             record = {
                 "id": f"key-{len(state['keys'])}",
@@ -1282,12 +1291,30 @@ def test_provision_gateway_key_rotates_only_when_rejected(monkeypatch):
 def test_validate_gateway_key_401_only_failure(monkeypatch):
     nr = ninerouter_module
     assert nr.validate_gateway_key("") is False
-    monkeypatch.setattr(
-        nr,
-        "httpx",
-        FakeHttpx(get=lambda u, h, t: _response({}, status=401, url=u)),
-    )
+
+    def http_401(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return _response(
+                {"data": [{"id": "m/one"}]}, url=url
+            )
+        return _response(
+            {"error": {"message": "invalid"}}, status=401,
+            method="POST", url=url,
+        )
+
+    def http_200(url, headers=None, timeout=None):
+        if url.endswith("/v1/models"):
+            return _response({"data": [{"id": "m/one"}]}, url=url)
+        return _response(
+            {"choices": [{"message": {"content": "ok"}}]},
+            method="POST", url=url,
+        )
+
+    monkeypatch.setattr(nr, "httpx", FakeHttpx(get=http_401, post=lambda u, j, h, t: http_401(u, h, t)))
     assert nr.validate_gateway_key("sk-x") is False
+    monkeypatch.setattr(nr, "httpx", FakeHttpx(get=http_200, post=lambda u, j, h, t: http_200(u, h, t)))
+    assert nr.validate_gateway_key("sk-x") is True
+    # Empty inventory -> inconclusive -> valid (never rotate).
     monkeypatch.setattr(
         nr,
         "httpx",
@@ -1298,7 +1325,11 @@ def test_validate_gateway_key_401_only_failure(monkeypatch):
     def boom(*a, **k):
         raise httpx.ConnectError("network down")
 
-    monkeypatch.setattr(nr, "httpx", FakeHttpx(get=boom))
+    monkeypatch.setattr(
+        nr,
+        "httpx",
+        FakeHttpx(get=lambda u, h, t: _response({"data": [{"id": "m/one"}]}, url=u), post=boom),
+    )
     assert nr.validate_gateway_key("sk-x") is True
 
 
