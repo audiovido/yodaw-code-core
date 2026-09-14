@@ -30,6 +30,10 @@ from app.learning.retrieval import (
     format_lessons,
     retrieve_relevant_learnings,
 )
+from app.intelligence.context_builder import RepoContextBuilder
+from app.intelligence.debug_engine import DebugSession, generate_hypotheses, format_debug_context
+from app.intelligence.review_engine import verify_edit_content, build_review_context, ModelReviewer
+from app.intelligence.quality_gate import assess_quality
 from app.llm.provider import pop_attempt_log
 
 # Edit engine is the single source of truth for every file mutation.
@@ -858,6 +862,45 @@ class RepoCodeWorker(Worker):
                     mission_id=mission_id,
                 )
 
+            # Elite intelligence: profile the repo, classify the task,
+            # and build progressive context once per mission. Failure
+            # degrades to the legacy flat-dump path, never breaks the
+            # mission.
+            intelligence = None
+            try:
+                builder = RepoContextBuilder()
+                context_build = builder.build(goal, worktree)
+                intelligence = {
+                    "strategy": (
+                        context_build.strategy.to_dict()
+                        if context_build.strategy
+                        else None
+                    ),
+                    "sections": context_build.sections,
+                }
+                evidence.append(
+                    {
+                        "type": "intelligence_context",
+                        "profile": context_build.profile,
+                        "ranked_files": context_build.ranked_files,
+                        "strategy": intelligence["strategy"],
+                        "included_files": context_build.included_files,
+                        "excluded_count": context_build.excluded_count,
+                        "timestamp": now_iso(),
+                    }
+                )
+            except Exception as exc:
+                evidence.append(
+                    {
+                        "type": "intelligence_context_error",
+                        "error": str(exc)[:300],
+                        "timestamp": now_iso(),
+                    }
+                )
+                intelligence = None
+
+            debug_session = None
+
             attempt = 0
             previous_plan = None
             repair_error = None
@@ -880,6 +923,7 @@ class RepoCodeWorker(Worker):
                                 goal,
                                 worktree,
                                 lessons=lessons,
+                                intelligence=intelligence,
                             )
 
                         except Exception as exc:
@@ -1100,6 +1144,33 @@ class RepoCodeWorker(Worker):
 
                             break
 
+                        # Seed/refresh the hypothesis-driven debug session
+                        # with the same failure evidence the repair plan
+                        # receives. Advisory only; never breaks repair.
+                        try:
+                            snippet = (
+                                failure_diff_text[:4000]
+                                + "\n"
+                                + "\n".join(
+                                    str(r.get("stderr", ""))[:2000]
+                                    for r in (failure_test_results or [])
+                                )
+                            )
+                            if debug_session is None:
+                                debug_session = DebugSession(
+                                    goal=goal,
+                                    failure_snippet=snippet[:6000],
+                                    hypotheses=generate_hypotheses(
+                                        snippet, goal
+                                    ),
+                                )
+                            if intelligence is not None:
+                                intelligence["debug"] = format_debug_context(
+                                    debug_session
+                                )
+                        except Exception:
+                            pass
+
                         repair_plan = generate_repair_plan(
                             goal,
                             worktree,
@@ -1112,6 +1183,7 @@ class RepoCodeWorker(Worker):
                                 prepare_error=failure_prepare_error,
                             ),
                             lessons=lessons,
+                            intelligence=intelligence,
                         )
 
                     except Exception as exc:
@@ -1581,6 +1653,114 @@ class RepoCodeWorker(Worker):
                 cwd=worktree,
             )
             evidence.append(diff_result)
+
+            # -------------------------------------------------
+            # Adversarial self-review: the reviewer must not be a
+            # rubber stamp. A concrete defect sends the change back
+            # to the repair loop instead of PASS. Hermetic by
+            # default (no model required); a model reviewer is only
+            # used when one is available.
+            # -------------------------------------------------
+            review_findings = []
+            try:
+                reviewed = verify_edit_content(
+                    goal,
+                    (
+                        normalize_edits(previous_plan)
+                        if isinstance(previous_plan, dict)
+                        else []
+                    ),
+                    strategy=intelligence.get("strategy") if intelligence else None,
+                    diff_text=diff_result.get("stdout", ""),
+                    test_success=True,
+                )
+                review_findings.extend(reviewed.findings)
+
+                quality = assess_quality(
+                    diff_result.get("stdout", ""),
+                    task_type=(
+                        (intelligence.get("strategy") or {}).get("task_type", "unknown")
+                        if intelligence
+                        else "unknown"
+                    ),
+                    files_touched=len(touched_files),
+                )
+                if quality.verdict in ("reject", "overbuilt"):
+                    review_findings.extend(
+                        [
+                            {
+                                "category": "quality",
+                                "severity": "blocker"
+                                if quality.verdict == "reject"
+                                else "warning",
+                                "message": i["message"],
+                                "evidence": i.get("evidence", ""),
+                            }
+                            for i in quality.issues
+                            if i["severity"] == "blocker" or quality.verdict == "reject"
+                        ]
+                    )
+                evidence.append(
+                    {
+                        "type": "self_review",
+                        "passed": reviewed.passed,
+                        "summary": reviewed.summary,
+                        "findings": reviewed.to_dict()["findings"],
+                        "quality": quality.to_dict(),
+                        "timestamp": now_iso(),
+                    }
+                )
+            except Exception as exc:
+                evidence.append(
+                    {
+                        "type": "self_review_error",
+                        "error": str(exc)[:300],
+                        "timestamp": now_iso(),
+                    }
+                )
+
+            blockers = [
+                f
+                for f in review_findings
+                if isinstance(f, dict) and f.get("severity") == "blocker"
+            ]
+
+            if blockers:
+                # A concrete defect found by the reviewer: the
+                # mission fails closed with the findings surfaced
+                # as evidence. Retryable so an orchestrator may
+                # re-run; nothing is committed. This preserves the
+                # repair budget for real repair planning while
+                # guaranteeing no fake PASS.
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
+                return _terminal_result(
+                    success=False,
+                    output={
+                        "goal": goal,
+                        "repo": str(repo),
+                        "worktree": str(worktree),
+                        "branch": branch_name,
+                        "base_sha": base_sha,
+                        "review_blocked": True,
+                    },
+                    evidence=evidence,
+                    error={
+                        "type": "ReviewBlocked",
+                        "message": "; ".join(
+                            str(f.get("message", ""))
+                            for f in blockers[:5]
+                        ),
+                        "findings": blockers[:10],
+                    },
+                    retryable=True,
+                )
 
             add_result = run(
                 ["git", "add", "--", *touched_files],

@@ -409,6 +409,7 @@ def generate_edit_plan(
     lessons: str = "",
     cancel_check=None,
     parse_retries=None,
+    intelligence=None,
 ) -> dict:
 
     if cancel_check:
@@ -437,7 +438,7 @@ def generate_edit_plan(
 CODING GOAL:
 
 {goal}
-
+{format_intelligence(intelligence)}
 REUSE ANALYSIS:
 
 {json.dumps(reuse_report, indent=2)}
@@ -447,6 +448,8 @@ REPOSITORY CONTENT:
 {context}
 {lessons}
 Before proposing new code, check the reuse analysis.
+Follow the TASK STRATEGY and LANGUAGE/FRAMEWORK guidance above
+exactly: they describe this repository, not generic assumptions.
 
 Priority:
 1. existing project code
@@ -474,6 +477,7 @@ def generate_repair_plan(
     lessons: str = "",
     cancel_check=None,
     parse_retries=None,
+    intelligence=None,
 ) -> dict:
 
     if cancel_check:
@@ -507,6 +511,9 @@ applied to the files above):
             "The previous attempt failed validation. Diagnose the "
             "failure from the test output and the diff, then return "
             "the smallest safe JSON corrective plan.\n\n"
+            "Use the DEBUGGING SESSION when present: rank the "
+            "hypotheses, test the cheapest, adjust, and do not "
+            "repeat an eliminated hypothesis.\n\n"
             "Do NOT repeat the same broken plan."
         )
 
@@ -514,7 +521,7 @@ applied to the files above):
 CODING GOAL:
 
 {goal}
-
+{format_intelligence(intelligence)}
 PREVIOUS PLAN THAT FAILED VALIDATION:
 
 {json.dumps(previous_plan or {}, indent=2)}
@@ -540,3 +547,44 @@ REPOSITORY CONTENT:
         user_prompt,
         parse_retries=parse_retries,
     )
+
+
+def format_intelligence(intelligence) -> str:
+    """Render the intelligence block for a prompt, safely.
+
+    `intelligence` is a dict produced by the elite intelligence
+    layer (context builder + strategy + debug session + review).
+    Absence or failure degrades to an empty string so the legacy
+    prompt path is byte-identical.
+    """
+    if not intelligence:
+        return ""
+
+    if isinstance(intelligence, str):
+        return intelligence
+
+    blocks = []
+
+    strategy = intelligence.get("strategy")
+    if strategy:
+        blocks.append(strategy)
+
+    sections = intelligence.get("sections")
+    if isinstance(sections, dict):
+        for title, body in sections.items():
+            if body:
+                blocks.append(body)
+
+    debug = intelligence.get("debug")
+    if debug:
+        blocks.append(debug)
+
+    review = intelligence.get("review")
+    if review:
+        blocks.append(review)
+
+    if not blocks:
+        return ""
+
+    return "\n\nINTELLIGENCE CONTEXT (machine-built, this repo specifically):\n\n" + \
+        "\n\n".join(b for b in blocks if b)
