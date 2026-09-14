@@ -107,6 +107,11 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _running_in_virtualenv() -> bool:
+    """True when the current interpreter is an activated venv/conda env."""
+    return bool(getattr(sys, "prefix", None) and sys.prefix != getattr(sys, "base_prefix", sys.prefix))
+
+
 def resolve_python() -> str:
     """Interpreter used for the launcher daemon and the runtime service."""
     env = os.environ.get("YODAW_PYTHON", "").strip()
@@ -115,6 +120,13 @@ def resolve_python() -> str:
     venv = REPO_ROOT / ".venv" / "bin" / "python"
     if venv.exists():
         return str(venv)
+    # When YODAW itself runs from a virtualenv, child processes must
+    # inherit that interpreter even if a different, dependency-less
+    # python3 sits earlier on PATH. A stock system interpreter (e.g.
+    # macOS python3.9) is deliberately NOT preferred here, so the
+    # explicit python3.12 lookup below still wins for non-venv users.
+    if _running_in_virtualenv() and sys.executable:
+        return sys.executable
     for name in ("python3.12", "python3"):
         found = shutil.which(name)
         if found:
