@@ -32,7 +32,13 @@ from app.learning.retrieval import (
 )
 from app.intelligence.context_builder import RepoContextBuilder
 from app.intelligence.debug_engine import DebugSession, generate_hypotheses, format_debug_context
-from app.intelligence.review_engine import verify_edit_content, build_review_context, ModelReviewer
+from app.intelligence.review_engine import (
+    ReviewFinding,
+    ReviewVerdict,
+    verify_edit_content,
+    build_review_context,
+    ModelReviewer,
+)
 from app.intelligence.quality_gate import assess_quality
 from app.llm.provider import pop_attempt_log
 
@@ -592,6 +598,38 @@ def _terminal_result(
         error=error,
         retryable=retryable,
     )
+
+
+def _finding_severity(f) -> Optional[str]:
+    """Severity of a review finding, typed ReviewFinding or legacy dict."""
+    if isinstance(f, ReviewFinding):
+        return f.severity
+    if isinstance(f, dict):
+        return f.get("severity")
+    return None
+
+
+def _finding_message(f) -> str:
+    if isinstance(f, ReviewFinding):
+        return f.message
+    if isinstance(f, dict):
+        return str(f.get("message", ""))
+    return str(f)
+
+
+def _finding_to_dict(f) -> dict:
+    """JSON-safe shape for evidence/error payloads."""
+    if isinstance(f, ReviewFinding):
+        return {
+            "category": f.category,
+            "severity": f.severity,
+            "message": f.message,
+            "evidence": f.evidence,
+            "file": f.file,
+        }
+    if isinstance(f, dict):
+        return f
+    return {"category": "unknown", "severity": "warning", "message": str(f)}
 
 
 class RepoCodeWorker(Worker):
@@ -1686,6 +1724,7 @@ class RepoCodeWorker(Worker):
             # used when one is available.
             # -------------------------------------------------
             review_findings = []
+            reviewed = None
             try:
                 reviewed = verify_edit_content(
                     goal,
@@ -1742,12 +1781,31 @@ class RepoCodeWorker(Worker):
                         "timestamp": now_iso(),
                     }
                 )
+                # Fail closed: a review that could not complete must
+                # not become a PASS. Route through the blocker path
+                # below so nothing is committed.
+                review_findings.append(
+                    ReviewFinding(
+                        "review",
+                        "blocker",
+                        f"self-review failed to complete: {str(exc)[:200]}",
+                    )
+                )
 
             blockers = [
-                f
-                for f in review_findings
-                if isinstance(f, dict) and f.get("severity") == "blocker"
+                f for f in review_findings if _finding_severity(f) == "blocker"
             ]
+
+            if not blockers and isinstance(reviewed, ReviewVerdict) and not reviewed.passed:
+                # Defense in depth: a verdict that did not pass must
+                # never slide through with an empty blocker list.
+                blockers = list(reviewed.blockers()) or [
+                    ReviewFinding(
+                        "review",
+                        "blocker",
+                        f"review verdict reported failed with no blocker: {reviewed.summary[:200]}",
+                    )
+                ]
 
             if blockers:
                 # A concrete defect found by the reviewer: the
@@ -1778,10 +1836,9 @@ class RepoCodeWorker(Worker):
                     error={
                         "type": "ReviewBlocked",
                         "message": "; ".join(
-                            str(f.get("message", ""))
-                            for f in blockers[:5]
+                            _finding_message(f) for f in blockers[:5]
                         ),
-                        "findings": blockers[:10],
+                        "findings": [_finding_to_dict(f) for f in blockers[:10]],
                     },
                     retryable=True,
                 )
