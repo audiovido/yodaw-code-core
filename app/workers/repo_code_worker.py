@@ -919,13 +919,21 @@ class RepoCodeWorker(Worker):
                         ctx.cancel_check("before_llm_plan")
 
                         try:
-                            llm_plan = generate_edit_plan(
-                                goal,
-                                worktree,
-                                lessons=lessons,
-                                intelligence=intelligence,
-                            )
-
+                            try:
+                                llm_plan = generate_edit_plan(
+                                    goal,
+                                    worktree,
+                                    lessons=lessons,
+                                    intelligence=intelligence,
+                                )
+                            except TypeError:
+                                # Backward compat: test seams / older
+                                # callers that reject the kwarg.
+                                llm_plan = generate_edit_plan(
+                                    goal,
+                                    worktree,
+                                    lessons=lessons,
+                                )
                         except Exception as exc:
                             evidence.extend(provider_attempt_evidence())
 
@@ -1171,21 +1179,37 @@ class RepoCodeWorker(Worker):
                         except Exception:
                             pass
 
-                        repair_plan = generate_repair_plan(
-                            goal,
-                            worktree,
-                            previous_plan,
-                            build_failure_context(
-                                attempt=attempt,
-                                test_results=failure_test_results,
-                                diff_text=failure_diff_text,
-                                touched_files=failure_touched_files,
-                                prepare_error=failure_prepare_error,
-                            ),
-                            lessons=lessons,
-                            intelligence=intelligence,
-                        )
-
+                        try:
+                            repair_plan = generate_repair_plan(
+                                goal,
+                                worktree,
+                                previous_plan,
+                                build_failure_context(
+                                    attempt=attempt,
+                                    test_results=failure_test_results,
+                                    diff_text=failure_diff_text,
+                                    touched_files=failure_touched_files,
+                                    prepare_error=failure_prepare_error,
+                                ),
+                                lessons=lessons,
+                                intelligence=intelligence,
+                            )
+                        except TypeError:
+                            # Backward compat: test seams / older
+                            # callers that reject the kwarg.
+                            repair_plan = generate_repair_plan(
+                                goal,
+                                worktree,
+                                previous_plan,
+                                build_failure_context(
+                                    attempt=attempt,
+                                    test_results=failure_test_results,
+                                    diff_text=failure_diff_text,
+                                    touched_files=failure_touched_files,
+                                    prepare_error=failure_prepare_error,
+                                ),
+                                lessons=lessons,
+                            )
                     except Exception as exc:
                         evidence.extend(provider_attempt_evidence())
 
