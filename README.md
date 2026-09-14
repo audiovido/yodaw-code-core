@@ -86,23 +86,44 @@ level = "INFO"
 Environment variables always win over the file (`YODAW_LLM_PROVIDER`,
 `YODAW_LLM_MODE`, `YODAW_LLM_MODEL`, `YODAW_LLM_BASE_URL`,
 `YODAW_LLM_API_KEY`, `YODAW_LLM_API_KEY_ENV`, `YODAW_PROFILE`,
-`YODAW_HOST`, `YODAW_PORT`, `YODAW_LOG_LEVEL`). Keys live in
-environment variables only — the file names the variable, and neither
-the file nor logs ever contain the secret.
+`YODAW_HOST`, `YODAW_PORT`, `YODAW_LOG_LEVEL`). Upstream provider
+keys live in environment variables only — the TOML names the
+variable (`api_key_env`) and never the secret. The sole on-disk
+secret is the LOCAL 9Router gateway key, written by zero-touch
+provisioning to an owner-only file (`api_key_file`, mode 0600 in a
+0700 directory); neither the config file nor logs ever contain it.
 
-### 9Router (native)
+### 9Router (native, zero-touch)
 
 9Router is a local AI router (40+ backend providers behind one
-OpenAI-compatible endpoint). Zero-touch setup — no manual env exports
-for provider/model/endpoint:
+OpenAI-compatible endpoint). One command performs the entire local
+lifecycle — install the package if missing, start the daemon,
+provision and persist the LOCAL gateway API key, discover models,
+and register any local OpenAI-compatible servers:
 
 ```bash
-npm install -g 9router
-9router                                    # dashboard: http://127.0.0.1:20128
-export NINEROUTER_API_KEY='<dashboard key>'
-yodaw setup-9router                        # probe, detect model, persist, verify
-yodaw models                               # combos + models + default
+yodaw setup-9router
+yodaw models          # combos + models + detected default
+
+# point a local llama.cpp/vLLM server at 9router (repeatable):
+yodaw setup-9router \
+  --register-local "Local Gemma3:gemma:http://127.0.0.1:8090/v1"
 ```
+
+There is no manual key copy/paste: the key is a **local gateway**
+credential (distinct from upstream provider credentials), minted via
+9Router's local admin protocol and stored in an owner-only
+(`0600`) key file inside a `0700` directory; the TOML config only
+references the file (`api_key_file`). An existing valid key is
+always reused — keys are rotated **only** when missing/rejected by
+the local daemon, never to work around upstream quotas or rate
+limits. A running daemon from another install is auto-detected
+(via its data directory) and attached to instead of duplicated.
+
+Flags: `--install/--no-install`, `--data-dir`, `--key-name`,
+`--register-local NAME:PREFIX:BASE_URL` (or comma-separated
+`YODAW_LOCAL_SERVERS`), `--model`, `--no-verify`, `--json`.
+Bootstrap performs this automatically (`--skip-9router` opts out).
 
 Details, fallback chains, SQLite repair, and the human acceptance
 checklist: `docs/ninerouter_acceptance.md`. Automated evidence:
