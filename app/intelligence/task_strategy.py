@@ -351,6 +351,7 @@ class StrategySelection:
             "verification_strategy": self.verification_strategy,
             "confidence": self.confidence,
             "evidence": self.evidence,
+            "min_repair_budget": self.strategy.min_repair_budget,
         }
 
 

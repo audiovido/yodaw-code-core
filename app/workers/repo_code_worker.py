@@ -944,6 +944,20 @@ class RepoCodeWorker(Worker):
             repair_error = None
             failure_prepare_error = None
 
+            # Enforce the detected task strategy's repair floor: a
+            # concurrency bug needs at least min_repair_budget
+            # corrective attempts even if the caller set a lower
+            # max_retries via metadata.
+            if intelligence and intelligence.get("strategy"):
+                strategy_budget = intelligence["strategy"].get(
+                    "min_repair_budget"
+                )
+                if (
+                    isinstance(strategy_budget, int)
+                    and strategy_budget > max_retries
+                ):
+                    max_retries = strategy_budget
+
             while True:
                 if attempt > 0:
                     ctx.cancel_check(f"between_attempts_{attempt}")

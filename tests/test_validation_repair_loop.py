@@ -525,3 +525,160 @@ def test_no_repair_when_first_attempt_passes(divide_repo, monkeypatch):
         "--count",
         output["branch"],
     ) == "2"
+
+# ---------------------------------------------------------------
+# E. Elite intelligence enforcement: min_repair_budget from the
+# detected strategy must raise the actual retry budget.
+# ---------------------------------------------------------------
+def test_strategy_min_repair_budget_raises_retry_floor(
+    divide_repo,
+    monkeypatch,
+):
+    """A detected strategy with min_repair_budget=3 must override the
+    caller's max_retries=1: two failing attempts then a passing
+    repair succeed instead of exhausting at the first repair."""
+    baseline = git(divide_repo, "rev-parse", "HEAD")
+
+    # First attempt and first repair intentionally fail.
+    plans = [
+        ("initial", BROKEN_DIVIDE_PLAN),
+        ("repair", BROKEN_DIVIDE_PLAN),
+        ("repair", GOOD_REPAIR_PLAN),
+    ]
+
+    calls, prompts = make_llm(monkeypatch, plans)
+
+    class FakeStrategy:
+        def to_dict(self):
+            return {
+                "task_type": "CONCURRENCY_BUG",
+                "analysis_depth": "deep",
+                "required_capabilities": [],
+                "optional_capabilities": [],
+                "risk_areas": [],
+                "verification_strategy": "stress/race repro + full suite",
+                "confidence": 0.9,
+                "evidence": {},
+                "min_repair_budget": 3,
+            }
+
+    class FakeContextBuild:
+        profile = {}
+        ranked_files = []
+        strategy = FakeStrategy()
+        language_guidance = ""
+        included_files = []
+        excluded_count = 0
+        sections = {}
+
+    class FakeRepoContextBuilder:
+        def build(self, goal, worktree):
+            return FakeContextBuild()
+
+    monkeypatch.setattr(
+        worker_module,
+        "RepoContextBuilder",
+        FakeRepoContextBuilder,
+    )
+
+    result = RepoCodeWorker().execute(
+        "Fix the race condition in the shared counter.",
+        {
+            "repo_path": str(divide_repo),
+            "max_retries": 1,
+        },
+    )
+
+    assert result["success"] is True, result
+
+    output = result["output"]
+    assert output["tests_passed"] is True
+    assert output["retries"] == 2
+    assert output["attempts"] == 3
+
+    # The strategy floor (3) was enforced: with the caller's
+    # max_retries=1 this mission would have exhausted after the
+    # first failed repair.
+    strategies = [
+        item.get("strategy", {}).get("min_repair_budget")
+        for item in result["evidence"]
+        if isinstance(item, dict)
+        and item.get("type") == "intelligence_context"
+    ]
+    assert strategies and strategies[0] == 3
+
+    branch = output["branch"]
+    assert git(divide_repo, "rev-list", "--count", branch) == "2"
+
+    final_code = git(
+        divide_repo,
+        "show",
+        f"{branch}:calculator.py",
+    )
+    assert "a // b" not in final_code
+    assert git(divide_repo, "rev-parse", "HEAD") == baseline
+
+
+def test_strategy_min_repair_budget_below_caller_retries(
+    divide_repo,
+    monkeypatch,
+):
+    """The strategy floor must never shrink the caller's explicit
+    retry budget: caller max_retries=5 with min_repair_budget=2 keeps
+    all 5 retries."""
+    good_initial_plan = {
+        "action": "edit",
+        "edits": [
+            {
+                "target_file": "calculator.py",
+                "find": "return a / b",
+                "replace": "return a / b if b != 0 else 0",
+            }
+        ],
+        "reason": "guard zero division",
+    }
+
+    monkeypatch.setattr(
+        worker_module,
+        "generate_edit_plan",
+        lambda goal, worktree, lessons="": good_initial_plan,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "generate_repair_plan",
+        lambda *a, **k: GOOD_REPAIR_PLAN,
+    )
+
+    class FakeStrategy:
+        def to_dict(self):
+            return {"min_repair_budget": 2}
+
+    class FakeContextBuild:
+        profile = {}
+        ranked_files = []
+        strategy = FakeStrategy()
+        language_guidance = ""
+        included_files = []
+        excluded_count = 0
+        sections = {}
+
+    class FakeRepoContextBuilder:
+        def build(self, goal, worktree):
+            return FakeContextBuild()
+
+    monkeypatch.setattr(
+        worker_module,
+        "RepoContextBuilder",
+        FakeRepoContextBuilder,
+    )
+
+    result = RepoCodeWorker().execute(
+        "Fix the divide function.",
+        {
+            "repo_path": str(divide_repo),
+            "max_retries": 5,
+        },
+    )
+
+    assert result["success"] is True, result
+    assert result["output"]["retries"] == 0
