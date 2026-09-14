@@ -119,7 +119,7 @@ def main():
         print("\n=== Step 5: Starting entrypoint ===")
         # Start YODAW in background
         yodaw_process = subprocess.Popen(
-            [str(yodaw_bin)],
+            [str(yodaw_bin), "serve"],
             cwd=install_dir / "lib" / "yodaw",
             env=env,
             stdout=subprocess.PIPE,
