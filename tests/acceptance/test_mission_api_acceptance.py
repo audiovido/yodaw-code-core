@@ -5,10 +5,12 @@ POST -> QUEUED, poll GET -> terminal state, evidence/events endpoints.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.main import app
-from tests.helpers import poll_mission
+from tests.helpers import poll_mission, make_smoke_repo, smoke_mission_payload
 
 client = TestClient(app)
 
@@ -31,11 +33,12 @@ def test_workers_advertise_code_capability():
     assert "code" in caps
 
 
-def test_code_mission_passes_with_evidence():
-    response = client.post(
-        "/api/v1/missions",
-        json={"goal": "Prove YODAW Code Core execution works", "capability": "code"},
-    )
+def test_code_mission_passes_with_evidence(tmp_path):
+    repo = make_smoke_repo(Path(tmp_path))
+    payload = smoke_mission_payload("Prove YODAW Code Core execution works")
+    payload["repo_path"] = repo
+
+    response = client.post("/api/v1/missions", json=payload)
     assert response.status_code == 200
     queued = response.json()
     assert queued["status"] == "QUEUED"

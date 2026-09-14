@@ -5,13 +5,14 @@ events, and the async API contract.
 
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import app
-from tests.helpers import poll_mission
+from tests.helpers import poll_mission, make_smoke_repo, smoke_mission_payload
 
 
 @pytest.fixture()
@@ -57,7 +58,7 @@ def test_invalid_key_rejected(auth_client):
     assert response.status_code == 401
 
 
-def test_valid_key_accepted_and_health_open(auth_client):
+def test_valid_key_accepted_and_health_open(auth_client, tmp_path):
     key, client = auth_client
 
     health = client.get("/api/v1/health")
@@ -67,11 +68,11 @@ def test_valid_key_accepted_and_health_open(auth_client):
 
     headers = {"Authorization": f"Bearer {key}"}
 
-    response = client.post(
-        "/api/v1/missions",
-        json={"goal": f"authed {uuid.uuid4().hex}", "capability": "code"},
-        headers=headers,
-    )
+    repo = make_smoke_repo(Path(tmp_path))
+    payload = smoke_mission_payload(f"authed {uuid.uuid4().hex}")
+    payload["repo_path"] = repo
+
+    response = client.post("/api/v1/missions", json=payload, headers=headers)
 
     assert response.status_code == 200
     assert response.json()["status"] == "QUEUED"
