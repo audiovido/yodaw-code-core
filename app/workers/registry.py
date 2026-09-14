@@ -1,5 +1,6 @@
 from app.workers.code_worker import CodeWorker
 from app.workers.repo_code_worker import RepoCodeWorker
+from app.workers.build_debug_worker import BuildDebugWorker
 
 
 class WorkerRegistry:
@@ -7,6 +8,7 @@ class WorkerRegistry:
         self.workers = [
             CodeWorker(),
             RepoCodeWorker(),
+            BuildDebugWorker(),
         ]
 
     def find(self, capability: str):
