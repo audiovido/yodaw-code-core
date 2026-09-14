@@ -1,6 +1,7 @@
 """
 Tests for YODAW bootstrap functionality.
 """
+import json
 import os
 import sys
 import tempfile
@@ -180,6 +181,18 @@ def test_create_wrapper_script(tmp_path):
     assert "#!/usr/bin/env bash" in content
     assert "VENV_PYTHON" in content
     assert "-m app.runtime" in content
+    # Management/mission commands must reach the product CLI, not
+    # silently launch the API server.
+    assert "-m app.cli.main" in content
+    assert "setup-9router" in content
+    # serve/start still launch the runtime service
+    serve_case = content.split("serve|server|start)")[1].split(";;")[0]
+    assert "-m app.runtime" in serve_case
+    default_case = content.rsplit("*)", 1)[1].split(";;")[0]
+    assert "-m app.cli.main" in default_case
+    assert "-m app.runtime" not in default_case
+    # A bootstrap-provisioned config is exported for all commands.
+    assert "YODAW_CONFIG" in content
 
 
 def test_create_uninstall_script(tmp_path):
@@ -299,3 +312,78 @@ if __name__ == "__main__":
     test_bootstrap_script_help()
     test_bootstrap_check_deps_only(tmp_path)
     print("All tests passed!")
+
+def test_provision_9router_success(tmp_path):
+    from scripts.bootstrap import provision_9router
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = json.dumps(
+            {
+                "ok": True,
+                "model": "gemma/gemma3-270m",
+                "config": str(tmp_path / "config.toml"),
+                "provisioning": {
+                    "daemon": {"started": True, "pid": 42},
+                    "gateway_key": {"status": "created"},
+                    "local_servers": [],
+                },
+            }
+        )
+        stderr = ""
+
+    captured = {}
+
+    def fake_runner(cmd, cwd=None, env=None, capture_output=True,
+                   text=True, timeout=900):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return FakeCompleted()
+
+    ok, summary, error = provision_9router(
+        tmp_path / ".venv" / "bin" / "python",
+        tmp_path / "lib" / "yodaw",
+        data_dir=tmp_path / "var" / "9router",
+        config_path=tmp_path / "var" / "yodaw" / "config.toml",
+        local_servers=["Local:local:http://127.0.0.1:8089/v1"],
+        runner=fake_runner,
+    )
+    assert ok is True and error == ""
+    assert summary["model"] == "gemma/gemma3-270m"
+    assert captured["env"]["DATA_DIR"] == str(tmp_path / "var" / "9router")
+    assert captured["env"]["YODAW_LOCAL_SERVERS"] == (
+        "Local:local:http://127.0.0.1:8089/v1"
+    )
+    assert "--no-verify" in captured["cmd"] and "--json" in captured["cmd"]
+
+
+def test_provision_9router_failure_surfaces_error(tmp_path):
+    from scripts.bootstrap import provision_9router
+
+    class FakeCompleted:
+        returncode = 1
+        stdout = json.dumps({"ok": False, "error": "npm install -g 9router"})
+        stderr = ""
+
+    ok, summary, error = provision_9router(
+        tmp_path / "py", tmp_path,
+        data_dir=tmp_path / "d", config_path=tmp_path / "c.toml",
+        runner=lambda *a, **k: FakeCompleted(),
+    )
+    assert ok is False
+    assert "npm install -g 9router" in error
+
+
+def test_provision_9router_missing_interpreter(tmp_path):
+    from scripts.bootstrap import provision_9router
+
+    def boom(*a, **k):
+        raise FileNotFoundError("no python")
+
+    ok, summary, error = provision_9router(
+        tmp_path / "py", tmp_path,
+        data_dir=tmp_path / "d", config_path=tmp_path / "c.toml",
+        runner=boom,
+    )
+    assert ok is False
+    assert "interpreter not found" in error

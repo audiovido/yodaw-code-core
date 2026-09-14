@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import time
 
-from app.core.models import Mission
+from app.core.models import Mission, MissionStatus
 from app.storage.db import connect
 from app.storage.sqlite_store import MissionStore, _migrate
 
@@ -279,3 +279,43 @@ def test_concurrent_readers_and_writers_under_wal(tmp_path):
         f"expected {EXPECTED_MISSIONS} claimed, got {len(claimed)}"
     )
     assert len(set(claimed)) == EXPECTED_MISSIONS, "mission double-claimed"
+
+
+def test_no_descriptor_leak_over_many_connections(tmp_path):
+    """
+    Repeated connect()/store cycles must not accumulate open file
+    descriptors. Regression: non-deterministic connection closure
+    previously exhausted descriptors under sustained traffic.
+    """
+    import os
+
+    db_path = tmp_path / "fd.sqlite"
+
+    def fd_count() -> int:
+        try:
+            return len(os.listdir("/dev/fd"))
+        except OSError:
+            return -1
+
+    store = MissionStore(db_path)
+    # Warm the pool: WAL/handles are stable before measurement starts.
+    store.list()
+    baseline = fd_count()
+
+    for i in range(150):
+        mission = Mission(goal=f"fd {i}", capability="repo-code")
+        store.enqueue(mission)
+        claimed = store.claim_next(f"fd-coord")
+        if claimed is not None:
+            claimed.status = MissionStatus.passed
+            store.save(claimed)
+        store.get(mission.id)
+        store.list()
+        store.status_counts()
+
+    # Bounded slack (a handful of transient handles) but no linear
+    # growth: 150 cycles must not accumulate anywhere near 150 fds.
+    assert fd_count() - baseline < 25, (
+        f"file descriptor growth over 150 store cycles: "
+        f"{baseline} -> {fd_count()}"
+    )

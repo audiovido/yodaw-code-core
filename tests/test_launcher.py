@@ -15,6 +15,7 @@ of stray processes after shutdown.
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -120,12 +121,51 @@ class Harness:
         return r
 
     def listeners_on_port(self) -> list:
-        r = subprocess.run(
-            ["lsof", "-iTCP:" + str(self.port), "-sTCP:LISTEN", "-t"],
-            capture_output=True,
-            text=True,
-        )
-        return [ln for ln in r.stdout.split() if ln.isdigit()]
+        # Prefer lsof when present; on minimal Linux images fall
+        # back to /proc/net/tcp + /proc/<pid>/fd socket-inode mapping
+        # so the suite does not hard-require an optional package.
+        if shutil.which("lsof"):
+            r = subprocess.run(
+                ["lsof", "-iTCP:" + str(self.port), "-sTCP:LISTEN", "-t"],
+                capture_output=True,
+                text=True,
+            )
+            return sorted({ln for ln in r.stdout.split() if ln.isdigit()})
+        if sys.platform.startswith("linux"):
+            return sorted(self._listeners_via_proc(self.port))
+        pytest.skip("listener enumeration needs lsof or Linux /proc")
+
+    @staticmethod
+    def _listeners_via_proc(port: int) -> set:
+        inodes: set[str] = set()
+        port_hex = f"{port:04X}"
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(table) as handle:
+                    for line in handle.readlines()[1:]:
+                        fields = line.split()
+                        # state 0A = LISTEN; local address ends :PORT
+                        if len(fields) > 9 and fields[3] == "0A" and fields[1].endswith(":" + port_hex):
+                            inodes.add(fields[9])
+            except OSError:
+                continue
+        if not inodes:
+            return set()
+        pids: set = set()
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                for fd in os.listdir(fd_dir):
+                    try:
+                        target = os.readlink(f"{fd_dir}/{fd}")
+                    except OSError:
+                        continue
+                    if target.startswith("socket:[") and target[8:-1] in inodes:
+                        pids.add(pid)
+                        break
+            except OSError:
+                continue
+        return pids
 
     def teardown(self):
         """Best-effort: graceful stop, then hard-kill any leftovers."""
@@ -324,3 +364,34 @@ def test_start_refuses_foreign_service_on_port(harness):
     finally:
         server.shutdown()
         server.server_close()
+
+def test_resolve_python_env_override(monkeypatch, tmp_path):
+    from app import launcher
+
+    custom = str(tmp_path / "python")
+    monkeypatch.setenv("YODAW_PYTHON", custom)
+    assert launcher.resolve_python() == custom
+
+
+def test_resolve_python_prefers_active_venv(monkeypatch):
+    from app import launcher
+
+    monkeypatch.delenv("YODAW_PYTHON", raising=False)
+    monkeypatch.setattr(launcher, "REPO_ROOT", Path("/no/such/repo"))
+    monkeypatch.setattr(launcher, "_running_in_virtualenv", lambda: True)
+    monkeypatch.setattr(launcher.sys, "executable", "/venv/bin/python", raising=False)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert launcher.resolve_python() == "/venv/bin/python"
+
+
+def test_resolve_python_system_prefers_312(monkeypatch):
+    from app import launcher
+
+    monkeypatch.delenv("YODAW_PYTHON", raising=False)
+    monkeypatch.setattr(launcher, "REPO_ROOT", Path("/no/such/repo"))
+    monkeypatch.setattr(launcher, "_running_in_virtualenv", lambda: False)
+    monkeypatch.setattr(
+        launcher.shutil, "which",
+        lambda name: "/usr/bin/python3.12" if name == "python3.12" else None,
+    )
+    assert launcher.resolve_python() == "/usr/bin/python3.12"

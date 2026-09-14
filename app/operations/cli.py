@@ -14,6 +14,9 @@ Commands (no shell-specific hacks, no manual DB edits):
 - outbox-requeue : return dead-lettered messages to the queue
 - backup         : consistent SQLite online backup
 - status         : runtime/status counters from the store
+- db-check       : SQLite health check (read-only, never mutates)
+- db-repair      : repair SQLite (missing -> create, corrupt ->
+                   backup + recreate; never deletes without --no-backup)
 
 The CLI is intentionally read-only or explicitly destructive
 (only audit-prune mutates history, with --archive recommended).
@@ -147,6 +150,24 @@ def cmd_backup(args) -> int:
     return 0
 
 
+def cmd_db_check(args) -> int:
+    from app.storage.db import check_database
+
+    report = check_database(args.db)
+    print(json.dumps(report, indent=2))
+
+    return 0 if report.get("ok") else 1
+
+
+def cmd_db_repair(args) -> int:
+    from app.storage.db import repair_database
+
+    report = repair_database(args.db, backup=not args.no_backup)
+    print(json.dumps(report, indent=2))
+
+    return 0 if report.get("ok") else 1
+
+
 def cmd_status(args) -> int:
     store, _ = _stores(args)
 
@@ -232,6 +253,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", help="runtime status counters")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("db-check", help="SQLite health check (read-only)")
+    p.set_defaults(func=cmd_db_check)
+
+    p = sub.add_parser(
+        "db-repair",
+        help="repair SQLite (missing -> create, corrupt -> backup + recreate)",
+    )
+    p.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="delete corrupt files instead of backing them up",
+    )
+    p.set_defaults(func=cmd_db_repair)
 
     return parser
 

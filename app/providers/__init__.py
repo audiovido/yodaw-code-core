@@ -13,13 +13,41 @@ OPENAI_COMPATIBLE = "openai_compatible"
 ANTHROPIC_COMPATIBLE = "anthropic_compatible"
 OLLAMA_LOCAL = "ollama_local"
 GENERIC_HTTP = "generic_http"
+NINEROUTER_LOCAL = "ninerouter_local"
 
 KINDS = (
     OPENAI_COMPATIBLE,
     ANTHROPIC_COMPATIBLE,
     OLLAMA_LOCAL,
     GENERIC_HTTP,
+    NINEROUTER_LOCAL,
 )
+
+
+def describe_9router(
+    base_url: str = "http://127.0.0.1:20128",
+    default_model: str = "auto",
+    available: bool = True,
+    auth_configured: bool = False,
+) -> "ProviderDescriptor":
+    """Descriptor for the local 9Router daemon (OpenAI wire format).
+
+    9Router routes across its own providers with automatic fallback,
+    so it presents as one local OpenAI-compatible backend with a
+    high reliability score; ``is_available`` stays True while the
+    daemon is reachable (local backends need no credentials to be
+    *listed*, even though chat may still require the dashboard key).
+    """
+    return ProviderDescriptor(
+        name="9router",
+        kind=NINEROUTER_LOCAL,
+        base_url=base_url,
+        default_model=default_model,
+        local=True,
+        available=available,
+        auth_configured=auth_configured,
+        reliability=0.95,
+    )
 
 
 @dataclass

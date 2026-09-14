@@ -6,19 +6,22 @@ Worker N routing beyond this is marked PENDING_WORKER_N.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.main import app
-from tests.helpers import poll_mission
+from tests.helpers import poll_mission, make_smoke_repo, smoke_mission_payload
 
 client = TestClient(app)
 
 
-def test_router_dispatches_code_to_code_bud():
-    queued = client.post(
-        "/api/v1/missions",
-        json={"goal": "Router dispatches code", "capability": "code"},
-    ).json()
+def test_router_dispatches_code_to_code_bud(tmp_path):
+    repo = make_smoke_repo(Path(tmp_path))
+    payload = smoke_mission_payload("Router dispatches code")
+    payload["repo_path"] = repo
+
+    queued = client.post("/api/v1/missions", json=payload).json()
     assert queued["status"] == "QUEUED"
     mission = poll_mission(client, queued["id"], timeout=60.0)
     assert mission["worker"] == "code-bud"

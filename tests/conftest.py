@@ -10,7 +10,9 @@ imported, so:
 - each pytest session starts with a clean mission/learning store
 """
 
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 import pytest
@@ -18,6 +20,16 @@ from pathlib import Path
 
 _TMPDIR = tempfile.mkdtemp(prefix="yodaw_test_")
 os.environ["YODAW_DB_PATH"] = str(Path(_TMPDIR) / "test_yodaw.db")
+
+
+def _cleanup_tmpdir() -> None:
+    """Remove the session temp DB directory so repeated pytest runs
+    don't accumulate yodaw_test_* directories (and their SQLite
+    files) in /tmp. Best-effort: Windows/held handles are ignored."""
+    shutil.rmtree(_TMPDIR, ignore_errors=True)
+
+
+atexit.register(_cleanup_tmpdir)
 
 # Session-unique import name for tests.helpers so pytest does not
 # collide with other packages named 'helpers' under --import-mode

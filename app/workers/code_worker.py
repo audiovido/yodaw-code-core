@@ -43,10 +43,12 @@ class CodeWorker:
             # come from actual git/pytest execution.
             return RepoCodeWorker().execute(goal, metadata)
 
-        # No repository target: report only truthful planning/result
-        # data. No repo-derived values or evidence are fabricated.
+        # No repository target: no edit, no validation, no commit
+        # happened, so this must never present as a PASS. The plan
+        # data is returned for transparency, but success is False
+        # (planning must never satisfy a mission).
         return {
-            "success": True,
+            "success": False,
             "output": {
                 "goal": goal,
                 "repo": {
@@ -72,6 +74,12 @@ class CodeWorker:
                     "message": "planning only; no repository target",
                 }
             ],
-            "error": None,
+            "error": {
+                "type": "NoRepositoryTarget",
+                "message": (
+                    "no repository target: planned only, nothing "
+                    "was edited, validated, or committed"
+                ),
+            },
             "retryable": False,
         }

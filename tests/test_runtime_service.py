@@ -112,7 +112,7 @@ def runtime(tmp_path):
         proc.wait(timeout=20)
 
 
-def test_runtime_health_and_mission_roundtrip(runtime):
+def test_runtime_health_and_mission_roundtrip(runtime, tmp_path):
     base, proc, env = runtime
 
     status, body = http_get(f"{base}/api/v1/health")
@@ -121,12 +121,18 @@ def test_runtime_health_and_mission_roundtrip(runtime):
     assert body["status"] == "READY"
     assert body["auth"] == "local-dev"
 
-    # Enqueue a trivial code mission; the embedded coordinator
-    # should execute it asynchronously.
-    status, created = http_post_json(
-        f"{base}/api/v1/missions",
-        {"goal": "runtime roundtrip goal", "capability": "code"},
-    )
+    # Enqueue a real repo mission; the embedded coordinator executes
+    # it asynchronously against the smoke repo (deterministic edits,
+    # no LLM provider required).
+    from pathlib import Path
+
+    from tests.helpers import make_smoke_repo, smoke_mission_payload
+
+    repo = make_smoke_repo(Path(tmp_path))
+    payload = smoke_mission_payload("runtime roundtrip goal")
+    payload["repo_path"] = repo
+
+    status, created = http_post_json(f"{base}/api/v1/missions", payload)
 
     assert status == 200
     assert created["status"] == "QUEUED"

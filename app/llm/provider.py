@@ -33,6 +33,22 @@ def llm_keep_alive() -> str:
     )
 
 
+_STREAM_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def llm_stream_enabled() -> bool:
+    """Whether OpenAI-compatible styles stream SSE responses.
+
+    Streaming keeps slow providers alive through intermediaries
+    (headers arrive with the first token instead of only at
+    completion). Default off: legacy single-shot behavior.
+    """
+    return (
+        os.environ.get("YODAW_LLM_STREAM", "").strip().lower()
+        in _STREAM_TRUTHY
+    )
+
+
 def provider_retry_config() -> tuple[int, float]:
     """
     Stage 8.6 provider resilience configuration.
@@ -116,6 +132,13 @@ def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, httpx.ConnectError):
         return True
 
+    stream_errors = getattr(httpx, "StreamError", ())
+
+    if stream_errors and isinstance(exc, stream_errors):
+        # Mid-stream transport failure: the attempt never ran to
+        # completion, so retrying the whole request is safe.
+        return True
+
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         return status >= 500 or status in (429, 408)
@@ -138,7 +161,20 @@ class LLMError(RuntimeError):
 
 
 ANTHROPIC_API_VERSION = "2023-06-01"
-SUPPORTED_STYLES = ("ollama", "openai", "anthropic")
+SUPPORTED_STYLES = ("ollama", "openai", "anthropic", "9router")
+
+# Aliases accepted for YODAW_LLM_STYLE / YODAW_LLM_PROVIDER.
+STYLE_ALIASES = {
+    "ninerouter": "9router",
+    "nine_router": "9router",
+    "9_router": "9router",
+}
+
+
+def normalize_style(style: str) -> str:
+    """Lowercase + alias-resolve a provider style label."""
+    text = (style or "").strip().lower()
+    return STYLE_ALIASES.get(text, text)
 
 
 def _normalize_base_url(url: str) -> str:
@@ -150,19 +186,193 @@ MODEL_DEFAULTS = {
     "ollama": "qwen2.5-coder:7b",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-sonnet-4-20250514",
+    # "auto" for 9Router means: detect at chat time via GET
+    # /v1/models (combos preferred), cached per base_url.
+    "9router": "auto",
 }
 
 BASE_URL_DEFAULTS = {
     "ollama": "http://127.0.0.1:11434",
     "openai": "https://api.openai.com",
     "anthropic": "https://api.anthropic.com",
+    "9router": "http://127.0.0.1:20128",
 }
 
 API_KEY_ENV_DEFAULTS = {
     "ollama": "",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "9router": "NINEROUTER_API_KEY",
 }
+
+
+def _sibling(style: str) -> "LocalLLMProvider":
+    """Build a fallback provider with that style's own defaults.
+
+    The fallback style inherits no base_url/model/api_key from the
+    primary: each backend resolves its own defaults (explicit
+    YODAW_LLM_BASE_URL/YODAW_LLM_MODEL still apply when they were
+    set for that backend, matching single-provider behavior).
+    """
+    return LocalLLMProvider(style=style)
+
+
+def fallback_styles() -> list[str]:
+    """Ordered fallback styles from YODAW_LLM_FALLBACKS (may be empty).
+
+    Comma-separated style labels, e.g. ``ollama,openai``. Unknown
+    labels are ignored so a typo degrades to fewer fallbacks rather
+    than a crash; the primary style itself is always skipped.
+    """
+    raw = os.environ.get("YODAW_LLM_FALLBACKS", "")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for part in raw.split(","):
+        style = normalize_style(part)
+        if not style or style not in SUPPORTED_STYLES:
+            continue
+        if style in seen:
+            continue
+        seen.add(style)
+        ordered.append(style)
+    return ordered
+
+
+def fallback_models() -> list[str]:
+    """Ordered fallback models from YODAW_LLM_FALLBACK_MODELS.
+
+    Comma-separated model/route ids (for the 9router style these
+    are ``provider/model`` routes, e.g.
+    ``ollama-local/qwen3:0.6b``). Empty entries are dropped and
+    duplicates collapse to first occurrence; the primary model
+    itself is skipped when the chain is built so listing it here
+    is harmless.
+    """
+    raw = os.environ.get("YODAW_LLM_FALLBACK_MODELS", "")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def accumulate_openai_stream(response) -> tuple[str, int]:
+    """Accumulate one OpenAI-style SSE chat stream into text.
+
+    Returns (content, chunk_count). Tolerates ping/comment
+    lines, blank frames, and both ``delta.content`` and
+    ``message.content`` chunk shapes; stops at ``data: [DONE]``.
+    Raises LLMError on a mid-stream error object or when the
+    stream yields no content at all.
+    """
+    parts: list[str] = []
+    chunks = 0
+
+    for raw_line in response.iter_lines():
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = raw_line
+        line = line.strip()
+
+        if not line or line.startswith(":"):
+            continue
+
+        if not line.startswith("data:"):
+            continue
+
+        data = line[5:].strip()
+
+        if data == "[DONE]":
+            break
+
+        try:
+            event = json.loads(data)
+        except ValueError:
+            continue
+
+        if isinstance(event, dict) and event.get("error"):
+            raise LLMError(
+                f"streamed chat error: {event.get('error')}"
+            )
+
+        try:
+            choices = event.get("choices") or []
+            first = choices[0] if choices else {}
+            delta = (
+                first.get("delta") or first.get("message") or {}
+            )
+            piece = delta.get("content") or ""
+        except (AttributeError, IndexError, TypeError):
+            continue
+
+        if piece:
+            chunks += 1
+            parts.append(piece)
+
+    content = "".join(parts)
+
+    if not content:
+        raise LLMError("streamed chat response was empty")
+
+    return content, chunks
+
+
+def accumulate_ollama_stream(response) -> tuple[str, int]:
+    """Accumulate one Ollama NDJSON chat stream into text.
+
+    Returns (content, chunk_count). Each line carries
+    ``{"message": {"content": ...}, "done": bool}``; blank and
+    malformed lines are tolerated. Raises LLMError on a
+    mid-stream error object or when the stream yields no
+    content at all.
+    """
+    parts: list[str] = []
+    chunks = 0
+
+    for raw_line in response.iter_lines():
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", "replace")
+        else:
+            line = raw_line
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+
+        if isinstance(event, dict) and event.get("error"):
+            raise LLMError(
+                f"streamed Ollama error: {event.get('error')}"
+            )
+
+        try:
+            message = event.get("message") or {}
+            piece = message.get("content") or ""
+        except (AttributeError, TypeError):
+            continue
+
+        if piece:
+            chunks += 1
+            parts.append(piece)
+
+        if isinstance(event, dict) and event.get("done"):
+            break
+
+    content = "".join(parts)
+
+    if not content:
+        raise LLMError("streamed Ollama response was empty")
+
+    return content, chunks
 
 
 class LocalLLMProvider:
@@ -170,18 +380,37 @@ class LocalLLMProvider:
     Generic local LLM adapter.
 
     Supports:
-      - Ollama native /api/chat
+      - Ollama native /api/chat (streaming optional too)
       - OpenAI-compatible /v1/chat/completions
       - Anthropic /v1/messages
+      - 9Router OpenAI-compatible /v1/chat/completions
+        (streaming optional via YODAW_LLM_STREAM)
 
     Configuration:
-      YODAW_LLM_STYLE=ollama|openai|anthropic
+      YODAW_LLM_STYLE=ollama|openai|anthropic|9router
       YODAW_LLM_BASE_URL=<base-url>
       YODAW_LLM_MODEL=<model-name>
       YODAW_LLM_API_KEY=<optional>
+      YODAW_LLM_FALLBACKS=<comma-separated styles, optional>
+      YODAW_LLM_FALLBACK_MODELS=<comma-separated 9router
+        routes, optional; each retryable failure fails over to
+        the next route instead of hammering one dead route>
+      YODAW_LLM_STREAM=1|true (optional; stream SSE for the
+        openai/9router styles instead of single-shot)
+
+    Explicit constructor arguments override the environment (used by
+    the fallback chain to build sibling providers with per-style
+    defaults); ``LocalLLMProvider()`` keeps the legacy behavior of
+    reading everything from the environment.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        style: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
         try:
             from app.product_config import apply_product_config
 
@@ -189,36 +418,52 @@ class LocalLLMProvider:
         except Exception:
             pass
 
-        self.style = (
+        env_style = normalize_style(
             os.environ.get("YODAW_LLM_STYLE")
             or os.environ.get("YODAW_LLM_PROVIDER")
             or "ollama"
-        ).lower()
+        )
+        self.style = normalize_style(style) if style else env_style
+
+        # A fallback sibling (explicit style differing from the
+        # environment's) resolves its OWN defaults: the primary's
+        # base_url/model must never leak into another backend.
+        foreign = bool(style) and self.style != env_style
 
         default_base = BASE_URL_DEFAULTS.get(
             self.style, "http://127.0.0.1:11434"
         )
-        self.base_url = _normalize_base_url(
-            os.environ.get(
-                "YODAW_LLM_BASE_URL",
-                default_base,
-            )
-        )
+        if base_url:
+            raw_base = base_url
+        elif foreign:
+            raw_base = default_base
+        else:
+            raw_base = os.environ.get("YODAW_LLM_BASE_URL", default_base)
+        self.base_url = _normalize_base_url(raw_base)
 
-        model = os.environ.get("YODAW_LLM_MODEL", "").strip()
-        if not model or model == "auto":
-            model = MODEL_DEFAULTS.get(self.style, "qwen2.5-coder:7b")
-        self.model = model
+        if model is not None:
+            wanted = model
+        elif foreign:
+            wanted = ""
+        else:
+            wanted = os.environ.get("YODAW_LLM_MODEL", "").strip()
+        wanted = (wanted or "").strip()
+        if not wanted or wanted == "auto":
+            wanted = MODEL_DEFAULTS.get(self.style, "qwen2.5-coder:7b")
+        self.model = wanted
 
         api_key_env = (
             os.environ.get("YODAW_LLM_API_KEY_ENV")
             or API_KEY_ENV_DEFAULTS.get(self.style, "")
         )
-        self.api_key = (
-            os.environ.get("YODAW_LLM_API_KEY")
-            or (os.environ.get(api_key_env) if api_key_env else "")
-            or ""
-        )
+        if api_key is not None:
+            self.api_key = api_key
+        else:
+            self.api_key = (
+                os.environ.get("YODAW_LLM_API_KEY")
+                or (os.environ.get(api_key_env) if api_key_env else "")
+                or ""
+            )
 
     def health(self):
         return {
@@ -227,18 +472,77 @@ class LocalLLMProvider:
             "model": self.model,
         }
 
+    def available_models(self) -> dict:
+        """List models/combos for 9Router-style providers.
+
+        Only the 9Router style supports inventory today; other
+        styles raise LLMError.
+        """
+        if self.style != "9router":
+            raise LLMError(
+                f"model inventory is only supported for the 9router "
+                f"style (current style: {self.style})"
+            )
+
+        from app.llm import ninerouter
+
+        try:
+            return ninerouter.list_models(self.base_url, self.api_key)
+        except ninerouter.NinerouterError as exc:
+            raise LLMError(str(exc)) from exc
+
     def chat(self, system: str, user: str) -> str:
-        if self.style == "ollama":
+        """Chat with the primary style, then YODAW_LLM_FALLBACKS.
+
+        Without YODAW_LLM_FALLBACKS this is exactly one attempt
+        against the configured style (legacy behavior). With
+        fallbacks, each style is tried once in order; every hop is
+        recorded in the attempt log for evidence.
+        """
+        chain = [self.style]
+        for style in fallback_styles():
+            if style != self.style and style not in chain:
+                chain.append(style)
+
+        if len(chain) == 1:
+            return self._chat_with_style(self.style, system, user)
+
+        last_error: Optional[LLMError] = None
+        for index, style in enumerate(chain):
+            provider = (
+                self if style == self.style else _sibling(style)
+            )
+            try:
+                return provider._chat_with_style(style, system, user)
+            except LLMError as exc:
+                last_error = exc
+                if index < len(chain) - 1:
+                    _log_attempt(
+                        {
+                            "provider_fallback": True,
+                            "from": style,
+                            "to": chain[index + 1],
+                            "error": str(exc)[:300],
+                        }
+                    )
+        assert last_error is not None
+        raise last_error
+
+    def _chat_with_style(self, style: str, system: str, user: str) -> str:
+        if style == "ollama":
             return self._ollama(system, user)
 
-        if self.style == "openai":
+        if style == "openai":
             return self._openai(system, user)
 
-        if self.style == "anthropic":
+        if style == "anthropic":
             return self._anthropic(system, user)
 
+        if style == "9router":
+            return self._ninerouter(system, user)
+
         raise LLMError(
-            f"Unsupported YODAW_LLM_STYLE: {self.style} "
+            f"Unsupported YODAW_LLM_STYLE: {style} "
             f"(supported: {', '.join(SUPPORTED_STYLES)})"
         )
 
@@ -247,25 +551,77 @@ class LocalLLMProvider:
         url: str,
         payload: dict,
         headers: Optional[dict] = None,
-    ) -> dict:
+        payloads: Optional[list[dict]] = None,
+        stream: bool = False,
+        stream_parser=None,
+    ) -> dict | str:
         """
         Stage 8.6: bounded retries with exponential backoff and
         jitter for transient provider faults. Every attempt is
         logged for evidence; classification decides retryability.
+
+        Failover: when ``payloads`` (a per-attempt model chain)
+        is given, attempt N uses
+        ``payloads[min(N - 1, len(payloads) - 1)]`` so each
+        retryable failure fails over to the next route instead
+        of hammering one dead route. Without ``payloads`` every
+        attempt posts ``payload`` (legacy behavior).
+
+        Streaming: when ``stream`` is true each attempt posts
+        with ``stream: true`` and the accumulated text is
+        returned instead of the decoded JSON body. Retries,
+        backoff, failover, and evidence behave identically.
+        ``stream_parser`` selects the frame accumulator
+        (OpenAI SSE by default, Ollama NDJSON for that style).
         """
         max_retries, base_backoff = provider_retry_config()
+        sequence = payloads if payloads else [payload]
 
         attempt = 0
+        previous_model: Optional[str] = None
 
         while True:
             attempt += 1
             started = time.monotonic()
+            used = sequence[min(attempt - 1, len(sequence) - 1)]
+            model = (
+                used.get("model") if isinstance(used, dict) else None
+            )
             record = {"provider_attempt": attempt, "url": url}
+            if model:
+                record["model"] = model
+            if previous_model and model and model != previous_model:
+                _log_attempt(
+                    {
+                        "provider_model_fallback": True,
+                        "from": previous_model,
+                        "to": model,
+                        "attempt": attempt,
+                    }
+                )
+            previous_model = model or previous_model
 
             try:
+                if stream:
+                    request_payload = dict(used, stream=True)
+                    parser = stream_parser or accumulate_openai_stream
+                    content, chunk_count = self._post_stream_text(
+                        url, request_payload, headers, parser=parser
+                    )
+
+                    record["status"] = 200
+                    record["stream"] = True
+                    record["stream_chunks"] = chunk_count
+                    record["duration_s"] = round(
+                        time.monotonic() - started, 3
+                    )
+                    _log_attempt(record)
+
+                    return content
+
                 response = httpx.post(
                     url,
-                    json=payload,
+                    json=used,
                     headers=headers,
                     timeout=llm_timeout_seconds(),
                 )
@@ -277,7 +633,15 @@ class LocalLLMProvider:
                 )
                 _log_attempt(record)
 
-                return response.json()
+                # Tolerate proxies that append an SSE keepalive
+                # marker (e.g. shipping 9Router's trailing
+                # "data: [DONE]") to a non-streaming JSON body.
+                try:
+                    return response.json()
+                except ValueError:
+                    from app.llm.ninerouter import lenient_json_loads
+
+                    return lenient_json_loads(response.text)
 
             except Exception as exc:
                 record["error"] = f"{type(exc).__name__}: {exc}"
@@ -304,10 +668,43 @@ class LocalLLMProvider:
                 )
                 time.sleep(delay)
 
+    def _post_stream_text(
+        self,
+        url: str,
+        payload: dict,
+        headers: Optional[dict],
+        parser=accumulate_openai_stream,
+    ) -> tuple[str, int]:
+        """POST a streaming chat request; return (text, chunks).
+
+        Headers arrive with the first token, so slow providers
+        stay alive through intermediaries that time out
+        headerless single-shot responses. Transport failures
+        mid-stream propagate for the retry classifier.
+        """
+        streamer = getattr(httpx, "stream", None)
+
+        if streamer is None:
+            raise LLMError(
+                "streaming requested but this httpx layer has no "
+                "stream support"
+            )
+
+        with streamer(
+            "POST",
+            url,
+            json=payload,
+            headers=headers,
+            timeout=llm_timeout_seconds(),
+        ) as response:
+            response.raise_for_status()
+            return parser(response)
+
     def _ollama(self, system: str, user: str) -> str:
+        stream_enabled = llm_stream_enabled()
         payload = {
             "model": self.model,
-            "stream": False,
+            "stream": stream_enabled,
             "format": "json",
             "keep_alive": llm_keep_alive(),
             "messages": [
@@ -325,7 +722,17 @@ class LocalLLMProvider:
         data = self._chat_with_retry(
             f"{self.base_url}/api/chat",
             payload,
+            stream=stream_enabled,
+            stream_parser=accumulate_ollama_stream,
         )
+
+        if stream_enabled:
+            if not isinstance(data, str):
+                raise LLMError(
+                    "streamed Ollama response malformed: "
+                    "expected text"
+                )
+            return data
 
         try:
             return data["message"]["content"]
@@ -359,11 +766,22 @@ class LocalLLMProvider:
             ],
         }
 
+        stream_enabled = llm_stream_enabled()
+
         data = self._chat_with_retry(
             f"{self.base_url}/v1/chat/completions",
             payload,
             headers=headers,
+            stream=stream_enabled,
         )
+
+        if stream_enabled:
+            if not isinstance(data, str):
+                raise LLMError(
+                    "streamed OpenAI-compatible response "
+                    "malformed: expected text"
+                )
+            return data
 
         try:
             return data["choices"][0]["message"]["content"]
@@ -371,6 +789,55 @@ class LocalLLMProvider:
             raise LLMError(
                 f"OpenAI-compatible response malformed: {exc}"
             ) from exc
+
+    def _ninerouter(self, system: str, user: str) -> str:
+        from app.llm import ninerouter
+
+        model = self.model
+        if not model or model == "auto":
+            try:
+                model = ninerouter.resolve_model(
+                    self.base_url, self.api_key, "auto"
+                )
+            except ninerouter.NinerouterError as exc:
+                raise LLMError(str(exc)) from exc
+
+        # Route failover chain: the primary model first, then each
+        # YODAW_LLM_FALLBACK_MODELS route once. A route that times
+        # out or 5xx-fails is abandoned for the next route on the
+        # following attempt instead of being retried blindly.
+        chain = [model]
+        for name in fallback_models():
+            if name != model and name not in chain:
+                chain.append(name)
+
+        url, payload, headers = ninerouter.build_chat_request(
+            self.base_url, model, system, user, self.api_key
+        )
+        payloads = [dict(payload, model=name) for name in chain]
+
+        stream_enabled = llm_stream_enabled()
+
+        data = self._chat_with_retry(
+            url,
+            payload,
+            headers=headers,
+            payloads=payloads,
+            stream=stream_enabled,
+        )
+
+        if stream_enabled:
+            if not isinstance(data, str):
+                raise LLMError(
+                    "9Router streamed response malformed: "
+                    "expected text"
+                )
+            return data
+
+        try:
+            return ninerouter.parse_chat_response(data)
+        except ninerouter.NinerouterError as exc:
+            raise LLMError(str(exc)) from exc
 
     def _anthropic(self, system: str, user: str) -> str:
         if not self.api_key:

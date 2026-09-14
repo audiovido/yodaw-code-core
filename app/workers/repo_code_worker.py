@@ -21,11 +21,19 @@ from app.workers.worker_errors import (
     MissionTimeout,
     ToolMissingError,
 )
-from app.llm.coder import generate_edit_plan, generate_repair_plan
+from app.llm.coder import (
+    PlanParseError,
+    generate_edit_plan,
+    generate_repair_plan,
+)
 from app.learning.retrieval import (
     format_lessons,
     retrieve_relevant_learnings,
 )
+from app.intelligence.context_builder import RepoContextBuilder
+from app.intelligence.debug_engine import DebugSession, generate_hypotheses, format_debug_context
+from app.intelligence.review_engine import verify_edit_content, build_review_context, ModelReviewer
+from app.intelligence.quality_gate import assess_quality
 from app.llm.provider import pop_attempt_log
 
 # Edit engine is the single source of truth for every file mutation.
@@ -284,13 +292,32 @@ def build_failure_context(
     test_results: list,
     diff_text: str,
     touched_files: list,
+    prepare_error: Optional[dict] = None,
 ) -> dict:
-    return {
+    context = {
         "attempt": attempt,
         "tests": test_results,
         "diff": diff_text,
         "touched_files": touched_files,
     }
+
+    if prepare_error is not None:
+        context["prepare_error"] = prepare_error
+
+    return context
+
+
+# Prepare-time failures that mean the PLAN is wrong (bad text or
+# bad path reference), so an LLM mission may spend retry budget on
+# a corrective plan. Containment/shape violations (path escape,
+# malformed plan) always fail closed with no LLM retry.
+REPAIRABLE_PREPARE_ERRORS = frozenset(
+    {
+        "FindTextMissing",
+        "TargetNotFound",
+        "TargetNotFile",
+    }
+)
 
 
 def collect_learning_lessons(
@@ -835,9 +862,49 @@ class RepoCodeWorker(Worker):
                     mission_id=mission_id,
                 )
 
+            # Elite intelligence: profile the repo, classify the task,
+            # and build progressive context once per mission. Failure
+            # degrades to the legacy flat-dump path, never breaks the
+            # mission.
+            intelligence = None
+            try:
+                builder = RepoContextBuilder()
+                context_build = builder.build(goal, worktree)
+                intelligence = {
+                    "strategy": (
+                        context_build.strategy.to_dict()
+                        if context_build.strategy
+                        else None
+                    ),
+                    "sections": context_build.sections,
+                }
+                evidence.append(
+                    {
+                        "type": "intelligence_context",
+                        "profile": context_build.profile,
+                        "ranked_files": context_build.ranked_files,
+                        "strategy": intelligence["strategy"],
+                        "included_files": context_build.included_files,
+                        "excluded_count": context_build.excluded_count,
+                        "timestamp": now_iso(),
+                    }
+                )
+            except Exception as exc:
+                evidence.append(
+                    {
+                        "type": "intelligence_context_error",
+                        "error": str(exc)[:300],
+                        "timestamp": now_iso(),
+                    }
+                )
+                intelligence = None
+
+            debug_session = None
+
             attempt = 0
             previous_plan = None
             repair_error = None
+            failure_prepare_error = None
 
             while True:
                 if attempt > 0:
@@ -852,12 +919,21 @@ class RepoCodeWorker(Worker):
                         ctx.cancel_check("before_llm_plan")
 
                         try:
-                            llm_plan = generate_edit_plan(
-                                goal,
-                                worktree,
-                                lessons=lessons,
-                            )
-
+                            try:
+                                llm_plan = generate_edit_plan(
+                                    goal,
+                                    worktree,
+                                    lessons=lessons,
+                                    intelligence=intelligence,
+                                )
+                            except TypeError:
+                                # Backward compat: test seams / older
+                                # callers that reject the kwarg.
+                                llm_plan = generate_edit_plan(
+                                    goal,
+                                    worktree,
+                                    lessons=lessons,
+                                )
                         except Exception as exc:
                             evidence.extend(provider_attempt_evidence())
 
@@ -925,6 +1001,50 @@ class RepoCodeWorker(Worker):
                                     },
                                     retryable=False,
                                     terminal="TIMEOUT",
+                                )
+
+                            if isinstance(exc, PlanParseError):
+                                evidence.append(
+                                    {
+                                        "type": "plan_parse_failure",
+                                        "attempt": 0,
+                                        "retry": retries,
+                                        "parse_attempts": exc.attempts,
+                                        "raw_snippet": exc.raw_snippet,
+                                        "error": str(exc)[:500],
+                                        "timestamp": now_iso(),
+                                    }
+                                )
+
+                                cleanup_worktree(
+                                    worktree,
+                                    repo,
+                                    keep_worktree,
+                                    evidence,
+                                    failed=True,
+                                )
+
+                                return _terminal_result(
+                                    success=False,
+                                    output={
+                                        "goal": goal,
+                                        "repo": str(repo),
+                                        "worktree": str(worktree),
+                                        "branch": branch_name,
+                                        "base_sha": base_sha,
+                                        "tests_passed": False,
+                                        "retries": retries,
+                                        "attempts": 1,
+                                    },
+                                    evidence=evidence,
+                                    error={
+                                        "type": "PlanParseError",
+                                        "message": str(exc),
+                                        "attempt": 0,
+                                        "retry": retries,
+                                        "parse_attempts": exc.attempts,
+                                    },
+                                    retryable=True,
                                 )
 
                             cleanup_worktree(
@@ -1032,19 +1152,64 @@ class RepoCodeWorker(Worker):
 
                             break
 
-                        repair_plan = generate_repair_plan(
-                            goal,
-                            worktree,
-                            previous_plan,
-                            build_failure_context(
-                                attempt=attempt,
-                                test_results=failure_test_results,
-                                diff_text=failure_diff_text,
-                                touched_files=failure_touched_files,
-                            ),
-                            lessons=lessons,
-                        )
+                        # Seed/refresh the hypothesis-driven debug session
+                        # with the same failure evidence the repair plan
+                        # receives. Advisory only; never breaks repair.
+                        try:
+                            snippet = (
+                                failure_diff_text[:4000]
+                                + "\n"
+                                + "\n".join(
+                                    str(r.get("stderr", ""))[:2000]
+                                    for r in (failure_test_results or [])
+                                )
+                            )
+                            if debug_session is None:
+                                debug_session = DebugSession(
+                                    goal=goal,
+                                    failure_snippet=snippet[:6000],
+                                    hypotheses=generate_hypotheses(
+                                        snippet, goal
+                                    ),
+                                )
+                            if intelligence is not None:
+                                intelligence["debug"] = format_debug_context(
+                                    debug_session
+                                )
+                        except Exception:
+                            pass
 
+                        try:
+                            repair_plan = generate_repair_plan(
+                                goal,
+                                worktree,
+                                previous_plan,
+                                build_failure_context(
+                                    attempt=attempt,
+                                    test_results=failure_test_results,
+                                    diff_text=failure_diff_text,
+                                    touched_files=failure_touched_files,
+                                    prepare_error=failure_prepare_error,
+                                ),
+                                lessons=lessons,
+                                intelligence=intelligence,
+                            )
+                        except TypeError:
+                            # Backward compat: test seams / older
+                            # callers that reject the kwarg.
+                            repair_plan = generate_repair_plan(
+                                goal,
+                                worktree,
+                                previous_plan,
+                                build_failure_context(
+                                    attempt=attempt,
+                                    test_results=failure_test_results,
+                                    diff_text=failure_diff_text,
+                                    touched_files=failure_touched_files,
+                                    prepare_error=failure_prepare_error,
+                                ),
+                                lessons=lessons,
+                            )
                     except Exception as exc:
                         evidence.extend(provider_attempt_evidence())
 
@@ -1061,12 +1226,34 @@ class RepoCodeWorker(Worker):
                         if isinstance(exc, MissionTimeout):
                             raise
 
+                        if isinstance(exc, PlanParseError):
+                            evidence.append(
+                                {
+                                    "type": "plan_parse_failure",
+                                    "attempt": attempt,
+                                    "retry": retries,
+                                    "parse_attempts": exc.attempts,
+                                    "raw_snippet": exc.raw_snippet,
+                                    "error": str(exc)[:500],
+                                    "timestamp": now_iso(),
+                                }
+                            )
+
                         repair_error = {
-                            "type": "LLMError",
+                            "type": (
+                                "PlanParseError"
+                                if isinstance(exc, PlanParseError)
+                                else "LLMError"
+                            ),
                             "message": str(exc),
                             "attempt": attempt,
                             "retry": retries,
                         }
+
+                        if isinstance(exc, PlanParseError):
+                            repair_error["parse_attempts"] = (
+                                exc.attempts
+                            )
 
                         break
 
@@ -1138,6 +1325,71 @@ class RepoCodeWorker(Worker):
                 )
 
                 if prepare_error is not None:
+                    prepare_type = (
+                        prepare_error.get("error") or {}
+                    ).get("type", "")
+
+                    if (
+                        is_llm_mission
+                        and prepare_type in REPAIRABLE_PREPARE_ERRORS
+                    ):
+                        if retries < max_retries:
+                            # The plan references wrong text or a
+                            # wrong path: nothing was written, so
+                            # feed the application failure back to
+                            # the Coder Brain as a corrective
+                            # attempt instead of failing the
+                            # mission on a near-miss plan.
+                            evidence.append(
+                                {
+                                    "type": "prepare_failure",
+                                    "attempt": attempt,
+                                    "retry": retries,
+                                    "error": prepare_error.get(
+                                        "error"
+                                    ),
+                                    "output": prepare_error.get(
+                                        "output"
+                                    ),
+                                    "timestamp": now_iso(),
+                                }
+                            )
+
+                            failure_test_results = []
+                            failure_diff_text = ""
+                            failure_touched_files = [
+                                edit.get("target_file")
+                                for edit in edits
+                                if isinstance(edit, dict)
+                                and edit.get("target_file")
+                            ]
+                            failure_prepare_error = {
+                                "error": prepare_error.get("error"),
+                                "output": prepare_error.get(
+                                    "output"
+                                ),
+                            }
+
+                            retries += 1
+                            attempt += 1
+
+                            continue
+
+                        repair_error = {
+                            "type": "RetryExhausted",
+                            "message": (
+                                "Plan could not be applied and "
+                                "retry budget is exhausted"
+                            ),
+                            "attempt": attempt,
+                            "retry": retries,
+                            "prepare_error": prepare_error.get(
+                                "error"
+                            ),
+                        }
+
+                        break
+
                     cleanup_worktree(
                         worktree,
                         repo,
@@ -1256,6 +1508,7 @@ class RepoCodeWorker(Worker):
                 failure_test_results = test_results
                 failure_diff_text = diff_result["stdout"]
                 failure_touched_files = touched_files
+                failure_prepare_error = None
 
                 restore_originals(
                     worktree,
@@ -1424,6 +1677,114 @@ class RepoCodeWorker(Worker):
                 cwd=worktree,
             )
             evidence.append(diff_result)
+
+            # -------------------------------------------------
+            # Adversarial self-review: the reviewer must not be a
+            # rubber stamp. A concrete defect sends the change back
+            # to the repair loop instead of PASS. Hermetic by
+            # default (no model required); a model reviewer is only
+            # used when one is available.
+            # -------------------------------------------------
+            review_findings = []
+            try:
+                reviewed = verify_edit_content(
+                    goal,
+                    (
+                        normalize_edits(previous_plan)
+                        if isinstance(previous_plan, dict)
+                        else []
+                    ),
+                    strategy=intelligence.get("strategy") if intelligence else None,
+                    diff_text=diff_result.get("stdout", ""),
+                    test_success=True,
+                )
+                review_findings.extend(reviewed.findings)
+
+                quality = assess_quality(
+                    diff_result.get("stdout", ""),
+                    task_type=(
+                        (intelligence.get("strategy") or {}).get("task_type", "unknown")
+                        if intelligence
+                        else "unknown"
+                    ),
+                    files_touched=len(touched_files),
+                )
+                if quality.verdict in ("reject", "overbuilt"):
+                    review_findings.extend(
+                        [
+                            {
+                                "category": "quality",
+                                "severity": "blocker"
+                                if quality.verdict == "reject"
+                                else "warning",
+                                "message": i["message"],
+                                "evidence": i.get("evidence", ""),
+                            }
+                            for i in quality.issues
+                            if i["severity"] == "blocker" or quality.verdict == "reject"
+                        ]
+                    )
+                evidence.append(
+                    {
+                        "type": "self_review",
+                        "passed": reviewed.passed,
+                        "summary": reviewed.summary,
+                        "findings": reviewed.to_dict()["findings"],
+                        "quality": quality.to_dict(),
+                        "timestamp": now_iso(),
+                    }
+                )
+            except Exception as exc:
+                evidence.append(
+                    {
+                        "type": "self_review_error",
+                        "error": str(exc)[:300],
+                        "timestamp": now_iso(),
+                    }
+                )
+
+            blockers = [
+                f
+                for f in review_findings
+                if isinstance(f, dict) and f.get("severity") == "blocker"
+            ]
+
+            if blockers:
+                # A concrete defect found by the reviewer: the
+                # mission fails closed with the findings surfaced
+                # as evidence. Retryable so an orchestrator may
+                # re-run; nothing is committed. This preserves the
+                # repair budget for real repair planning while
+                # guaranteeing no fake PASS.
+                cleanup_worktree(
+                    worktree,
+                    repo,
+                    keep_worktree,
+                    evidence,
+                    failed=True,
+                )
+
+                return _terminal_result(
+                    success=False,
+                    output={
+                        "goal": goal,
+                        "repo": str(repo),
+                        "worktree": str(worktree),
+                        "branch": branch_name,
+                        "base_sha": base_sha,
+                        "review_blocked": True,
+                    },
+                    evidence=evidence,
+                    error={
+                        "type": "ReviewBlocked",
+                        "message": "; ".join(
+                            str(f.get("message", ""))
+                            for f in blockers[:5]
+                        ),
+                        "findings": blockers[:10],
+                    },
+                    retryable=True,
+                )
 
             add_result = run(
                 ["git", "add", "--", *touched_files],
