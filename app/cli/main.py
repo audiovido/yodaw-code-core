@@ -176,6 +176,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         approval_mode=args.approval_mode,
         approved=approved,
         confirm=None,
+        timeout=args.timeout,
     )
     session.history.append({"role": "user", "text": args.goal})
     session.history.append({"role": "assistant", "text": f"[{result.status}] {result.summary}"[:2000]})
@@ -719,7 +720,7 @@ def _apply_product_config() -> int:
         return EXIT_USAGE
     return EXIT_OK
 
-TASK_COMMANDS = (None, "run", "status", "resume", "sessions")
+TASK_COMMANDS = (None, "run", "status", "resume", "sessions", "setup-9router", "models")
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse argv and dispatch; bare `yodaw` opens the interactive REPL."""

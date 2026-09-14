@@ -821,6 +821,61 @@ def test_setup_9router_json_and_verify(tmp_path, monkeypatch, capsys):
     }
 
 
+def test_setup_9router_reuses_persisted_key_not_home_dir(
+    tmp_path, monkeypatch, capsys
+):
+    """A re-run of setup-9router on a provisioned install must reuse
+    the persisted LOCAL gateway key file (via product config) instead
+    of attempting admin provisioning against ~/.9router."""
+    from app.cli.main import main as cli_main
+
+    # Product config from a previous provisioned install, plus its
+    # owner-only local gateway key file.
+    key = "sk-persisted-key"
+    existing = tmp_path / "secrets" / "9router-api.key"
+    existing.parent.mkdir(parents=True)
+    existing.write_text(key + "\n")
+    os.chmod(existing, 0o600)
+    config = tmp_path / "product-config.toml"
+    config.write_text(
+        (
+            "[llm]\n"
+            'provider = "9router"\n'
+            'mode = "local"\n'
+            'model = "premium-coding"\n'
+            'base_url = "http://127.0.0.1:20128"\n'
+            'api_key_env = "NINEROUTER_API_KEY"\n'
+            f'api_key_file = "{existing}"\n'
+        )
+    )
+    target = str(tmp_path / "config.toml")
+    monkeypatch.setenv("YODAW_CONFIG", str(config))
+    # Drop any ambient key so the config file is the only source.
+    monkeypatch.delenv("YODAW_LLM_API_KEY", raising=False)
+
+    reached = {"admin_attempted": False}
+    _patch_zero_touch(monkeypatch)
+
+    def _fail_if_provisioned(*a, **k):
+        # Reaching the admin provisioning path means the product's
+        # persisted key was silently ignored (defaulting to the
+        # ~/.9router data dir instead of the product's).
+        reached["admin_attempted"] = True
+        raise AssertionError(
+            "setup-9router attempted admin provisioning despite a "
+            "valid persisted LOCAL gateway key file"
+        )
+
+    monkeypatch.setattr(
+        ninerouter_module, "auto_provision", _fail_if_provisioned
+    )
+
+    code = cli_main(["setup-9router", "--path", target, "--no-verify"])
+    assert code == 0, capsys.readouterr().err
+    assert reached["admin_attempted"] is False
+    assert "9Router is ready" in capsys.readouterr().out
+
+
 def test_setup_9router_empty_inventory_with_pin(tmp_path, monkeypatch, capsys):
     from app.cli.main import main as cli_main
 
