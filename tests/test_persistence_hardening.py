@@ -319,3 +319,85 @@ def test_no_descriptor_leak_over_many_connections(tmp_path):
         f"file descriptor growth over 150 store cycles: "
         f"{baseline} -> {fd_count()}"
     )
+
+
+def test_with_block_closes_connection_deterministically(tmp_path):
+    """`with connect(...)` must close on exit, not wait for GC."""
+    import os
+    import gc
+
+    db_path = tmp_path / "close.sqlite"
+
+    def fd_count() -> int:
+        try:
+            return len(os.listdir("/dev/fd"))
+        except OSError:
+            return -1
+
+    with connect(db_path) as db:
+        db.execute("SELECT 1")
+    baseline = fd_count()
+
+    for _ in range(40):
+        with connect(db_path) as db:
+            db.execute("SELECT 1")
+
+    # Deterministic close: nothing leaked from the with-blocks.
+    assert fd_count() - baseline < 10, (
+        f"fd growth from with-blocks: {baseline} -> {fd_count()}"
+    )
+
+
+def test_12_thread_store_stress_does_not_accumulate_handles(tmp_path):
+    """12 threads hammering MissionStore must keep FD count bounded.
+
+    Regression for the audited observation of 78 handles on one DB
+    inode under 12 threads: concurrent store work must release every
+    connection and never grow handles linearly with operations.
+    """
+    import os
+
+    db_path = tmp_path / "stress.sqlite"
+    store = MissionStore(db_path)
+
+    def fd_count() -> int:
+        try:
+            return len(os.listdir("/dev/fd"))
+        except OSError:
+            return -1
+
+    store.list()
+    baseline = fd_count()
+
+    barrier = threading.Barrier(12)
+    errors = []
+
+    def worker(worker_id: int):
+        try:
+            barrier.wait()
+            for i in range(40):
+                mission = Mission(
+                    goal=f"t{worker_id} i{i}", capability="repo-code"
+                )
+                store.enqueue(mission)
+                seen = store.get(mission.id)
+                assert seen is not None
+                store.list()
+                store.status_counts()
+        except Exception as exc:  # pragma: no cover - failure detail
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(n,)) for n in range(12)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+
+    # 12x40 = 480 operation cycles; count must settle near baseline.
+    assert fd_count() - baseline < 30, (
+        f"fd growth under 12-thread stress: {baseline} -> {fd_count()}"
+    )

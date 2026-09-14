@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from app.learning.models import LearningRecord
-from app.storage.db import DB_PATH
+from app.storage.db import DB_PATH, connect
 
 
 class LearningStore:
@@ -10,7 +10,7 @@ class LearningStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS learning_records (
@@ -21,7 +21,7 @@ class LearningStore:
             )
 
     def save(self, record: LearningRecord):
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.execute(
                 """
                 INSERT INTO learning_records(id, payload)
@@ -33,7 +33,7 @@ class LearningStore:
             )
 
     def list(self) -> list[LearningRecord]:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 "SELECT payload FROM learning_records ORDER BY rowid DESC"
             ).fetchall()

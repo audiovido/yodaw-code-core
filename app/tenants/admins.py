@@ -33,6 +33,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from app.storage.db import connect
 
 from app.storage.db import DB_PATH
 
@@ -95,7 +96,7 @@ class AdminStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             _ensure_table(db)
 
     # -----------------------------------------------------
@@ -115,7 +116,7 @@ class AdminStore:
         plaintext = f"yodad_{secrets.token_urlsafe(24)}"
         admin_id = f"ad_{secrets.token_hex(6)}"
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
 
             try:
@@ -153,7 +154,7 @@ class AdminStore:
         """
         plaintext = f"yodad_{secrets.token_urlsafe(24)}"
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             cursor = db.execute(
                 """
                 UPDATE api_admins
@@ -174,7 +175,7 @@ class AdminStore:
         if role not in VALID_ROLES:
             raise ValueError(f"invalid role: {role}")
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             cursor = db.execute(
                 "UPDATE api_admins SET role=? WHERE name=?",
                 (role, name),
@@ -183,7 +184,7 @@ class AdminStore:
             return cursor.rowcount > 0
 
     def set_disabled(self, name: str, disabled: bool) -> bool:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             cursor = db.execute(
                 """
                 UPDATE api_admins
@@ -197,7 +198,7 @@ class AdminStore:
 
     def list_admins(self) -> list[dict]:
         """Admin listing: never includes key hashes."""
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 """
                 SELECT id, name, role, created_at, rotated_at,
@@ -220,7 +221,7 @@ class AdminStore:
         ]
 
     def count_admins(self) -> int:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             return db.execute(
                 "SELECT COUNT(*) FROM api_admins"
             ).fetchone()[0]
@@ -241,7 +242,7 @@ class AdminStore:
 
         digest = hash_key(plaintext_key)
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             row = db.execute(
                 """
                 SELECT id, name, role, disabled_at

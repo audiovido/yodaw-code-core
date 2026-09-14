@@ -30,6 +30,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from app.storage.db import connect
 
 from app.storage.db import DB_PATH
 from app.tenants.redact import redact
@@ -145,7 +146,7 @@ class AuditStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             _ensure_table(db)
 
     # -----------------------------------------------------
@@ -171,7 +172,7 @@ class AuditStore:
         """
         payload = json.dumps(redact(data or {}))
 
-        with self._lock, sqlite3.connect(self.path) as db:
+        with self._lock, connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
 
             row = db.execute(
@@ -274,7 +275,7 @@ class AuditStore:
             [max(1, min(int(limit), 1000)), max(0, int(offset))]
         )
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 f"""
                 SELECT seq, ts, actor, client_id, action, mission_id, data,
@@ -302,7 +303,7 @@ class AuditStore:
         ]
 
     def count(self) -> int:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             return db.execute(
                 "SELECT COUNT(*) FROM audit_events"
             ).fetchone()[0]
@@ -320,7 +321,7 @@ class AuditStore:
         matched its predecessor (the chain is valid up to and
         including it).
         """
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 """
                 SELECT seq, ts, actor, client_id, action, mission_id,
@@ -389,7 +390,7 @@ class AuditStore:
         }
 
     def _anchors(self) -> list[dict]:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 """
                 SELECT up_to_seq, head_hash, pruned_at
@@ -438,7 +439,7 @@ class AuditStore:
             - timedelta(days=int(keep_days))
         ).isoformat()
 
-        with self._lock, sqlite3.connect(self.path) as db:
+        with self._lock, connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
 
             rows = db.execute(

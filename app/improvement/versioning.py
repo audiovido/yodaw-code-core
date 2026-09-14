@@ -17,7 +17,7 @@ from pathlib import Path
 
 from app.improvement.models import ImprovementProposal, ProposalStatus, now_iso
 from app.improvement.store import ProposalStore
-from app.storage.db import DB_PATH
+from app.storage.db import DB_PATH, connect
 
 
 def _ensure_table(db: sqlite3.Connection) -> None:
@@ -76,7 +76,7 @@ class ActivationStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.proposals = proposals or ProposalStore(path=self.path)
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
 
@@ -98,7 +98,7 @@ class ActivationStore:
             )
         actor = (actor or "").strip() or "loop"
 
-        with self._lock, sqlite3.connect(self.path) as db:
+        with self._lock, connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             db.execute("BEGIN IMMEDIATE")
@@ -140,7 +140,7 @@ class ActivationStore:
     ) -> ActivationRecord:
         """Deactivate the current version, restore the previous one."""
         actor = (actor or "").strip() or "loop"
-        with self._lock, sqlite3.connect(self.path) as db:
+        with self._lock, connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             db.execute("BEGIN IMMEDIATE")
@@ -195,7 +195,7 @@ class ActivationStore:
     # --------------------------------------------------
 
     def current(self) -> ActivationRecord | None:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             row = db.execute(
@@ -205,7 +205,7 @@ class ActivationStore:
         return _row_to_record(row) if row else None
 
     def get_version(self, version: int) -> ActivationRecord | None:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             row = db.execute(
@@ -215,7 +215,7 @@ class ActivationStore:
         return _row_to_record(row) if row else None
 
     def history(self, limit: int = 200) -> list[ActivationRecord]:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             rows = db.execute(

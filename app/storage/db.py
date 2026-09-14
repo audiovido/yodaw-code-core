@@ -28,6 +28,26 @@ DB_PATH = Path(os.environ.get("YODAW_DB_PATH", "data/yodaw.db"))
 BUSY_TIMEOUT_MS = 30000
 
 
+class ClosingConnection(sqlite3.Connection):
+    """sqlite3 connection whose ``with`` exit actually closes it.
+
+    The stdlib connection context manager only commits/rolls back; it
+    leaves the handle open until garbage collection, which lets FDs
+    pile up linearly under sustained multi-threaded load. Closing on
+    exit keeps handle count bounded by in-flight operations.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+        return False
+
+
 def connect(path: Union[Path, str] = DB_PATH) -> sqlite3.Connection:
     """Open a hardened SQLite connection."""
     path = Path(path)
@@ -40,7 +60,11 @@ def connect(path: Union[Path, str] = DB_PATH) -> sqlite3.Connection:
         ) from exc
 
     try:
-        db = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
+        db = sqlite3.connect(
+            path,
+            timeout=BUSY_TIMEOUT_MS / 1000,
+            factory=ClosingConnection,
+        )
         db.execute("PRAGMA journal_mode=WAL")
         db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         db.execute("PRAGMA synchronous=NORMAL")

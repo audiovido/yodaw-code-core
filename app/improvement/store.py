@@ -23,7 +23,7 @@ from app.improvement.models import (
     now_iso,
     proposal_id_for,
 )
-from app.storage.db import DB_PATH
+from app.storage.db import DB_PATH, connect
 
 
 def _ensure_table(db: sqlite3.Connection) -> None:
@@ -84,7 +84,7 @@ class ProposalStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
 
@@ -126,7 +126,7 @@ class ProposalStore:
             content_hash=content_hash or title,
         )
         now = now_iso()
-        with self._lock, sqlite3.connect(self.path) as db:
+        with self._lock, connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             db.execute("BEGIN IMMEDIATE")
@@ -179,7 +179,7 @@ class ProposalStore:
         """Persist in-memory mutations (validation evidence, notes)."""
         proposal.touch()
         data = proposal.to_dict()
-        with self._lock, sqlite3.connect(self.path) as db:
+        with self._lock, connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             db.execute(
@@ -265,7 +265,7 @@ class ProposalStore:
     # --------------------------------------------------
 
     def get(self, proposal_id: str) -> ImprovementProposal | None:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             row = db.execute(
@@ -277,7 +277,7 @@ class ProposalStore:
     def find_by_hash(self, content_hash: str) -> ImprovementProposal | None:
         if not content_hash:
             return None
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             row = db.execute(
@@ -304,7 +304,7 @@ class ProposalStore:
             params.append(kind.value if isinstance(kind, ProposalKind) else str(kind))
         where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
         params.extend([max(1, min(int(limit), 1000))])
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.row_factory = sqlite3.Row
             _ensure_table(db)
             rows = db.execute(
@@ -324,6 +324,6 @@ class ProposalStore:
                 "SELECT COUNT(*) FROM improvement_proposals WHERE status=?",
                 [status.value],
             )
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             _ensure_table(db)
             return int(db.execute(query, params).fetchone()[0])

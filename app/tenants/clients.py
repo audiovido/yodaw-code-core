@@ -18,6 +18,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from app.storage.db import connect
 
 from app.storage.db import DB_PATH
 
@@ -116,7 +117,7 @@ class ClientStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             _migrate(db)
 
     # -----------------------------------------------------
@@ -137,7 +138,7 @@ class ClientStore:
         """
         plaintext = f"yodak_{secrets.token_urlsafe(24)}"
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
 
             try:
@@ -171,7 +172,7 @@ class ClientStore:
         }
 
     def set_disabled(self, name: str, disabled: bool) -> bool:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             cursor = db.execute(
                 """
                 UPDATE api_clients
@@ -183,7 +184,7 @@ class ClientStore:
             return cursor.rowcount > 0
 
     def set_priority(self, name: str, priority: int) -> bool:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             cursor = db.execute(
                 """
                 UPDATE api_clients
@@ -201,7 +202,7 @@ class ClientStore:
         if max_concurrent_missions is not None:
             max_concurrent_missions = max(1, int(max_concurrent_missions))
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             cursor = db.execute(
                 """
                 UPDATE api_clients
@@ -214,7 +215,7 @@ class ClientStore:
 
     def list_clients(self) -> list[dict]:
         """Admin listing: never includes key hashes."""
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             rows = db.execute(
                 """
                 SELECT id, name, priority, max_concurrent_missions,
@@ -253,7 +254,7 @@ class ClientStore:
 
         digest = hash_key(plaintext_key)
 
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             row = db.execute(
                 """
                 SELECT id, name, priority, max_concurrent_missions,
@@ -286,7 +287,7 @@ class ClientStore:
         return record
 
     def count_clients(self) -> int:
-        with sqlite3.connect(self.path) as db:
+        with connect(self.path) as db:
             return db.execute(
                 "SELECT COUNT(*) FROM api_clients"
             ).fetchone()[0]

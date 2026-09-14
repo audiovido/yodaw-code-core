@@ -10,6 +10,7 @@ import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+from app.storage.db import connect
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -66,7 +67,7 @@ class EvidenceStore:
 
     def _init_db(self):
         """Initialize database schema."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS evidence (
                     id TEXT PRIMARY KEY,
@@ -98,7 +99,7 @@ class EvidenceStore:
 
     def store(self, record: EvidenceRecord) -> str:
         """Store an evidence record."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.execute("""
                 INSERT INTO evidence (id, skill_id, execution_id, timestamp, success, inputs, outputs, artifacts, metrics, errors, metadata, tags)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -120,7 +121,7 @@ class EvidenceStore:
 
     def get(self, record_id: str) -> Optional[EvidenceRecord]:
         """Get an evidence record by ID."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM evidence WHERE id = ?", (record_id,)).fetchone()
             if row:
@@ -129,7 +130,7 @@ class EvidenceStore:
 
     def get_by_execution(self, execution_id: str) -> list[EvidenceRecord]:
         """Get all evidence for an execution."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM evidence WHERE execution_id = ? ORDER BY timestamp",
@@ -139,7 +140,7 @@ class EvidenceStore:
 
     def get_by_skill(self, skill_id: SkillId, limit: int = 100, offset: int = 0) -> list[EvidenceRecord]:
         """Get evidence for a skill."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM evidence WHERE skill_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
@@ -186,7 +187,7 @@ class EvidenceStore:
 
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 f"SELECT * FROM evidence{where_clause} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
@@ -213,7 +214,7 @@ class EvidenceStore:
 
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             row = conn.execute(
                 f"SELECT COUNT(*) FROM evidence{where_clause}",
                 params
@@ -238,13 +239,13 @@ class EvidenceStore:
 
     def delete(self, record_id: str) -> bool:
         """Delete an evidence record."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             cursor = conn.execute("DELETE FROM evidence WHERE id = ?", (record_id,))
             return cursor.rowcount > 0
 
     def clear(self):
         """Clear all evidence (use with caution)."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.execute("DELETE FROM evidence")
 
 
