@@ -240,6 +240,13 @@ cd "$APP_DIR" || {
     exit 1
 }
 
+# Product configuration persisted by bootstrap's zero-touch
+# 9Router stage (owner-only key file sits beside it).
+_BOOTSTRAP_CONFIG="$SCRIPT_DIR/../var/yodaw/config.toml"
+if [ -z "${YODAW_CONFIG:-}" ] && [ -f "$_BOOTSTRAP_CONFIG" ]; then
+    export YODAW_CONFIG="$_BOOTSTRAP_CONFIG"
+fi
+
 case "${1:-run}" in
     version)
         "$VENV_PYTHON" -c "
@@ -280,12 +287,20 @@ print(json.dumps(doc, indent=2))
         host="${YODAW_HOST:-127.0.0.1}"
         curl -s "http://$host:$port/api/v1/health" || { echo "YODAW: unhealthy (unreachable)" >&2; exit 1; }
         ;;
-    run|serve|start)
+    serve|server|start)
         shift
         exec "$VENV_PYTHON" -m app.runtime "$@"
         ;;
+    run|resume|sessions|config|setup-9router|models)
+        # Product CLI: missions, configuration, and the zero-touch
+        # 9Router lifecycle (provisioning, key, model discovery).
+        exec "$VENV_PYTHON" -m app.cli.main "$@"
+        ;;
     *)
-        exec "$VENV_PYTHON" -m app.runtime "$@"
+        # Unknown words must reach the CLI (which prints usage);
+        # starting an API server on an unrecognized command would
+        # hide typos and break management commands.
+        exec "$VENV_PYTHON" -m app.cli.main "$@"
         ;;
 esac
 '''
@@ -357,6 +372,86 @@ def create_release_artifact(source_dir, version_info, output_dir):
 
     return tarball_path
 
+def provision_9router(
+    python_exe,
+    app_dir,
+    *,
+    data_dir,
+    config_path,
+    local_servers=None,
+    timeout=900,
+    runner=subprocess.run,
+):
+    """Zero-touch 9Router lifecycle stage.
+
+    Invokes the installed YODAW CLI, which (see ``app/cli/main.py``
+    and ``app/llm/ninerouter.py``):
+
+      * installs the official 9Router package if the CLI is missing;
+      * starts the daemon against the install-private DATA_DIR;
+      * provisions the LOCAL gateway API key into an owner-only file;
+      * idempotently registers local OpenAI-compatible servers;
+      * discovers models and persists the [llm] configuration.
+
+    Upstream provider credentials are never involved at this stage.
+    Returns ``(ok, summary_or_none, error_text)`` and never raises
+    for a deterministic provisioning failure (a missing interpreter
+    path is reported the same way).
+    """
+    import json as _json
+
+    cmd = [
+        str(python_exe),
+        "-m",
+        "app.cli.main",
+        "setup-9router",
+        "--path",
+        str(config_path),
+        "--data-dir",
+        str(data_dir),
+        "--no-verify",
+        "--json",
+    ]
+    env = os.environ.copy()
+    env["DATA_DIR"] = str(data_dir)
+    if local_servers:
+        env["YODAW_LOCAL_SERVERS"] = ",".join(local_servers)
+
+    try:
+        completed = runner(
+            cmd,
+            cwd=str(app_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, None, "9Router provisioning timed out"
+    except FileNotFoundError:
+        return False, None, f"interpreter not found: {python_exe}"
+
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    code = getattr(completed, "returncode", 1)
+
+    summary = None
+    try:
+        summary = _json.loads(stdout[stdout.index("{"):])
+    except ValueError:
+        summary = None
+
+    if code != 0 or not (summary or {}).get("ok"):
+        error = ""
+        if isinstance(summary, dict):
+            error = str(summary.get("error") or "")
+        return False, summary, (
+            error or stderr.strip()
+            or f"setup-9router exited with status {code}"
+        )
+    return True, summary, ""
+
+
 def perform_dependency_checks(install_dir):
     """Perform comprehensive dependency and environment checks."""
     system_info = get_system_info()
@@ -413,6 +508,27 @@ def main():
         "--check-deps-only",
         action="store_true",
         help="Only perform dependency checks, don't install"
+    )
+    parser.add_argument(
+        "--skip-9router",
+        action="store_true",
+        help="Skip the zero-touch 9Router install/provisioning stage"
+    )
+    parser.add_argument(
+        "--require-9router",
+        action="store_true",
+        help="Fail the bootstrap if the 9Router stage does not succeed"
+    )
+    parser.add_argument(
+        "--9router-local",
+        action="append",
+        default=[],
+        metavar="NAME:PREFIX:BASE_URL",
+        help=(
+            "Register a local OpenAI-compatible model server with "
+            "9Router (repeatable), e.g. "
+            "'Local llama:local:http://127.0.0.1:8089/v1'"
+        )
     )
     args = parser.parse_args()
 
@@ -541,6 +657,49 @@ def main():
     # Create uninstall script
     create_uninstall_script(bin_dir, args.install_dir)
     print(f"Created uninstall script: {bin_dir / 'yodaw-uninstall'}")
+
+    # Zero-touch 9Router lifecycle (install daemon, start it,
+    # provision the LOCAL gateway key, register local servers,
+    # discover models, persist configuration).
+    if not args.skip_9router:
+        venv_python = venv_path / "bin" / "python"
+        app_dir = lib_dir / "yodaw"
+        router_data = var_dir / "9router"
+        config_path = var_dir / "yodaw" / "config.toml"
+        print("\nProvisioning 9Router (zero-touch)...")
+        ok, summary, error = provision_9router(
+            venv_python,
+            app_dir,
+            data_dir=router_data,
+            config_path=config_path,
+            local_servers=getattr(args, "9router_local", None) or None,
+        )
+        if ok:
+            provisioning = (summary or {}).get("provisioning") or {}
+            daemon = provisioning.get("daemon") or {}
+            gateway = provisioning.get("gateway_key") or {}
+            servers = provisioning.get("local_servers") or []
+            print("  daemon     : " + (
+                "started" if daemon.get("started") else "already running"
+            ))
+            print(f"  gateway key: {gateway.get('status', 'unknown')}")
+            print(f"  model      : {(summary or {}).get('model')}")
+            for server in servers:
+                print(
+                    f"  local route: {server.get('prefix')} -> "
+                    f"{server.get('base_url')}"
+                )
+            print(f"  config     : {config_path}")
+        else:
+            print(f"  warning: 9Router provisioning did not complete: {error}")
+            print(
+                "  rerun later with "
+                f"'{bin_dir / 'yodaw'} setup-9router', or pass "
+                "--skip-9router to bootstrap."
+            )
+            if args.require_9router:
+                print("Error: --require-9router was set.", file=sys.stderr)
+                sys.exit(1)
 
     print("\nBootstrap complete!")
     print(f"To run YODAW: {bin_dir / 'yodaw'}")

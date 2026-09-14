@@ -36,6 +36,7 @@ import shutil
 from typing import Optional
 
 import httpx
+from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "http://127.0.0.1:20128"
 DEFAULT_PORT = 20128
@@ -689,6 +690,10 @@ def start_daemon(
         )
     data_dir = Path(data_dir) if data_dir else default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    # Pre-create the shared admin secret so the daemon we are about
+    # to launch derives the same admin token (the official CLI does
+    # this too); 0600 owner-only.
+    ensure_cli_secret(data_dir)
 
     env = os.environ.copy()
     env["DATA_DIR"] = str(data_dir)
@@ -1122,38 +1127,125 @@ def ensure_provider_connection(
 # End-to-end zero-touch orchestration
 # ------------------------------------------------------------
 
+def _try_admin_token(
+    base_url: str,
+    data_dir: Path,
+    timeout: float = ADMIN_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    """Derive the token for a data dir; return it only if accepted."""
+    # Read-only: never create secret files while probing candidate
+    # data directories (creation happens in start_daemon).
+    token = derive_cli_token(data_dir, create_secret=False)
+    if not token:
+        return None
+    try:
+        list_gateway_keys(base_url, token, timeout=timeout)
+    except NinerouterAdminError:
+        return None
+    return token
+
+
+def discover_running_data_dir(port: int = DEFAULT_PORT) -> Optional[Path]:
+    """Find the DATA_DIR of a running 9Router via /proc (Linux).
+
+    Same-user processes expose command line and environment in
+    ``/proc``; the 9Router launcher (and its next-server child) carry
+    ``DATA_DIR``. Returns None on non-Linux, when nothing matches, or
+    when the process belongs to another user - we must never administer
+    another user's daemon.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().decode(
+                "utf-8", "replace"
+            )
+        except OSError:
+            continue
+        if "9router" not in cmdline:
+            continue
+        try:
+            environ = (entry / "environ").read_bytes().decode(
+                "utf-8", "replace"
+            )
+        except OSError:
+            continue
+        for item in environ.split("\x00"):
+            if item.startswith("DATA_DIR="):
+                value = item[len("DATA_DIR="):].strip()
+                if value and Path(value).is_dir():
+                    return Path(value)
+    return None
+
+
+def _candidate_data_dirs(explicit: Path, port: int) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        path = Path(path)
+        if str(path) not in seen:
+            seen.add(str(path))
+            candidates.append(path)
+
+    add(explicit)
+    env_dir = (os.environ.get("DATA_DIR") or "").strip()
+    add(Path(env_dir) if env_dir else None)
+    add(discover_running_data_dir(port))
+    add(default_data_dir())
+    return candidates
+
+
+def resolve_admin(
+    base_url: str = DEFAULT_BASE_URL,
+    data_dir: Optional[Path] = None,
+    *,
+    timeout: float = ADMIN_TIMEOUT_SECONDS,
+) -> tuple[Path, str]:
+    """Resolve the data dir the live daemon actually uses + valid token.
+
+    Tries the requested dir first, then DATA_DIR, then a same-user
+    /proc discovery, then the default location - so zero-touch
+    installs attach to an already-running daemon instead of minting
+    secrets that daemon does not know.
+    """
+    normalized = normalize_base_url(base_url)
+    try:
+        port = int(urlparse(normalized).port or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        port = DEFAULT_PORT
+    explicit = Path(data_dir) if data_dir else default_data_dir()
+
+    tried: list[str] = []
+    for candidate in _candidate_data_dirs(explicit, port):
+        tried.append(str(candidate))
+        token = _try_admin_token(normalized, candidate, timeout=timeout)
+        if token:
+            return candidate, token
+
+    raise NinerouterAdminError(
+        "no local 9Router data directory authenticated against "
+        f"{normalized}; tried: {', '.join(tried)}. If another 9Router "
+        "install owns that daemon, point YODAW at its data directory "
+        "via --data-dir or the DATA_DIR environment variable."
+    )
+
+
 def admin_token(
     base_url: str = DEFAULT_BASE_URL,
     data_dir: Optional[Path] = None,
     *,
     timeout: float = ADMIN_TIMEOUT_SECONDS,
 ) -> str:
-    """Derive and verify the local admin token.
-
-    Raises NinerouterAdminError when no machine id is derivable or
-    the daemon rejects the token (secret/data-dir mismatch).
-    """
-    data_dir = Path(data_dir) if data_dir else default_data_dir()
-    ensure_cli_secret(data_dir)
-    token = derive_cli_token(data_dir)
-    if not token:
-        raise NinerouterAdminError(
-            f"could not determine a machine id for {data_dir}"
-        )
-    if not token:
-        raise NinerouterAdminError(
-            "could not derive 9Router admin token (missing cli-secret)"
-        )
-    # Verify before callers rely on it: an admin GET must succeed.
-    try:
-        list_gateway_keys(base_url, token, timeout=timeout)
-    except NinerouterAdminError as exc:
-        raise NinerouterAdminError(
-            "9Router rejected the local admin token derived from "
-            f"{data_dir}: {exc}. If another 9Router install owns that "
-            "daemon, point YODAW at its data directory via --data-dir "
-            "or the DATA_DIR environment variable."
-        ) from exc
+    """Verify the local admin token, auto-attaching to a running
+    daemon's data dir when the requested one does not authenticate."""
+    _, token = resolve_admin(base_url, data_dir, timeout=timeout)
     return token
 
 
@@ -1183,9 +1275,6 @@ def auto_provision(
     keys to bypass upstream quotas or rate limits.
     """
     data_dir = Path(data_dir) if data_dir else default_data_dir()
-    # Pre-create the shared secret before starting the daemon so both
-    # sides agree on the first launch (the official CLI does the same).
-    ensure_cli_secret(data_dir)
 
     daemon = {"running": False, "started": False}
     if start:
@@ -1207,7 +1296,9 @@ def auto_provision(
             "reachable and start was disabled"
         )
 
-    token = admin_token(base_url, data_dir)
+    # The live daemon may already run under a different data dir
+    # (e.g. a prior manual install); resolve_admin attaches to it.
+    data_dir, token = resolve_admin(base_url, data_dir)
 
     key_result = provision_gateway_key(
         base_url=base_url,

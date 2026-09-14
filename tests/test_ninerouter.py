@@ -1389,7 +1389,7 @@ def test_auto_provision_full_orchestration(tmp_path, monkeypatch):
     state = _admin_state()
     monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
     monkeypatch.setattr(nr, "daemon_health", lambda *a, **k: True)
-    monkeypatch.setattr(nr, "admin_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(nr, "resolve_admin", lambda b, d=None, **k: (d, "tok"))
 
     data = tmp_path / "9r"
     result = nr.auto_provision(
@@ -1407,8 +1407,9 @@ def test_auto_provision_full_orchestration(tmp_path, monkeypatch):
     assert server["prefix"] == "gemma"
     assert server["node_created"] is True
     assert server["connection_created"] is True
-    # Secret pre-created owner-only even though daemon was "up".
-    assert (data / "auth" / "cli-secret").is_file()
+    # Attaching to an already-healthy daemon must not litter the
+    # requested data dir with a secret it will never use.
+    assert not (data / "auth" / "cli-secret").exists()
 
     # Second run: everything idempotent, no fresh key.
     state["valid_key"] = "sk-fresh-1"
@@ -1433,7 +1434,7 @@ def test_auto_provision_starts_daemon(tmp_path, monkeypatch):
     state = _admin_state()
     monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
     monkeypatch.setattr(nr, "find_cli", lambda: "/usr/local/bin/9router")
-    monkeypatch.setattr(nr, "admin_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(nr, "resolve_admin", lambda b, d=None, **k: (d, "tok"))
     started = {"n": 0}
 
     health = {"up": False}
@@ -1595,3 +1596,75 @@ def test_provider_tolerates_sse_trailer_on_nonstream(monkeypatch):
         api_key="sk-x",
     )
     assert provider.chat("s", "u") == "hi"
+
+
+def test_resolve_admin_attaches_to_running_daemon_dir(
+    tmp_path, monkeypatch
+):
+    nr = ninerouter_module
+    requested = tmp_path / "requested"
+    running = tmp_path / "running-data"
+    running.mkdir()
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    monkeypatch.setattr(
+        nr, "discover_running_data_dir", lambda port=None: running
+    )
+    monkeypatch.setattr(nr, "default_data_dir", lambda: tmp_path / "default")
+
+    def fake_try(base_url, data_dir, timeout=10.0):
+        return "tok" if data_dir == running else None
+
+    monkeypatch.setattr(nr, "_try_admin_token", fake_try)
+    resolved, token = nr.resolve_admin(
+        "http://127.0.0.1:20128", requested
+    )
+    assert resolved == running and token == "tok"
+
+    # Requested dir authenticating always wins, never hijacked.
+    monkeypatch.setattr(
+        nr, "_try_admin_token",
+        lambda b, d, timeout=10.0: "own" if d == requested else None,
+    )
+    resolved, token = nr.resolve_admin(
+        "http://127.0.0.1:20128", requested
+    )
+    assert resolved == requested and token == "own"
+
+
+def test_resolve_admin_no_match_lists_attempts(tmp_path, monkeypatch):
+    nr = ninerouter_module
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    monkeypatch.setattr(nr, "discover_running_data_dir", lambda port=None: None)
+    monkeypatch.setattr(nr, "default_data_dir", lambda: tmp_path / "default")
+    monkeypatch.setattr(nr, "_try_admin_token", lambda *a, **k: None)
+    with pytest.raises(nr.NinerouterAdminError, match="tried:"):
+        nr.resolve_admin("http://127.0.0.1:20128", tmp_path / "req")
+
+
+def test_start_daemon_precreates_secret_and_binds_loopback(
+    tmp_path, monkeypatch
+):
+    nr = ninerouter_module
+    monkeypatch.setattr(nr, "find_cli", lambda: "/usr/local/bin/9router")
+    captured = {}
+
+    class FakeProc:
+        pid = 9911
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(nr.subprocess, "Popen", fake_popen)
+    data = tmp_path / "9r"
+    pid = nr.start_daemon(data_dir=data, port=20131)
+    assert pid == 9911
+    assert "--host" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--host") + 1] == "127.0.0.1"
+    assert captured["env"]["DATA_DIR"] == str(data)
+    import stat
+
+    secret = data / "auth" / "cli-secret"
+    assert secret.is_file()
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
