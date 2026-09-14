@@ -633,7 +633,15 @@ class LocalLLMProvider:
                 )
                 _log_attempt(record)
 
-                return response.json()
+                # Tolerate proxies that append an SSE keepalive
+                # marker (e.g. shipping 9Router's trailing
+                # "data: [DONE]") to a non-streaming JSON body.
+                try:
+                    return response.json()
+                except ValueError:
+                    from app.llm.ninerouter import lenient_json_loads
+
+                    return lenient_json_loads(response.text)
 
             except Exception as exc:
                 record["error"] = f"{type(exc).__name__}: {exc}"

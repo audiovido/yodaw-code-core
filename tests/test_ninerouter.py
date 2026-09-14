@@ -86,11 +86,15 @@ class FakeHttpx:
     ConnectError = httpx.ConnectError
     HTTPStatusError = httpx.HTTPStatusError
 
-    def __init__(self, get=None, post=None):
+    def __init__(self, get=None, post=None, put=None, delete=None):
         self._get = get
         self._post = post
+        self._put = put
+        self._delete = delete
         self.get_calls: list[dict] = []
         self.post_calls: list[dict] = []
+        self.put_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
 
     def get(self, url, headers=None, timeout=None):
         self.get_calls.append(
@@ -110,6 +114,20 @@ class FakeHttpx:
         )
         assert self._post is not None, "unexpected POST"
         return self._post(url, json, headers, timeout)
+
+    def put(self, url, json=None, headers=None, timeout=None):
+        self.put_calls.append(
+            {"url": url, "json": json, "headers": dict(headers or {})}
+        )
+        assert self._put is not None, "unexpected PUT"
+        return self._put(url, json, headers, timeout)
+
+    def delete(self, url, headers=None, timeout=None):
+        self.delete_calls.append(
+            {"url": url, "headers": dict(headers or {})}
+        )
+        assert self._delete is not None, "unexpected DELETE"
+        return self._delete(url, headers, timeout)
 
 
 MODELS_PAYLOAD = {
@@ -711,14 +729,39 @@ def _detection_ok(**overrides):
     return detection
 
 
-def test_setup_9router_zero_touch(tmp_path, monkeypatch, capsys):
-    from app.cli.main import main as cli_main
-
+def _patch_zero_touch(
+    monkeypatch, key="sk-local-zero-touch", local_servers=None
+):
+    """Patch every provisioning seam so the CLI flow stays hermetic."""
     monkeypatch.setattr(
         ninerouter_module,
         "detect_install",
-        lambda base_url, api_key, timeout=10.0: _detection_ok(),
+        lambda base_url, api_key, timeout=10.0: _detection_ok(
+            api_key_set=bool(api_key)
+        ),
     )
+    monkeypatch.setattr(
+        ninerouter_module,
+        "auto_provision",
+        lambda *a, **k: {
+            "base_url": "http://127.0.0.1:20128",
+            "data_dir": str(Path.home() / ".9router"),
+            "daemon": {"running": True, "started": False, "pid": None},
+            "gateway_key": {
+                "id": "key-1",
+                "name": "yodaw-zero-touch",
+                "status": "created",
+                "key": key,
+            },
+            "local_servers": local_servers or [],
+        },
+    )
+
+
+def test_setup_9router_zero_touch(tmp_path, monkeypatch, capsys):
+    from app.cli.main import main as cli_main
+
+    _patch_zero_touch(monkeypatch)
     target = str(tmp_path / "config.toml")
     code = cli_main(
         ["setup-9router", "--path", target, "--no-verify"]
@@ -729,18 +772,23 @@ def test_setup_9router_zero_touch(tmp_path, monkeypatch, capsys):
     assert cfg.model == "premium-coding"
     assert cfg.base_url == "http://127.0.0.1:20128"
     assert cfg.api_key_env == "NINEROUTER_API_KEY"
+    # The LOCAL gateway key lives in a 0600 file, never the TOML.
+    assert cfg.api_key == "sk-local-zero-touch"
+    key_file = Path(cfg.api_key_file)
+    assert key_file.is_file()
+    import stat
+
+    assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
+    assert "sk-local-zero-touch" not in Path(target).read_text()
     out = capsys.readouterr().out
     assert "9Router is ready" in out
+    assert "sk-local-zero-touch" not in out
 
 
 def test_setup_9router_json_and_verify(tmp_path, monkeypatch, capsys):
     from app.cli.main import main as cli_main
 
-    monkeypatch.setattr(
-        ninerouter_module,
-        "detect_install",
-        lambda base_url, api_key, timeout=10.0: _detection_ok(),
-    )
+    _patch_zero_touch(monkeypatch)
 
     class FakeProvider:
         def __init__(self, **kwargs):
@@ -748,6 +796,7 @@ def test_setup_9router_json_and_verify(tmp_path, monkeypatch, capsys):
 
         def chat(self, system, user):
             assert self.kwargs["style"] == "9router"
+            assert self.kwargs["api_key"] == "sk-local-zero-touch"
             return "OK"
 
     monkeypatch.setattr(
@@ -756,10 +805,20 @@ def test_setup_9router_json_and_verify(tmp_path, monkeypatch, capsys):
     target = str(tmp_path / "config.toml")
     code = cli_main(["setup-9router", "--path", target, "--json"])
     assert code == 0
-    payload = json.loads(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    payload = json.loads(out)
     assert payload["ok"] is True
     assert payload["model"] == "premium-coding"
     assert payload["verified"] is True
+    assert payload["key_file"]
+    # Raw key must never reach JSON output.
+    assert "sk-local-zero-touch" not in out
+    gk = payload["provisioning"]["gateway_key"]
+    assert gk == {
+        "id": "key-1",
+        "name": "yodaw-zero-touch",
+        "status": "created",
+    }
 
 
 def test_setup_9router_empty_inventory_with_pin(tmp_path, monkeypatch, capsys):
@@ -782,6 +841,7 @@ def test_setup_9router_empty_inventory_with_pin(tmp_path, monkeypatch, capsys):
             },
         }
 
+    _patch_zero_touch(monkeypatch)
     monkeypatch.setattr(
         ninerouter_module, "detect_install", fake_detect
     )
@@ -823,6 +883,16 @@ def test_setup_9router_unreachable(monkeypatch, capsys):
 
     monkeypatch.setattr(
         ninerouter_module, "detect_install", fake_detect
+    )
+
+    def fake_auto_provision(*a, **k):
+        raise ninerouter_module.NinerouterAdminError(
+            "9Router CLI not found; install with "
+            "`npm install -g 9router`"
+        )
+
+    monkeypatch.setattr(
+        ninerouter_module, "auto_provision", fake_auto_provision
     )
     assert cli_main(["setup-9router", "--no-verify"]) == 1
     err = capsys.readouterr().err
@@ -1006,3 +1076,522 @@ def test_mission_e2e_through_mock_9router(tmp_path, monkeypatch):
     )
     assert evidence.status_code == 200
     assert len(evidence.json()) > 0
+
+
+# ============================================================
+# Zero-touch local provisioning (admin API, key lifecycle,
+# idempotent nodes/connections, full orchestration)
+# ============================================================
+
+def test_cli_secret_created_owner_only(tmp_path):
+    data = tmp_path / "9r"
+    first = ninerouter_module.ensure_cli_secret(data)
+    import stat
+
+    secret = data / "auth" / "cli-secret"
+    assert secret.is_file()
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+    assert stat.S_IMODE((data / "auth").stat().st_mode) == 0o700
+    # Idempotent: same secret, no churn.
+    assert ninerouter_module.ensure_cli_secret(data) == first
+
+
+def test_derive_cli_token(tmp_path, monkeypatch):
+    nr = ninerouter_module
+    data = tmp_path / "9r"
+    # No OS machine id derivable at all -> empty token, never a guess.
+    monkeypatch.setattr(nr, "system_machine_id", lambda: "")
+    assert nr.derive_cli_token(data) == ""
+    (data).mkdir(parents=True, exist_ok=True)
+    (data / "machine-id").write_text("machine-123\n")
+    ninerouter_module.ensure_cli_secret(data)
+    token = ninerouter_module.derive_cli_token(data)
+    import hashlib
+
+    secret = (data / "auth" / "cli-secret").read_text().strip()
+    expected = hashlib.sha256(
+        ("machine-123" + "9r-cli-auth" + secret).encode()
+    ).hexdigest()[:16]
+    assert token == expected
+
+
+def test_derive_token_without_persisted_machine_id(
+    tmp_path, monkeypatch
+):
+    nr = ninerouter_module
+    monkeypatch.setattr(nr, "system_machine_id", lambda: "sysid-hash")
+    data = tmp_path / "9r"  # no machine-id file, like a fresh daemon
+    token = nr.derive_cli_token(data)
+    import hashlib
+
+    secret = (data / "auth" / "cli-secret").read_text().strip()
+    expected = hashlib.sha256(
+        ("sysid-hash" + "9r-cli-auth" + secret).encode()
+    ).hexdigest()[:16]
+    assert token == expected
+    # Persisted file wins once the daemon has written it.
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "machine-id").write_text("file-id")
+    token2 = nr.derive_cli_token(data)
+    expected2 = hashlib.sha256(
+        ("file-id" + "9r-cli-auth" + secret).encode()
+    ).hexdigest()[:16]
+    assert token2 == expected2 and token2 != token
+
+
+def test_admin_request_dispatch_and_errors(monkeypatch):
+    calls = []
+
+    def fake(method, url, **kw):
+        calls.append((method, url, kw.get("json")))
+        if url.endswith("/api/explode"):
+            return _response({"error": "boom"}, status=400, method=method, url=url)
+        return _response({}, method=method, url=url)
+
+    fake_http = FakeHttpx(
+        get=lambda u, h, t: fake("GET", u),
+        post=lambda u, j, h, t: fake("POST", u, json=j),
+        delete=lambda u, h, t: fake("DELETE", u),
+    )
+    monkeypatch.setattr(ninerouter_module, "httpx", fake_http)
+    nr = ninerouter_module
+    nr._admin_request("POST", "/api/keys", nr.DEFAULT_BASE_URL, "tok", body={"name": "x"})
+    nr._admin_request("DELETE", "/api/keys/k1", nr.DEFAULT_BASE_URL, "tok")
+    with pytest.raises(nr.NinerouterAdminError, match="boom"):
+        nr._admin_request("GET", "/api/explode", nr.DEFAULT_BASE_URL, "tok")
+    assert calls[0][0] == "POST" and calls[0][2] == {"name": "x"}
+    assert calls[1][0] == "DELETE"
+    # Admin token header present, never a Bearer secret.
+    req_headers = fake_http.post_calls[0]["headers"]
+    assert req_headers["x-9r-cli-token"] == "tok"
+    assert "Authorization" not in req_headers
+
+
+def _admin_fake_httpx(state):
+    """Fake admin API backed by an in-memory state dict."""
+
+    def get(url, headers, timeout):
+        if url.endswith("/v1/models"):
+            if headers.get("Authorization") == f"Bearer {state['valid_key']}":
+                return _response({"data": []})
+            return _response(
+                {"error": "invalid api key"}, status=401, url=url
+            )
+        if url.endswith("/api/keys"):
+            return _response({"keys": state["keys"]})
+        if url.endswith("/api/provider-nodes"):
+            return _response({"nodes": state["nodes"]})
+        if url.endswith("/api/providers"):
+            return _response({"connections": state["connections"]})
+        if url.endswith("/api/health"):
+            return _response({"ok": True})
+        raise AssertionError(f"unexpected GET {url}")
+
+    def post(url, body, headers, timeout):
+        if url.endswith("/api/keys"):
+            record = {
+                "id": f"key-{len(state['keys'])}",
+                "key": state["next_key"],
+                "name": body["name"],
+                "isActive": True,
+            }
+            state["next_key"] += "x"
+            state["keys"].append(record)
+            return _response(record, status=201, method="POST", url=url)
+        if url.endswith("/api/provider-nodes"):
+            node = {"id": f"node-{len(state['nodes'])}", **body}
+            state["nodes"].append(node)
+            return _response({"node": node}, status=201, method="POST", url=url)
+        if url.endswith("/api/providers"):
+            conn = {
+                "id": f"conn-{len(state['connections'])}",
+                "provider": body["provider"],
+                "name": body["name"],
+            }
+            state["connections"].append(conn)
+            return _response(
+                {"connection": conn}, status=201, method="POST", url=url
+            )
+        raise AssertionError(f"unexpected POST {url}")
+
+    def delete(url, headers, timeout):
+        if "/api/keys/" in url:
+            key_id = url.rsplit("/", 1)[-1]
+            state["keys"] = [k for k in state["keys"] if k["id"] != key_id]
+        return _response({"message": "deleted"}, method="DELETE", url=url)
+
+    return FakeHttpx(get=get, post=post, delete=delete)
+
+
+def _admin_state(**overrides):
+    state = {
+        "keys": [],
+        "nodes": [],
+        "connections": [],
+        "next_key": "sk-fresh-1",
+        "valid_key": overrides.pop("valid_key", None),
+    }
+    state.update(overrides)
+    return state
+
+
+def test_provision_gateway_key_creates_then_reuses(monkeypatch):
+    nr = ninerouter_module
+    state = _admin_state(valid_key=None)
+    monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
+
+    first = nr.provision_gateway_key(token="t")
+    assert first["status"] == "created" and first["key"] == "sk-fresh-1"
+    # Second run with no key handed back: named key found + valid now.
+    state["valid_key"] = "sk-fresh-1"
+    second = nr.provision_gateway_key(token="t")
+    assert second["status"] == "reused" and second["key"] == "sk-fresh-1"
+    assert len(state["keys"]) == 1  # no churn
+    # Valid key supplied explicitly: no admin traffic at all.
+    fake = nr.httpx
+    calls_before = len(fake.get_calls)
+    third = nr.provision_gateway_key(token="t", existing_key="sk-fresh-1")
+    assert third["status"] == "reused"
+    assert len(fake.get_calls) == calls_before + 1  # only /v1/models validate
+
+
+def test_provision_gateway_key_rotates_only_when_rejected(monkeypatch):
+    nr = ninerouter_module
+    state = _admin_state()
+    state["valid_key"] = "sk-new-1"
+    state["next_key"] = "sk-new-1"
+    state["keys"] = [
+        {
+            "id": "key-dead",
+            "key": "sk-dead",
+            "name": nr.DEFAULT_KEY_NAME,
+            "isActive": True,
+        }
+    ]
+    fake = _admin_fake_httpx(state)
+    monkeypatch.setattr(nr, "httpx", fake)
+
+    result = nr.provision_gateway_key(token="t")
+    # Dead named key is rejected (401) -> deleted + replaced once.
+    assert result["status"] == "rotated"
+    assert result["key"] == "sk-new-1"
+    assert [k["id"] for k in state["keys"]] == ["key-0"]
+    assert any("/api/keys/key-dead" in c["url"] for c in fake.delete_calls)
+
+
+def test_validate_gateway_key_401_only_failure(monkeypatch):
+    nr = ninerouter_module
+    assert nr.validate_gateway_key("") is False
+    monkeypatch.setattr(
+        nr,
+        "httpx",
+        FakeHttpx(get=lambda u, h, t: _response({}, status=401, url=u)),
+    )
+    assert nr.validate_gateway_key("sk-x") is False
+    monkeypatch.setattr(
+        nr,
+        "httpx",
+        FakeHttpx(get=lambda u, h, t: _response({"data": []}, url=u)),
+    )
+    assert nr.validate_gateway_key("sk-x") is True
+    # Transport failure must NOT trigger rotation: treated valid.
+    def boom(*a, **k):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(nr, "httpx", FakeHttpx(get=boom))
+    assert nr.validate_gateway_key("sk-x") is True
+
+
+def test_ensure_provider_node_idempotent_and_conflict(monkeypatch):
+    nr = ninerouter_module
+    state = _admin_state()
+    fake = _admin_fake_httpx(state)
+    monkeypatch.setattr(nr, "httpx", fake)
+
+    first = nr.ensure_provider_node(
+        name="Local", prefix="gem", node_base_url="http://127.0.0.1:8090/v1"
+    )
+    assert first["created"] is True
+    # Same prefix + url -> idempotent no-op.
+    second = nr.ensure_provider_node(
+        name="Local", prefix="gem", node_base_url="http://127.0.0.1:8090/v1"
+    )
+    assert second["created"] is False
+    assert second["node"]["id"] == first["node"]["id"]
+    assert len(state["nodes"]) == 1
+    # Same prefix, different url -> honest conflict error (never
+    # silently shadows an existing node).
+    with pytest.raises(nr.NinerouterAdminError, match="already exists"):
+        nr.ensure_provider_node(
+            name="Local2", prefix="gem", node_base_url="http://127.0.0.1:9999/v1"
+        )
+
+
+def test_ensure_provider_connection_idempotent(monkeypatch):
+    nr = ninerouter_module
+    state = _admin_state()
+    monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
+
+    node = nr.ensure_provider_node(
+        name="Local", prefix="gem", node_base_url="http://127.0.0.1:8090/v1"
+    )["node"]
+    a = nr.ensure_provider_connection(
+        node_id=node["id"], connection_name="gem-local"
+    )
+    b = nr.ensure_provider_connection(
+        node_id=node["id"], connection_name="gem-local"
+    )
+    assert a["created"] is True and b["created"] is False
+    assert a["connection"]["id"] == b["connection"]["id"]
+    assert len(state["connections"]) == 1
+    # Placeholder credential used for local no-auth servers, never a
+    # real-looking secret.
+    body = nr.httpx.post_calls[1]["json"]
+    assert body["apiKey"] == nr.LOCAL_PLACEHOLDER_CREDENTIAL
+
+
+def test_placeholder_connection_dedupes_by_node(monkeypatch):
+    # A pre-existing connection under a DIFFERENT name (e.g. one
+    # created through the dashboard) must still satisfy a later
+    # zero-touch run for a local, no-auth node.
+    nr = ninerouter_module
+    state = _admin_state()
+    state["nodes"] = [{"id": "node-0", "prefix": "gem"}]
+    state["connections"] = [
+        {"id": "conn-old", "provider": "node-0", "name": "manual-name",
+         "isActive": True}
+    ]
+    monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
+    out = nr.ensure_provider_connection(
+        node_id="node-0", connection_name="gem-local"
+    )
+    assert out["created"] is False
+    assert out["connection"]["id"] == "conn-old"
+
+
+def test_parse_local_server_spec():
+    nr = ninerouter_module
+    parsed = nr.parse_local_server_spec(
+        "Local llama (Gemma):gemma:http://127.0.0.1:8090/v1"
+    )
+    assert parsed == {
+        "name": "Local llama (Gemma)",
+        "prefix": "gemma",
+        "base_url": "http://127.0.0.1:8090/v1",
+    }
+    for bad in ("", "garbage", "n:p", "n:p:ftp://x"):
+        with pytest.raises(nr.NinerouterAdminError):
+            nr.parse_local_server_spec(bad)
+
+
+def test_auto_provision_full_orchestration(tmp_path, monkeypatch):
+    nr = ninerouter_module
+    state = _admin_state()
+    monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
+    monkeypatch.setattr(nr, "daemon_health", lambda *a, **k: True)
+    monkeypatch.setattr(nr, "admin_token", lambda *a, **k: "tok")
+
+    data = tmp_path / "9r"
+    result = nr.auto_provision(
+        data_dir=data,
+        existing_key="",
+        local_servers=[
+            {"name": "Gemma", "prefix": "gemma",
+             "base_url": "http://127.0.0.1:8090/v1"}
+        ],
+    )
+    assert result["gateway_key"]["status"] == "created"
+    assert result["gateway_key"]["key"] == "sk-fresh-1"
+    assert len(result["local_servers"]) == 1
+    server = result["local_servers"][0]
+    assert server["prefix"] == "gemma"
+    assert server["node_created"] is True
+    assert server["connection_created"] is True
+    # Secret pre-created owner-only even though daemon was "up".
+    assert (data / "auth" / "cli-secret").is_file()
+
+    # Second run: everything idempotent, no fresh key.
+    state["valid_key"] = "sk-fresh-1"
+    again = nr.auto_provision(
+        data_dir=data,
+        existing_key="",
+        local_servers=[
+            {"name": "Gemma", "prefix": "gemma",
+             "base_url": "http://127.0.0.1:8090/v1"}
+        ],
+    )
+    assert again["gateway_key"]["status"] == "reused"
+    assert again["local_servers"][0]["node_created"] is False
+    assert again["local_servers"][0]["connection_created"] is False
+    assert len(state["keys"]) == 1
+    assert len(state["nodes"]) == 1
+    assert len(state["connections"]) == 1
+
+
+def test_auto_provision_starts_daemon(tmp_path, monkeypatch):
+    nr = ninerouter_module
+    state = _admin_state()
+    monkeypatch.setattr(nr, "httpx", _admin_fake_httpx(state))
+    monkeypatch.setattr(nr, "find_cli", lambda: "/usr/local/bin/9router")
+    monkeypatch.setattr(nr, "admin_token", lambda *a, **k: "tok")
+    started = {"n": 0}
+
+    health = {"up": False}
+
+    def fake_health(*a, **k):
+        return health["up"]
+
+    def fake_start(data_dir=None, port=0, log_file=None):
+        started["n"] += 1
+        health["up"] = True
+        return 4242
+
+    monkeypatch.setattr(nr, "daemon_health", fake_health)
+    monkeypatch.setattr(nr, "start_daemon", fake_start)
+
+    result = nr.auto_provision(data_dir=tmp_path / "9r", install=False)
+    assert started["n"] == 1
+    assert result["daemon"]["started"] is True
+    assert result["daemon"]["pid"] == 4242
+
+
+def test_setup_9router_registers_local_servers(
+    tmp_path, monkeypatch, capsys
+):
+    from app.cli.main import main as cli_main
+
+    captured = {}
+
+    def fake_auto_provision(base_url, **kwargs):
+        captured["kwargs"] = kwargs
+        return {
+            "base_url": base_url,
+            "data_dir": kwargs["data_dir"],
+            "daemon": {"running": True, "started": False, "pid": None},
+            "gateway_key": {
+                "id": "key-1",
+                "name": "yodaw-zero-touch",
+                "status": "created",
+                "key": "sk-local-1",
+            },
+            "local_servers": [
+                {"prefix": "gemma", "base_url": "http://127.0.0.1:8090/v1",
+                 "node_created": True, "connection_created": True,
+                 "node_id": "n1", "connection_id": "c1", "name": "Gemma"}
+            ],
+        }
+
+    monkeypatch.setattr(
+        ninerouter_module, "auto_provision", fake_auto_provision
+    )
+    monkeypatch.setattr(
+        ninerouter_module,
+        "detect_install",
+        lambda base_url, api_key, timeout=10.0: _detection_ok(
+            models=["gemma/gemma3-270m"], combos=[],
+            probe={
+                "ok": True,
+                "models": ["gemma/gemma3-270m"],
+                "combos": [],
+                "default_model": "gemma/gemma3-270m",
+                "base_url": "http://127.0.0.1:20128",
+            },
+            api_key_set=bool(api_key),
+        ),
+    )
+
+    target = str(tmp_path / "config.toml")
+    code = cli_main(
+        [
+            "setup-9router", "--path", target, "--no-verify",
+            "--register-local",
+            "Gemma:gemma:http://127.0.0.1:8090/v1",
+        ]
+    )
+    assert code == 0
+    servers = captured["kwargs"]["local_servers"]
+    assert servers == [
+        {"name": "Gemma", "prefix": "gemma",
+         "base_url": "http://127.0.0.1:8090/v1"}
+    ]
+    out = capsys.readouterr().out
+    assert "gemma -> http://127.0.0.1:8090/v1" in out
+    assert "sk-local-1" not in out
+    cfg = load_product_config(target)
+    assert cfg.model == "gemma/gemma3-270m"
+
+
+def test_key_file_config_roundtrip_and_perms(tmp_path, monkeypatch):
+    from app.product_config import (
+        ConfigError,
+        write_api_key_file,
+        write_llm_config,
+    )
+
+    target = str(tmp_path / "config.toml")
+    key_file = write_api_key_file("sk-loopback", str(tmp_path / "k.key"))
+    write_llm_config(
+        target,
+        provider="9router",
+        model="auto",
+        base_url="http://127.0.0.1:20128",
+        api_key_env="NINEROUTER_API_KEY",
+        api_key_file=key_file,
+    )
+    cfg = load_product_config(target)
+    assert cfg.api_key == "sk-loopback"
+    assert cfg.api_key_file == key_file
+
+    # A loosened key file is detected and re-tightened.
+    os.chmod(key_file, 0o644)
+    cfg2 = load_product_config(target)
+    import stat
+
+    assert stat.S_IMODE(os.stat(key_file).st_mode) == 0o600
+    assert any("0600" in w for w in cfg2.warnings)
+
+    # Missing referenced key file with no env key -> hard error.
+    os.unlink(key_file)
+    with pytest.raises(ConfigError, match="does not exist"):
+        load_product_config(target)
+
+    # Environment wins over the file; a missing file degrades to a
+    # warning when the env supplies the key.
+    monkeypatch.setenv("NINEROUTER_API_KEY", "sk-from-env")
+    cfg3 = load_product_config(target)
+    assert cfg3.api_key == "sk-from-env"
+    assert any("does not exist" in w for w in cfg3.warnings)
+
+
+def test_lenient_json_loads_tolerates_sse_trailer():
+    nr = ninerouter_module
+    body = json.dumps(_chat_payload("OK"))
+    tolerant = nr.lenient_json_loads(body + '\ndata: [DONE]\n\n')
+    assert nr.parse_chat_response(tolerant) == "OK"
+    # Plain JSON still works; garbage and non-objects fail clearly.
+    assert nr.lenient_json_loads(body)["choices"]
+    with pytest.raises(json.JSONDecodeError):
+        nr.lenient_json_loads("not json at all")
+    with pytest.raises(nr.NinerouterError):
+        nr.lenient_json_loads("[1,2,3]")
+
+
+def test_provider_tolerates_sse_trailer_on_nonstream(monkeypatch):
+    nr = ninerouter_module
+    body = json.dumps(_chat_payload("hi")) + 'data: [DONE]\n\n'
+
+    def post(url, json=None, headers=None, timeout=None):
+        return _response(
+            None, status=200, method="POST", url=url
+        ).__class__(200, content=body.encode(),
+                     request=httpx.Request("POST", url))
+
+    fake = FakeHttpx(post=post)
+    monkeypatch.setattr(provider_module.httpx, "post", fake.post)
+    provider = provider_module.LocalLLMProvider(
+        style="9router",
+        base_url="http://127.0.0.1:20128",
+        model="local/smollm2-135m",
+        api_key="sk-x",
+    )
+    assert provider.chat("s", "u") == "hi"

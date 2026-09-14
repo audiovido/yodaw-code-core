@@ -95,6 +95,33 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the verification chat after provisioning",
     )
+    setup_p.add_argument(
+        "--data-dir",
+        default=None,
+        help="9Router data directory (default: $DATA_DIR or ~/.9router)",
+    )
+    setup_p.add_argument(
+        "--key-name",
+        default=None,
+        help="name of the local gateway key to provision",
+    )
+    setup_p.add_argument(
+        "--install",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="install/start the 9Router daemon automatically (default)",
+    )
+    setup_p.add_argument(
+        "--register-local",
+        action="append",
+        default=[],
+        metavar="NAME:PREFIX:BASE_URL",
+        help=(
+            "register a local OpenAI-compatible server as a provider "
+            "node + connection (repeatable), e.g. "
+            "'Local llama (Gemma):gemma:http://127.0.0.1:8090/v1'"
+        ),
+    )
     setup_p.add_argument("--timeout", type=float, default=30.0)
     setup_p.add_argument("--json", action="store_true", help="machine-readable output")
     models_p = sub.add_parser(
@@ -322,16 +349,28 @@ def cmd_config(args: argparse.Namespace) -> int:
 def cmd_setup_9router(args: argparse.Namespace) -> int:
     """Zero-touch 9Router provisioning.
 
-    Probe the daemon, detect models/combos, pick a default, persist
-    the selection to the config file (no manual env exports for
-    provider/model/endpoint), and verify with one tiny chat unless
-    --no-verify. The dashboard API key itself stays in the
-    environment (secrets are never written to the file).
+    Full lifecycle, no manual copy/paste:
+
+    1. ensure the official 9Router daemon is installed and running
+       against a private data dir (install/start it when needed);
+    2. derive the local admin token from the shared data dir and
+       auto-provision the LOCAL gateway API key, persisting it in a
+       0600 key file (upstream credentials are never touched);
+    3. idempotently register local OpenAI-compatible model servers
+       given via --register-local / YODAW_LOCAL_SERVERS;
+    4. discover models/combos, pick a default, persist [llm] config;
+    5. verify with one tiny chat unless --no-verify.
     """
     import os
+    from pathlib import Path
 
     from app.llm import ninerouter
-    from app.product_config import ConfigError, write_llm_config
+    from app.product_config import (
+        ConfigError,
+        config_file_candidates,
+        write_api_key_file,
+        write_llm_config,
+    )
 
     base_url = (
         getattr(args, "base_url", None)
@@ -341,40 +380,105 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
     api_key_env = (
         getattr(args, "api_key_env", None) or ninerouter.DEFAULT_API_KEY_ENV
     )
-    api_key = (
+    existing_key = (
         os.environ.get("YODAW_LLM_API_KEY", "")
         or os.environ.get(api_key_env, "")
         or ""
     )
     timeout = getattr(args, "timeout", 30.0) or 30.0
     as_json = bool(getattr(args, "json", False))
+    may_install = bool(getattr(args, "install", True))
 
+    data_dir_arg = (
+        getattr(args, "data_dir", None)
+        or os.environ.get("DATA_DIR")
+        or None
+    )
+    data_dir = Path(data_dir_arg) if data_dir_arg else ninerouter.default_data_dir()
+    key_name = getattr(args, "key_name", None) or ninerouter.DEFAULT_KEY_NAME
+
+    # Local model servers: repeatable --register-local plus a
+    # comma-separated env var (bootstrap zero-touch path).
+    specs = list(getattr(args, "register_local", []) or [])
+    specs.extend(
+        part.strip()
+        for part in os.environ.get("YODAW_LOCAL_SERVERS", "").split(",")
+        if part.strip()
+    )
+    try:
+        local_servers = [
+            ninerouter.parse_local_server_spec(spec) for spec in specs
+        ]
+    except ninerouter.NinerouterAdminError as exc:
+        print(f"setup-9router: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    # ---- 1+2+3: daemon, admin token, gateway key, local nodes ----
+    provisioned = None
+    initial = ninerouter.detect_install(
+        base_url, existing_key, timeout=min(timeout, 10.0)
+    )
+    need_admin = (
+        not initial["reachable"]
+        or not existing_key
+        or bool(local_servers)
+    )
+    if need_admin:
+        log_dir = Path.home() / ".yodaw" / "logs"
+        try:
+            from urllib.parse import urlparse
+
+            parsed_port = urlparse(base_url).port
+            provisioned = ninerouter.auto_provision(
+                base_url,
+                data_dir=data_dir,
+                port=parsed_port or ninerouter.DEFAULT_PORT,
+                key_name=key_name,
+                existing_key=existing_key,
+                local_servers=local_servers,
+                install=may_install,
+                start=True,
+                log_file=log_dir / "9router.log",
+            )
+            api_key = (
+                provisioned["gateway_key"].get("key") or existing_key
+            )
+        except ninerouter.NinerouterAdminError as exc:
+            # Already reachable with a valid env key and no admin
+            # data dir? Keep legacy manual mode working.
+            if initial["reachable"] and existing_key and not local_servers:
+                print(
+                    f"warning: automatic key provisioning unavailable "
+                    f"({exc}); continuing with {api_key_env} from the "
+                    "environment",
+                    file=sys.stderr,
+                )
+                api_key = existing_key
+                provisioned = None
+            else:
+                if as_json:
+                    print(
+                        json.dumps(
+                            {"ok": False, "error": str(exc)}, indent=2
+                        )
+                    )
+                else:
+                    print(f"setup-9router: {exc}", file=sys.stderr)
+                return EXIT_TASK_FAILURE
+    else:
+        api_key = existing_key
+
+    # ---- 4: discovery ------------------------------------------------
     detection = ninerouter.detect_install(base_url, api_key, timeout=timeout)
     normalized = detection["base_url"]
     probe = detection["probe"]
 
     if not detection["reachable"]:
+        message = probe.get("error", "9Router became unreachable")
         if as_json:
-            print(json.dumps({"ok": False, **detection}, indent=2))
+            print(json.dumps({"ok": False, "error": message}, indent=2))
         else:
-            print("9Router is not reachable:", file=sys.stderr)
-            print(f"  {probe.get('error')}", file=sys.stderr)
-            print("", file=sys.stderr)
-            if not detection["cli_installed"]:
-                print("  1. install: npm install -g 9router", file=sys.stderr)
-                print("  2. start:   9router", file=sys.stderr)
-            else:
-                print("  1. start:   9router", file=sys.stderr)
-            print(
-                f"  2. open:    {normalized}/dashboard", file=sys.stderr
-            )
-            print(
-                "  3. connect a provider (Kiro AI or OpenCode Free)",
-                file=sys.stderr,
-            )
-            print(
-                f"  4. rerun:   yodaw setup-9router", file=sys.stderr
-            )
+            print(f"setup-9router: {message}", file=sys.stderr)
         return EXIT_TASK_FAILURE
 
     models = probe.get("models", [])
@@ -388,11 +492,7 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
             "9Router reports no models and no combos.",
         )
         if as_json:
-            print(
-                json.dumps(
-                    {"ok": False, "error": message, **detection}, indent=2
-                )
-            )
+            print(json.dumps({"ok": False, "error": message}, indent=2))
         else:
             print(f"setup-9router: {message}", file=sys.stderr)
         return EXIT_TASK_FAILURE
@@ -419,18 +519,34 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # ---- persist: 0600 key file + TOML (never the raw key) ----------
+    config_target = getattr(args, "path", None) or config_file_candidates()[1]
+    key_file_path = (
+        Path(os.path.dirname(os.path.abspath(config_target)))
+        / "secrets"
+        / "9router-api.key"
+    )
     try:
+        if api_key:
+            key_file = write_api_key_file(api_key, str(key_file_path))
+        else:
+            key_file = None
         written = write_llm_config(
-            getattr(args, "path", None),
+            config_target,
             provider="9router",
             model=model,
             base_url=normalized,
             api_key_env=api_key_env,
+            api_key_file=key_file,
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    except OSError as exc:
+        print(f"could not persist gateway key: {exc}", file=sys.stderr)
+        return EXIT_TASK_FAILURE
 
+    # ---- 5: verification ---------------------------------------------
     verified: object = "skipped"
     if not getattr(args, "no_verify", False):
         from app.llm.provider import LLMError, LocalLLMProvider
@@ -442,13 +558,11 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
                 model=model,
                 api_key=api_key,
             )
-            reply = provider.chat(
+            provider.chat(
                 "You are a provisioning check. Reply exactly.",
                 "Reply with exactly: OK",
             )
             verified = True
-            if as_json:
-                pass  # reply length only; never echo model text raw
         except LLMError as exc:
             if as_json:
                 print(
@@ -457,6 +571,7 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
                             "ok": False,
                             "error": str(exc),
                             "config": written,
+                            "key_file": key_file,
                             "model": model,
                         },
                         indent=2,
@@ -466,8 +581,8 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
                 print(f"verification chat failed: {exc}", file=sys.stderr)
                 print(
                     f"(selection was still persisted to {written}; "
-                    f"connect a provider in {normalized}/dashboard "
-                    f"and rerun, or pass --no-verify)",
+                    "connect a capable route and rerun, or pass "
+                    "--no-verify)",
                     file=sys.stderr,
                 )
             return EXIT_TASK_FAILURE
@@ -478,12 +593,13 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
                 {
                     "ok": True,
                     "config": written,
+                    "key_file": key_file,
                     "provider": "9router",
                     "model": model,
                     "detected_default": detected,
                     "base_url": normalized,
                     "api_key_env": api_key_env,
-                    "api_key_set": bool(api_key),
+                    "provisioning": _provisioning_summary(provisioned),
                     "models": len(models),
                     "combos": len(combos),
                     "verified": verified,
@@ -495,20 +611,41 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
 
     print("9Router is ready:")
     print(f"  endpoint : {normalized}")
+    if provisioned:
+        daemon = provisioned.get("daemon", {})
+        if daemon.get("started"):
+            print(f"  daemon   : started (pid {daemon.get('pid')})")
+        gk = provisioned.get("gateway_key", {})
+        print(f"  gateway  : key {gk.get('status')} ({gk.get('name')})")
+        for server in provisioned.get("local_servers", []):
+            print(
+                f"  local    : {server['prefix']} -> {server['base_url']} "
+                f"(node {'created' if server['node_created'] else 'present'}, "
+                f"connection {'created' if server['connection_created'] else 'present'})"
+            )
     print(f"  inventory: {len(models)} models, {len(combos)} combos")
     if combos:
         print(f"  combos   : {', '.join(combos[:8])}")
     print(f"  model    : {model}")
     print(f"  config   : {written}")
-    if api_key:
-        print(f"  key      : set via {api_key_env}")
-    else:
-        print(
-            f"  key      : NOT SET -- export "
-            f"{api_key_env}='<key from {normalized}/dashboard>'"
-        )
+    print(f"  key file : {key_file or 'n/a (using environment)'}")
     print(f"  verified : {verified}")
     return EXIT_OK
+
+
+def _provisioning_summary(provisioned) -> object:
+    """JSON-safe provisioning summary with every secret stripped."""
+    if not provisioned:
+        return None
+    gateway_key = dict(provisioned.get("gateway_key") or {})
+    gateway_key.pop("key", None)  # never emit the raw gateway key
+    return {
+        "base_url": provisioned.get("base_url"),
+        "data_dir": provisioned.get("data_dir"),
+        "daemon": provisioned.get("daemon"),
+        "gateway_key": gateway_key,
+        "local_servers": provisioned.get("local_servers"),
+    }
 
 
 def cmd_models(args: argparse.Namespace) -> int:
