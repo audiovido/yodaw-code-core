@@ -57,14 +57,18 @@ def test_product_submit_returns_product_shape():
     assert body["links"]["retry"]
 
 
-def test_product_status_transition_code_mission():
+def test_product_status_transition_code_mission_reports_not_executed():
+    """A bare 'code' mission with no repository target must not emit
+    PASS: planning alone never satisfies a mission."""
     client = make_client()
     created = client.post(
         "/api/v1/missions",
         json={"goal": f"shape flow {uuid.uuid4().hex}", "capability": "code"},
     ).json()
     mission = poll_mission(client, created["mission_id"])
-    assert mission["status"] == "PASS"
+    assert mission["status"] == "FAIL"
+    error = (mission.get("result") or {}).get("error") or {}
+    assert error.get("type") == "NoRepositoryTarget"
 
 
 def test_product_dry_run_returns_result_without_execution():
@@ -339,6 +343,14 @@ def test_product_top_level_dependencies_block_through_public_api():
                 ),
                 "capability": "code",
                 "repo_path": str(_make_smoke_repo(root)),
+                # Deterministic edits: the worker applies them without
+                # any LLM provider, so this test never depends on a
+                # live model endpoint (pytest here PASSes upstream).
+                "metadata": {
+                    "target_file": "app.py",
+                    "find": "return 'old'",
+                    "replace": "return 'hello'",
+                },
             },
         ).json()
         assert filler["status"] == "QUEUED"

@@ -80,11 +80,15 @@ def test_real_code_worker_end_to_end():
         td.cleanup()
 
 
-def test_code_worker_no_repo_reports_planning_only():
+def test_code_worker_no_repo_is_not_a_pass():
+    """Planning without a repository must never report success: no
+    edit, no validation, and no commit happened."""
     worker = CodeWorker()
     result = worker.execute("Plan something", None)
 
-    assert result["success"] is True
+    # A plan is not execution: success must be False.
+    assert result["success"] is False
+    assert result["error"]["type"] == "NoRepositoryTarget"
     assert result["output"]["repo"]["observed"] is False
 
     # No fabricated repo-derived values when no repository target.
