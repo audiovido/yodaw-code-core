@@ -222,6 +222,20 @@ def test_run_task_cancelled_in_safe_mode(temp_repo, sessions_dir):
     assert result.status == "CANCELLED"
 
 
+def test_run_task_without_executor_is_not_a_pass(temp_repo, sessions_dir):
+    """Planning without any execution backend must never be PASS."""
+    repo = detect_repo(temp_repo)
+    session = _session(temp_repo)
+    result = run_task(
+        "fix tests", repo, session, approval_mode="auto", approved=True
+    )
+    assert result.success is False
+    assert result.status == "NOT_EXECUTED"
+    assert "execution backend" in (result.error or "")
+    # A produced plan is fine, but it must not satisfy the task.
+    assert result.plan is not None
+    assert session.tasks[-1].status == "failed"
+
 def test_run_task_interrupted_preserves_session(temp_repo, sessions_dir):
     repo = detect_repo(temp_repo)
     session = _session(temp_repo)

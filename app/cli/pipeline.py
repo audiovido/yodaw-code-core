@@ -268,14 +268,14 @@ def run_task(
             _emit(events, "error", f"execution failed: {exc}", level="error")
             return PipelineResult(success=False, status="FAILED", summary=f"execution failed: {exc}", events=events, evidence=evidence, plan=plan, error=str(exc), retryable=True)
 
-    _emit(events, "execute", "execution adapter only: no live provider in this build")
-    _emit(events, "verify", "no changes applied; poll /status for plan progress")
-    task.status = "completed"
+    # Plan-only must never present as PASS: planning succeeded but
+    # nothing executed, no edit was applied, and nothing was validated.
+    _emit(events, "execute", "no execution backend wired; nothing was executed")
+    _emit(events, "verify", "nothing to verify: no edit was applied")
+    task.status = "failed"
     task.finished_at = _now_iso()
-    _emit(events, "learn", "recorded plan-only outcome for future retrieval")
-    _emit(events, "deliver", "plan ready; connect a provider to execute")
-    _emit(events, "done", "task completed")
-    return PipelineResult(success=True, status="PASS", summary=f"Plan ready with {len(plan.steps)} steps. Execution needs a configured provider.", events=events, evidence=evidence, plan=plan)
+    _emit(events, "done", "plan ready but not executed", level="error")
+    return PipelineResult(success=False, status="NOT_EXECUTED", summary=f"Planned {len(plan.steps)} steps but executed nothing: no execution backend is wired in this build. Submit the goal through the daemon API or configure a live executor.", events=events, evidence=evidence, plan=plan, error="no execution backend wired", retryable=True)
 
 
 def execute_with_worker(
