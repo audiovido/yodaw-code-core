@@ -157,6 +157,20 @@ def build_repo_context(
         ".pytest_cache",
     }
 
+    # SWARM_CONTEXT_ROBUSTNESS_V2
+    # Generated dependency manifests can consume the entire bounded
+    # context before real source code is reached.
+    ignored_files = {
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+        "composer.lock",
+        "Cargo.lock",
+        ".DS_Store",
+    }
+
     allowed_suffixes = {
         ".py",
         ".js",
@@ -180,16 +194,36 @@ def build_repo_context(
         ".cpp",
         ".h",
         ".hpp",
+        ".html",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".vue",
+        ".svelte",
     }
 
     # Walk with followlinks=False: symlinked directories are never
     # traversed and symlinked files are skipped, so context can never
     # leak outside the worktree or loop on directory cycles.
     for dirpath, dirnames, filenames in os.walk(worktree, followlinks=False):
+        source_dirs = {
+            "src",
+            "app",
+            "lib",
+            "components",
+            "pages",
+            "tests",
+            "test",
+        }
         dirnames[:] = sorted(
-            d for d in dirnames if d not in ignored_dirs
+            (d for d in dirnames if d not in ignored_dirs),
+            key=lambda d: (d not in source_dirs, d),
         )
         for name in sorted(filenames):
+            if name in ignored_files:
+                continue
+
             path = Path(dirpath) / name
 
             if path.is_symlink():
@@ -221,6 +255,22 @@ def build_repo_context(
     return joined[:max_chars]
 
 
+def _loads_plan_json_lenient(text: str):
+    """Parse model JSON while tolerating raw control chars in strings.
+
+    Local coding models occasionally emit literal newlines/tabs inside
+    JSON string values. Python's strict parser rejects them although
+    the structural object is otherwise valid.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as strict_error:
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            raise strict_error
+
+
 def parse_plan(raw: str) -> dict:
     text = raw.strip()
 
@@ -236,14 +286,14 @@ def parse_plan(raw: str) -> dict:
         candidate = text
 
     try:
-        plan = json.loads(candidate)
+        plan = _loads_plan_json_lenient(candidate)
     except json.JSONDecodeError:
         # Fallback: attempt to find the outer-most JSON object in the text
         start = candidate.find("{")
         end = candidate.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                plan = json.loads(candidate[start : end + 1])
+                plan = _loads_plan_json_lenient(candidate[start : end + 1])
             except json.JSONDecodeError as exc:
                 raise LLMError(
                     f"Coder returned invalid JSON: {exc}"
@@ -254,6 +304,25 @@ def parse_plan(raw: str) -> dict:
             )
 
     action = plan.get("action")
+
+    # SWARM_ACTION_NORMALIZATION_V2
+    # Some otherwise-valid local-model plans omit the redundant
+    # top-level action while providing a valid edits payload.
+    if action in {None, ""}:
+        edits_value = plan.get("edits")
+
+        if isinstance(edits_value, list) and edits_value:
+            action = "edit"
+            plan["action"] = "edit"
+        elif all(
+            key in plan
+            for key in ("target_file", "find", "replace")
+        ):
+            action = "edit"
+            plan["action"] = "edit"
+        elif plan.get("blocked") is True:
+            action = "blocked"
+            plan["action"] = "blocked"
 
     if action == "create":
         # Top-level create plan: normalize into the multi-edit shape

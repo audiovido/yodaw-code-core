@@ -12,6 +12,8 @@ failure, never a pass.
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -81,13 +83,63 @@ def detect_test_commands(
         )
 
     # JS/TS
+    # SWARM_JS_VALIDATION_V2
+    # Do not assume every JS project exposes `npm test`. A production
+    # Vite/React repository may intentionally validate through build.
     if (worktree / "package.json").exists():
         if not tool_check("npm"):
             raise ToolMissingError(
                 "npm executable not found on PATH; "
                 "cannot run JavaScript validation"
             )
-        commands.append(["npm", "test", "--", "--runInBand"])
+
+        try:
+            package_data = json.loads(
+                (worktree / "package.json").read_text(
+                    errors="replace"
+                )
+            )
+        except (OSError, json.JSONDecodeError):
+            package_data = {}
+
+        scripts = package_data.get("scripts") or {}
+        js_commands = []
+
+        if scripts.get("test"):
+            # Preserve the existing test behavior when a test script
+            # actually exists.
+            js_commands.append(
+                ["npm", "test", "--", "--runInBand"]
+            )
+        elif scripts.get("build"):
+            js_commands.append(["npm", "run", "build"])
+        else:
+            # Backward-compatible fallback for unknown JS projects.
+            js_commands.append(
+                ["npm", "test", "--", "--runInBand"]
+            )
+
+        auto_install = os.environ.get(
+            "YODAW_AUTO_INSTALL_JS_DEPS",
+            "",
+        ).lower() in {"1", "true", "yes", "on"}
+
+        if (
+            auto_install
+            and js_commands
+            and (worktree / "package-lock.json").exists()
+            and not (worktree / "node_modules").exists()
+        ):
+            commands.append(
+                [
+                    "npm",
+                    "ci",
+                    "--no-audit",
+                    "--no-fund",
+                ]
+            )
+
+        commands.extend(js_commands)
 
     # Go
     if (worktree / "go.mod").exists():

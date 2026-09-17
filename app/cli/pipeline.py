@@ -379,7 +379,26 @@ def execute_with_worker(
     if repo.root is not None:
         with tempfile.TemporaryDirectory(prefix="yodaw_cli_diff_") as tmp:
             before = _run_shell(["git", "status", "--short"], repo.root).get("stdout", "")
-            metadata = {"repo_path": str(repo.root), "branch_name": f"yodaw/cli-{task.task_id}", "keep_worktree": True, "max_retries": 0, "mission_id": task.task_id}
+            try:
+                cli_worker_retries = max(
+                    0,
+                    int(
+                        os.environ.get(
+                            "YODAW_CLI_WORKER_RETRIES",
+                            "0",
+                        )
+                    ),
+                )
+            except ValueError:
+                cli_worker_retries = 0
+
+            metadata = {
+                "repo_path": str(repo.root),
+                "branch_name": f"yodaw/cli-{task.task_id}",
+                "keep_worktree": True,
+                "max_retries": cli_worker_retries,
+                "mission_id": task.task_id,
+            }
             try:
                 result = worker.execute(goal, metadata)
             except Exception as exc:
