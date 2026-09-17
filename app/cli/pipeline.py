@@ -75,6 +75,28 @@ def classify_goal(goal: str) -> str:
     return "mutating"
 
 
+# Explicit no-op phrases: the user states the request must not touch
+# the repo. Such goals are conversational by definition, no matter
+# how classify_goal's prefix heuristics read the rest of the text.
+EXPLICIT_READONLY_PHRASES = (
+    "do not modify any files",
+    "don't modify any files",
+    "do not modify files",
+    "no file changes",
+    "do not run any commands",
+    "don't run any commands",
+    "without modifying any files",
+    "read-only",
+    "read only",
+)
+
+
+def is_explicit_readonly(goal: str) -> bool:
+    """True when the goal explicitly forbids mutation/execution."""
+    lowered = goal.lower()
+    return any(phrase in lowered for phrase in EXPLICIT_READONLY_PHRASES)
+
+
 def is_high_risk(goal: str) -> bool:
     """Detect goals that need explicit approval outside auto mode."""
     lowered = goal.lower()
@@ -181,6 +203,37 @@ def route_task(goal: str, repo: RepoInfo) -> dict[str, Any]:
     return {"capability": capability, "model": model, "provider_style": style}
 
 
+def default_executor():
+    """The canonical CLI executor: the existing worker registry.
+
+    Returned lazily so importing the pipeline never imports the
+    worker stack; tests may still inject any callable over it.
+    """
+    from app.cli.pipeline import execute_with_worker
+
+    return execute_with_worker
+
+
+def answer_readonly(goal: str) -> str:
+    """Real LLM answer for a read-only conversational goal.
+
+    Smallest possible reuse of the existing provider layer: one chat
+    through the configured LocalLLMProvider (9Router/Ollama/etc.).
+    No plan, no worker, no edits, no commands - the model text is the
+    whole deliverable. Raises LLMError on provider failure.
+    """
+    from app.llm.provider import LocalLLMProvider
+
+    provider = LocalLLMProvider()
+    return provider.chat(
+        "You are Kodgar, a concise coding assistant running inside a "
+        "terminal. The user asked a read-only or conversational "
+        "question: answer directly and briefly. Do not claim to have "
+        "run tools, edited files, or executed commands.",
+        goal,
+    )
+
+
 def run_task(
     goal: str,
     repo: RepoInfo,
@@ -222,6 +275,31 @@ def run_task(
         task.finished_at = _now_iso()
         _emit(events, "done", "task completed")
         return PipelineResult(success=True, status="PASS", summary=summary, events=events, evidence=evidence)
+
+    # Read-only conversational goals: real LLM inference through the
+    # existing provider layer, zero file mutations, zero commands.
+    # This is what makes the shell chat like a coding assistant
+    # instead of demanding every input be an executable mission.
+    if classify_goal(goal) == "readonly" or is_explicit_readonly(goal):
+        routing = route_task(goal, repo)
+        _emit(events, "route", f"capability=chat provider={routing['provider_style']}")
+        try:
+            answer = answer_readonly(goal)
+        except Exception as exc:
+            task.status = "failed"
+            task.finished_at = _now_iso()
+            _emit(events, "error", f"LLM inference failed: {exc}", level="error")
+            return PipelineResult(success=False, status="FAILED", summary=f"LLM inference failed: {exc}", events=events, evidence=evidence, error=str(exc), retryable=True)
+        if not (answer or "").strip():
+            task.status = "failed"
+            task.finished_at = _now_iso()
+            _emit(events, "error", "LLM returned an empty answer", level="error")
+            return PipelineResult(success=False, status="FAILED", summary="LLM returned an empty answer", events=events, evidence=evidence, error="empty answer", retryable=True)
+        _emit(events, "deliver", "answer ready")
+        task.status = "completed"
+        task.finished_at = _now_iso()
+        _emit(events, "done", "task completed")
+        return PipelineResult(success=True, status="PASS", summary=answer, events=events, evidence=evidence)
 
     _emit(events, "observe", "scanning repository")
     relevant: list[dict[str, Any]] = []

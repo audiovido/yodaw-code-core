@@ -90,6 +90,15 @@ def _validate_edit(edit: Any, index: int) -> Optional[dict]:
             "type": "InvalidEditPlan",
             "message": "Edit %d has unknown action: %r" % (index, action),
         }
+    # Tolerate plans that express creation with an omitted action:
+    # find=="" on a non-existent target means "create", exactly as
+    # the coder prompt documents.
+    if (
+        action == "edit"
+        and (edit.get("find") or "") == ""
+        and (edit.get("replace") or "") != ""
+    ):
+        action = "create"
     if action == "delete":
         if not edit.get("target_file"):
             return {
@@ -145,6 +154,14 @@ def prepare_edits(
 
         target_file = edit["target_file"]
         action = edit.get("action", "edit")
+        # Mirror _validate_edit: an omitted action with an empty
+        # find anchor is a create edit (new file / full content).
+        if (
+            action == "edit"
+            and (edit.get("find") or "") == ""
+            and (edit.get("replace") or "") != ""
+        ):
+            action = "create"
 
         try:
             target = _resolve_target(worktree, target_file)

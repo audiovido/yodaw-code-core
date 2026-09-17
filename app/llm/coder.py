@@ -119,6 +119,13 @@ Required JSON format:
   "reason": "short explanation"
 }
 
+Creating a brand-new file (or appending to a file) uses the
+"create" action: "find" must be the empty string and "replace"
+holds the complete new file content:
+
+    {"target_file": "new/path.txt", "action": "create",
+     "find": "", "replace": "full new file content"}
+
 Use multiple edits when the goal genuinely requires multiple files.
 
 Legacy single-edit format is also accepted internally for compatibility.
@@ -248,6 +255,27 @@ def parse_plan(raw: str) -> dict:
 
     action = plan.get("action")
 
+    if action == "create":
+        # Top-level create plan: normalize into the multi-edit shape
+        # the edit engine already understands (single create edit).
+        target = plan.get("target_file") or plan.get("file")
+        if not target or not (plan.get("replace") or plan.get("content")):
+            raise LLMError(
+                "Create plan must include target_file and replace/content"
+            )
+        return {
+            "action": "edit",
+            "edits": [
+                {
+                    "target_file": target,
+                    "action": "create",
+                    "find": "",
+                    "replace": plan.get("replace") or plan.get("content"),
+                    "reason": plan.get("reason", ""),
+                }
+            ],
+        }
+
     if action not in {"edit", "blocked"}:
         raise LLMError(
             f"Unsupported coder action: {action}"
@@ -309,6 +337,18 @@ def parse_plan(raw: str) -> dict:
         if missing:
             raise LLMError(
                 f"Edit {index} missing: {missing}"
+            )
+
+        # A create edit legitimately carries find="" (nothing to
+        # locate); the edit engine treats empty find + non-empty
+        # replace on a non-existent target as creation.
+        if (
+            edit.get("action", "edit") == "edit"
+            and (edit.get("find") or "") == ""
+            and not (edit.get("replace") or "")
+        ):
+            raise LLMError(
+                f"Edit {index} has empty find and empty replace"
             )
 
     return plan

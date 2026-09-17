@@ -212,6 +212,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         provider=None if args.provider in (None, "auto") else args.provider,
     )
     approved = args.approval_mode == "auto"
+    # `run` executes real tasks: default to the worker-registry
+    # executor so the non-interactive path can never degrade into
+    # plan-only NOT_EXECUTED by a forgotten wiring.
+    from app.cli.pipeline import default_executor
+
     result = run_task(
         args.goal,
         repo,
@@ -219,6 +224,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         approval_mode=args.approval_mode,
         approved=approved,
         confirm=None,
+        executor=default_executor(),
         timeout=args.timeout,
     )
     session.history.append({"role": "user", "text": args.goal})
@@ -1053,6 +1059,60 @@ def cmd_kodgar_doctor(args: argparse.Namespace) -> int:
             "detail": cli_path or "9router CLI not found on PATH",
         }
     )
+
+    # ---- execution-path checks (safe, non-mutating) ----------------
+    # The doctor must not report healthy while the CLI itself cannot
+    # execute a task: the wiring defect that shipped once as plan-only
+    # NOT_EXECUTED output must be caught here.
+    from app.cli.pipeline import default_executor
+    from app.workers.registry import registry as worker_registry
+
+    try:
+        executor = default_executor()
+        executor_wiring_ok = callable(executor)
+        executor_detail = "default executor wired" if executor_wiring_ok else "no default executor"
+    except Exception as exc:
+        executor = None
+        executor_wiring_ok = False
+        executor_detail = f"executor wiring error: {exc}"
+    checks.append(
+        {"name": "executor wiring", "ok": executor_wiring_ok, "detail": executor_detail}
+    )
+
+    try:
+        workers = worker_registry.status()
+        ready = [w for w in workers if w.get("status") == "READY"]
+        caps = sorted({c for w in workers for c in (w.get("capabilities") or [])})
+        workers_ok = bool(ready) and bool(caps)
+        workers_detail = (
+            f"{len(ready)}/{len(workers)} ready; capabilities: {', '.join(caps)}"
+            if workers_ok
+            else "no worker reports READY"
+        )
+    except Exception as exc:
+        workers_ok = False
+        workers_detail = f"worker registry error: {exc}"
+    checks.append({"name": "worker registry", "ok": workers_ok, "detail": workers_detail})
+
+    llm_inference_ok = False
+    llm_detail = ""
+    try:
+        from app.llm.provider import LocalLLMProvider, LLMError
+
+        provider = LocalLLMProvider()
+        reply = provider.chat(
+            "You are a health check. Reply with exactly: OK",
+            "Reply with exactly: OK",
+        )
+        llm_inference_ok = "OK" in (reply or "")
+        llm_detail = (
+            f"style={provider.style} model={provider.model} reply={reply[:60]!r}"
+            if llm_inference_ok
+            else f"unexpected reply {reply[:60]!r}"
+        )
+    except Exception as exc:
+        llm_detail = f"inference failed: {type(exc).__name__}: {exc}"[:200]
+    checks.append({"name": "llm inference", "ok": llm_inference_ok, "detail": llm_detail})
 
     reachable = ninerouter.daemon_health(base_url)
     checks.append(

@@ -1,5 +1,60 @@
 # Kodgar Final Acceptance Report (September 17, 2026)
 
+## RUNTIME EXECUTOR FIX (post-release blocker, resolved)
+
+After the initial release, the installed CLI ran every goal as plan-only:
+`[execute] no execution backend wired; nothing was executed` → NOT_EXECUTED.
+
+Root cause: `run_task(..., executor=None)` deliberately returns NOT_EXECUTED
+when no executor is supplied; `start_interactive()` and `cmd_run()` both
+constructed the pipeline without one. The existing `execute_with_worker`
+(worker registry → RepoCodeWorker / CodeWorker) was never wired in.
+
+Fix (production, no new engine, DI preserved):
+- `pipeline.default_executor()` returns the existing `execute_with_worker`.
+- `start_interactive()` now constructs `Repl(..., executor=default_executor())`.
+- `cmd_run()` passes `executor=default_executor()` to `run_task`.
+- `Repl(executor=...)` constructor injection unchanged — tests keep fakes.
+- Read-only goals (classification + explicit "do not modify files" phrases)
+  now take a conversational path: ONE real `LocalLLMProvider.chat` through
+  the existing provider layer (9Router/qwen), zero workers, zero mutation.
+- Doctor (`kodgar-doctor`) now reports `executor wiring`, `worker registry`,
+  and `llm inference` separately and fails closed when the CLI has no
+  execution backend.
+- Coder plan contract: top-level `action="create"` and empty-find create
+  edits normalize into the edit engine's existing create action (before,
+  new-file goals could only produce a plan the engine rejected).
+
+Live acceptance evidence (real CLI, real LLM, real worker):
+
+- READ-ONLY: `run "Reply with exactly: KODGAR_RUNTIME_OK. …"` → PASS,
+  answer exactly `KODGAR_RUNTIME_OK`, route event `capability=chat`, no file
+  changes (`git status` unchanged).
+- EXECUTION: disposable temp repo (baseline committed) →
+  `run 'Create a file KODGAR_EXECUTOR_E2E.txt containing exactly:
+  KODGAR_EXECUTOR_OK' --approval-mode auto` → exit 0, status PASS,
+  events `route → [execute] worker repo-code-bud executing → verify → done`,
+  real commit in the worker's isolated worktree
+  (`yodaw: Create a file …`), file content exactly `KODGAR_EXECUTOR_OK`.
+- INTERACTIVE: real `YODAW >` shell driven over stdin in a separate process
+  → `[route] … [execute] worker repo-code-bud executing … [verify] worker
+  reported success … [done] task completed`; commit landed in the worktree
+  with exact content; `no execution backend` count: 0.
+- RESTART: fresh process constructs `start_interactive` with the default
+  executor (`EXECUTOR_IS_DEFAULT: True`).
+- DOCTOR: live run reports cli/executor wiring/worker registry/llm
+  inference/daemon/inventory/certified route all PASS (exit 0).
+
+Regression tests added (tests/test_cli_shell.py): default executor is the
+worker registry; run_task with default executor reaches a real worker;
+start_interactive wires the default executor; Repl still accepts injected
+fakes; cmd_run can never silently degrade to NOT_EXECUTED; read-only goal
+answers without invoking a worker or mutating files; explicit no-mutation
+phrase classification; doctor surfaces the three execution-path checks.
+
+Full suite: 205 passed (CLI/worker/coder/edit-engine/9Router/acceptance/
+recovery/outbox/launcher).
+
 ## Mission table (exact)
 
 | # | Item | Status | Evidence |

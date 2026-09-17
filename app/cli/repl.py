@@ -247,5 +247,17 @@ def start_interactive(
             session.model = model
         if provider:
             session.provider = provider
-    repl = Repl(repo, session, approval_mode=session.approval_mode, verbose=verbose, json_mode=json_mode)
+    # The native shell always ships with a live executor: without
+    # one every goal would stop at plan-only (NOT_EXECUTED). Tests
+    # still inject fakes through Repl's constructor argument.
+    from app.cli.pipeline import default_executor
+
+    repl = Repl(
+        repo,
+        session,
+        approval_mode=session.approval_mode,
+        verbose=verbose,
+        json_mode=json_mode,
+        executor=default_executor(),
+    )
     return repl.run()

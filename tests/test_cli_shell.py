@@ -236,6 +236,270 @@ def test_run_task_without_executor_is_not_a_pass(temp_repo, sessions_dir):
     assert result.plan is not None
     assert session.tasks[-1].status == "failed"
 
+
+def _mutating_worker_result(goal):
+    return {
+        "success": True,
+        "output": {"goal": goal, "worker": "fake-bud", "commit_sha": None},
+        "evidence": [{"type": "fake_execute", "worker": "fake-bud"}],
+        "error": {},
+    }
+
+
+def test_default_executor_resolves_to_worker_registry(temp_repo, sessions_dir):
+    """default_executor() must be the real worker-registry executor."""
+    from app.cli.pipeline import default_executor, execute_with_worker
+
+    executor = default_executor()
+    assert executor is execute_with_worker
+    # The registry must actually contain the shipped workers.
+    from app.workers.registry import registry
+
+    names = {type(w).__name__ for w in registry.workers}
+    assert "RepoCodeWorker" in names and "CodeWorker" in names
+
+
+def test_run_task_with_default_executor_routes_to_a_real_worker(
+    temp_repo, sessions_dir, monkeypatch
+):
+    """run_task + default_executor must reach a registry worker."""
+    import app.cli.pipeline as pipeline_module
+
+    called = {}
+
+    def fake_execute(goal, metadata):
+        called["goal"] = goal
+        called["metadata"] = metadata
+        return _mutating_worker_result(goal)
+
+    # Intercept at the registry boundary: the executor must resolve a
+    # worker from the registry and hand it the goal + repo metadata.
+    class FakeWorker:
+        name = "fake-bud"
+        capabilities = {"repo-code", "code"}
+
+        def supports(self, capability):
+            return capability in self.capabilities
+
+        def health(self):
+            return {"name": self.name, "status": "READY", "capabilities": sorted(self.capabilities)}
+
+        def execute(self, goal, metadata=None):
+            return fake_execute(goal, metadata or {})
+
+    monkeypatch.setattr(
+        pipeline_module, "route_task", lambda goal, repo: {"capability": "repo-code", "model": None, "provider_style": "test"}
+    )
+    from app.workers import registry as registry_module
+
+    monkeypatch.setattr(registry_module.registry, "workers", [FakeWorker()])
+
+    repo = detect_repo(temp_repo)
+    session = _session(temp_repo)
+    from app.cli.pipeline import default_executor
+
+    result = run_task(
+        "fix the login tests", repo, session,
+        approval_mode="auto", approved=True, executor=default_executor(),
+    )
+    assert result.success is True
+    assert result.status == "PASS"
+    assert called["goal"] == "fix the login tests"
+    assert called["metadata"]["repo_path"] == str(temp_repo)
+    # Real executor events, not the plan-only placeholders.
+    stages = [e["stage"] for e in result.events]
+    assert "route" in stages and "execute" in stages and "verify" in stages
+    execute_events = [e for e in result.events if e["stage"] == "execute"]
+    assert any("fake-bud" in e["message"] for e in execute_events)
+    assert not any("no execution backend" in e["message"] for e in result.events)
+
+
+def test_start_interactive_defaults_to_real_executor(temp_repo, sessions_dir, monkeypatch, capsys):
+    """The interactive entrypoint must wire the default executor."""
+    import app.cli.repl as repl_module
+
+    captured = {}
+    real_repl = repl_module.Repl
+
+    def spying_repl(repo, session, **kwargs):
+        captured["executor"] = kwargs.get("executor")
+        captured["approval_mode"] = kwargs.get("approval_mode")
+        fake_input = lambda prompt: "exit"
+        return real_repl(
+            repo, session,
+            approval_mode=kwargs.get("approval_mode", "standard"),
+            verbose=kwargs.get("verbose", False),
+            json_mode=kwargs.get("json_mode", False),
+            output=io.StringIO(),
+            input_func=fake_input,
+            executor=kwargs.get("executor"),
+        )
+
+    monkeypatch.setattr(repl_module, "Repl", spying_repl)
+    monkeypatch.setenv("YODAW_SESSIONS_DIR", str(sessions_dir))
+    code = repl_module.start_interactive(repo_path=str(temp_repo), approval_mode="standard")
+    assert code == 0
+    from app.cli.pipeline import default_executor
+
+    assert captured["executor"] is default_executor()
+
+
+def test_repl_still_allows_injected_fake_executor(temp_repo, sessions_dir):
+    """DI contract: tests keep overriding the executor."""
+    seen = {}
+
+    def fake_executor(**kwargs):
+        seen["goal"] = kwargs["goal"]
+        return PipelineResult(success=True, status="PASS", summary="injected", events=kwargs["events"], evidence=[])
+
+    repl, output = _repl(temp_repo, executor=fake_executor, confirm_func=lambda q: True)
+    assert repl.handle_line("fix the login tests") is False
+    assert seen["goal"] == "fix the login tests"
+    assert "injected" in output.getvalue()
+
+
+def test_cmd_run_defaults_to_real_executor(temp_repo, sessions_dir, monkeypatch, capsys):
+    """`run` must never silently degrade into plan-only NOT_EXECUTED."""
+    import app.cli.main as main_module
+
+    seen = {}
+
+    def fake_worker_execute(goal, metadata):
+        seen["goal"] = goal
+        seen["metadata"] = metadata
+        return _mutating_worker_result(goal)
+
+    class FakeWorker:
+        name = "fake-bud"
+        capabilities = {"repo-code", "code"}
+
+        def supports(self, capability):
+            return capability in self.capabilities
+
+        def health(self):
+            return {"name": self.name, "status": "READY", "capabilities": sorted(self.capabilities)}
+
+        def execute(self, goal, metadata=None):
+            return fake_worker_execute(goal, metadata or {})
+
+    import app.cli.pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module, "route_task", lambda goal, repo: {"capability": "repo-code", "model": None, "provider_style": "test"}
+    )
+    from app.workers import registry as registry_module
+
+    monkeypatch.setattr(registry_module.registry, "workers", [FakeWorker()])
+    monkeypatch.setenv("YODAW_SESSIONS_DIR", str(sessions_dir))
+
+    code = main_module.main(
+        ["run", "fix the login tests", "--repo", str(temp_repo), "--approval-mode", "auto"]
+    )
+    assert code == EXIT_OK
+    assert seen["goal"] == "fix the login tests"
+    out = capsys.readouterr().out
+    assert "NOT_EXECUTED" not in out and "no execution backend" not in out
+
+
+def test_readonly_goal_answers_without_worker_or_mutation(temp_repo, sessions_dir, monkeypatch):
+    """A read-only goal takes the chat path: real LLM, zero mutation."""
+    import app.cli.pipeline as pipeline_module
+
+    worker_touched = {}
+
+    class ShouldNotRun:
+        name = "must-not-run"
+        capabilities = {"repo-code", "code"}
+
+        def supports(self, capability):
+            return True
+
+        def health(self):
+            return {"name": self.name, "status": "READY"}
+
+        def execute(self, goal, metadata=None):
+            worker_touched["called"] = True
+            raise AssertionError("worker must not run for read-only goals")
+
+    from app.workers import registry as registry_module
+
+    monkeypatch.setattr(registry_module.registry, "workers", [ShouldNotRun()])
+    monkeypatch.setattr(
+        pipeline_module, "answer_readonly", lambda goal: "KODGAR_RUNTIME_OK"
+    )
+
+    (temp_repo / "app.py").write_text("def add(a, b):\n    return a + b\n")
+    before = (temp_repo / "app.py").read_text()
+    repo = detect_repo(temp_repo)
+    session = _session(temp_repo)
+    from app.cli.pipeline import default_executor
+
+    result = run_task(
+        "Reply with exactly: KODGAR_RUNTIME_OK. Do not modify any files "
+        "and do not run any commands.",
+        repo, session, approval_mode="auto", approved=True,
+        executor=default_executor(),
+    )
+    assert result.success is True and result.status == "PASS"
+    assert result.summary == "KODGAR_RUNTIME_OK"
+    assert "worker_touched" not in dir() or not worker_touched
+    assert (temp_repo / "app.py").read_text() == before
+    stages = [e["stage"] for e in result.events]
+    assert "execute" not in stages
+    assert any(e["stage"] == "route" and "chat" in e["message"] for e in result.events)
+
+
+def test_readonly_classification_covers_explicit_no_mutation():
+    from app.cli.pipeline import is_explicit_readonly
+
+    assert is_explicit_readonly(
+        "Reply with exactly: KODGAR_RUNTIME_OK. Do not modify any files "
+        "and do not run any commands."
+    )
+    assert not is_explicit_readonly("fix the login tests")
+
+
+def test_doctor_includes_execution_path_checks(tmp_path, monkeypatch, capsys):
+    """kodgar-doctor must surface executor wiring, workers, and LLM."""
+    from app.llm import ninerouter as ninerouter_module
+    from app.product_config import write_llm_config
+
+    target = str(tmp_path / "config.toml")
+    write_llm_config(target, provider="9router", base_url="http://127.0.0.1:20128", model="auto")
+    monkeypatch.setenv("YODAW_CONFIG", target)
+    monkeypatch.setattr(ninerouter_module, "find_cli", lambda: "/usr/local/bin/9router")
+    monkeypatch.setattr(ninerouter_module, "daemon_health", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ninerouter_module, "list_models",
+        lambda *a, **k: {"models": ["m/x"], "combos": [], "base_url": "http://127.0.0.1:20128"},
+    )
+    monkeypatch.setattr(
+        ninerouter_module, "build_fallback_chain",
+        lambda *a, **k: {"healthy": [{"model": "m/x"}], "rejected": []},
+    )
+    import app.cli.main as main_module
+
+    monkeypatch.setattr(
+        main_module, "_", None, raising=False
+    )  # no-op guard; real LocalLLMProvider call is mocked below
+    from app.llm import provider as provider_module
+
+    class FakeProvider:
+        style = "9router"
+        model = "m/x"
+
+        def chat(self, system, user):
+            return "OK"
+
+    monkeypatch.setattr(provider_module, "LocalLLMProvider", lambda: FakeProvider())
+    code = main_module.main(["kodgar-doctor", "--json"])
+    assert code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    names = {c["name"]: c for c in payload["checks"]}
+    assert names["executor wiring"]["ok"] is True
+    assert names["worker registry"]["ok"] is True
+    assert names["llm inference"]["ok"] is True
+
 def test_run_task_interrupted_preserves_session(temp_repo, sessions_dir):
     repo = detect_repo(temp_repo)
     session = _session(temp_repo)
