@@ -43,7 +43,7 @@ class SmokeTestRunner:
             # Step 1: Load the skill
             loader = self.loader_factory.create_loader(
                 source_type=manifest.source.type,
-                source_config=manifest.source.to_dict(),
+                source_config=manifest.source.to_dict(include_credentials=False),
                 cache_enabled=False,
             )
 

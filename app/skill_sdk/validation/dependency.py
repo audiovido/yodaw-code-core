@@ -40,14 +40,7 @@ class DependencyChecker:
 
     def _check_manifest_dependencies(self, manifest: SkillManifest) -> List[str]:
         """Check dependencies listed in the manifest."""
-        issues = []
-
-        # For now, we don't have dependencies in the manifest model itself
-        # This would be extended if we add dependencies to SkillManifest
-        # For now, we'll check the compatibility dependencies
-        pass
-
-        return issues
+        return self._check_dependencies(manifest.dependencies)
 
     def _check_compatibility_dependencies(
         self,
@@ -55,26 +48,23 @@ class DependencyChecker:
         available_skills: Optional[List[str]] = None
     ) -> List[str]:
         """Check dependencies in the compatibility section."""
-        issues = []
+        return self._check_dependencies(manifest.compatibility.dependencies)
 
-        for dep in manifest.compatibility.dependencies:
-            # Check if dependency has required fields
-            if not dep.skill_id:
+    def _check_dependencies(
+        self,
+        dependencies: List[SkillDependency],
+    ) -> List[str]:
+        issues = []
+        for dep in dependencies:
+            if not isinstance(dep.skill_id, str) or not dep.skill_id.strip():
                 issues.append("Dependency missing skill_id")
                 continue
 
-            # Check if dependency is available (if we have a list of available skills)
-            if available_skills is not None and dep.skill_id not in available_skills:
-                if not dep.optional:
-                    issues.append(f"Required dependency not available: {dep.skill_id}")
+            if not isinstance(dep.optional, bool):
+                issues.append(f"Dependency {dep.skill_id} has invalid optional value")
 
-            # Validate version constraint format (basic)
-            if dep.version_constraint:
-                # Simple validation - in practice this would be more sophisticated
-                if not any(op in dep.version_constraint for op in ['>=', '>', '<=', '<', '==', '~=', '^']):
-                    if dep.version_constraint != '*':
-                        # Might be a version without constraint - that's OK
-                        pass
+            if dep.version_constraint and not isinstance(dep.version_constraint, str):
+                issues.append(f"Dependency {dep.skill_id} has invalid version constraint")
 
         return issues
 
@@ -86,19 +76,19 @@ class DependencyChecker:
         """Check for circular dependencies among skills.
         Returns list of circular dependency issues found.
         """
-        issues = []
-
-        # Build dependency graph
         dependency_graph = {}
         for skill_id, skill_manifest in all_manifests.items():
-            deps = [dep.skill_id for dep in skill_manifest.compatibility.dependencies if dep.skill_id]
-            dependency_graph[skill_id] = deps
+            dependencies = list(skill_manifest.dependencies)
+            dependencies.extend(skill_manifest.compatibility.dependencies)
+            dependency_graph[skill_id] = [
+                dep.skill_id for dep in dependencies if dep.skill_id
+            ]
 
-        # Check for circular dependencies using DFS
         visited = set()
         rec_stack = set()
+        issues = []
 
-        def dfs(node):
+        def dfs(node: str) -> bool:
             visited.add(node)
             rec_stack.add(node)
 
@@ -113,9 +103,8 @@ class DependencyChecker:
             return False
 
         for node in dependency_graph:
-            if node not in visited:
-                if dfs(node):
-                    issues.append(f"Circular dependency detected involving skill: {node}")
-                    break  # Just report one for now
+            if node not in visited and dfs(node):
+                issues.append(f"Circular dependency detected involving skill: {node}")
+                break
 
         return issues

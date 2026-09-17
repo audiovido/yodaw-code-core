@@ -110,7 +110,7 @@ class CandidateValidator:
             # Try to create a loader for the skill's source
             loader = self.loader_factory.create_loader(
                 source_type=manifest.source.type,
-                source_config=manifest.source.to_dict(),
+                source_config=manifest.source.to_dict(include_credentials=False),
                 cache_enabled=False,
             )
 
@@ -137,7 +137,7 @@ class CandidateValidator:
         try:
             loader = self.loader_factory.create_loader(
                 source_type=manifest.source.type,
-                source_config=manifest.source.to_dict(),
+                source_config=manifest.source.to_dict(include_credentials=False),
                 cache_enabled=False,
             )
 

@@ -1,4 +1,5 @@
 """
+from sqlite3 import connect
 Stage 8.2/8.3/8.5: mission execution coordinator.
 
 Owns the async execution runtime:

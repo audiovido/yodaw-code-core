@@ -3,4 +3,5 @@ uvicorn[standard]
 pydantic
 pytest
 httpx
+PyYAML>=6.0
 psycopg[binary]>=3.1
