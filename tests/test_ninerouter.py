@@ -43,6 +43,7 @@ _ENV_NAMES = (
     "YODAW_LLM_API_KEY",
     "YODAW_LLM_API_KEY_ENV",
     "YODAW_LLM_FALLBACKS",
+    "YODAW_LLM_FALLBACK_MODELS",
     "YODAW_PROVIDER_MAX_RETRIES",
     "YODAW_PROVIDER_BACKOFF_SECONDS",
     "YODAW_LLM_TIMEOUT_SECONDS",
@@ -733,6 +734,19 @@ def _patch_zero_touch(
     monkeypatch, key="sk-local-zero-touch", local_servers=None
 ):
     """Patch every provisioning seam so the CLI flow stays hermetic."""
+    # Certification happens against ninerouter.httpx (the seam the
+    # new health-aware selection uses); the fixture's inventory
+    # routes must certify PASS.
+    cert_post = lambda url, json=None, headers=None, timeout=None: _response(
+        _chat_payload("OK"), method="POST", url=url
+    )
+    monkeypatch.setattr(
+        ninerouter_module,
+        "httpx",
+        FakeHttpx(get=lambda url, headers=None, timeout=None: _response(
+            MODELS_PAYLOAD, url=url
+        ), post=cert_post),
+    )
     monkeypatch.setattr(
         ninerouter_module,
         "detect_install",
@@ -873,7 +887,11 @@ def test_setup_9router_reuses_persisted_key_not_home_dir(
     code = cli_main(["setup-9router", "--path", target, "--no-verify"])
     assert code == 0, capsys.readouterr().err
     assert reached["admin_attempted"] is False
-    assert "9Router is ready" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "9Router is ready" in out
+    # The healthy chain is persisted for future shells (YODAW_LLM_
+    # FALLBACK_MODELS), and the primary is certified, not just listed.
+    assert "healthy" in out
 
 
 def test_setup_9router_empty_inventory_with_pin(tmp_path, monkeypatch, capsys):
@@ -1037,12 +1055,33 @@ def _mock_9router(monkeypatch):
     return fake
 
 
+def _mock_9router_with_inventory(monkeypatch):
+    """Mock inventory (ninerouter.httpx) + provider chat (provider.httpx).
+
+    The health-aware auto-resolution path probes GET /v1/models and
+    POST /v1/chat/completions through the ninerouter seam; the
+    provider seam carries the actual agent chat traffic.
+    """
+
+    def nr_post(url, json=None, headers=None, timeout=None):
+        return _response(_chat_payload("OK"), method="POST", url=url)
+
+    inventory = FakeHttpx(
+        get=lambda url, headers=None, timeout=None: _response(
+            MODELS_PAYLOAD, url=url
+        ),
+        post=nr_post,
+    )
+    monkeypatch.setattr(ninerouter_module, "httpx", inventory)
+    return _mock_9router(monkeypatch)
+
+
 def test_worker_e2e_through_mock_9router(tmp_path, monkeypatch):
     import app.workers.repo_code_worker as worker_module
 
     monkeypatch.setenv("YODAW_LLM_STYLE", "9router")
-    monkeypatch.setenv("YODAW_LLM_MODEL", "premium-coding")
-    fake = _mock_9router(monkeypatch)
+    monkeypatch.setenv("YODAW_LLM_MODEL", "auto")
+    fake = _mock_9router_with_inventory(monkeypatch)
 
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -1087,8 +1126,8 @@ def test_mission_e2e_through_mock_9router(tmp_path, monkeypatch):
     import app.main as main_module
 
     monkeypatch.setenv("YODAW_LLM_STYLE", "9router")
-    monkeypatch.setenv("YODAW_LLM_MODEL", "premium-coding")
-    _mock_9router(monkeypatch)
+    monkeypatch.setenv("YODAW_LLM_MODEL", "auto")
+    _mock_9router_with_inventory(monkeypatch)
 
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -1571,6 +1610,21 @@ def test_setup_9router_registers_local_servers(
     monkeypatch.setattr(
         ninerouter_module, "auto_provision", fake_auto_provision
     )
+    # Health-aware certification must never touch the live network in
+    # tests: prove the local gemma route with a mocked REAL chat probe.
+    monkeypatch.setattr(
+        ninerouter_module,
+        "certify_route",
+        lambda model, base_url=ninerouter_module.DEFAULT_BASE_URL,
+        api_key="", timeout=20.0, max_tokens=16: {
+            "model": model,
+            "status": 200,
+            "classification": "PASS",
+            "ok": True,
+            "content": "OK",
+            "detail": "",
+        },
+    )
     monkeypatch.setattr(
         ninerouter_module,
         "detect_install",
@@ -1725,6 +1779,92 @@ def test_resolve_admin_no_match_lists_attempts(tmp_path, monkeypatch):
     monkeypatch.setattr(nr, "_try_admin_token", lambda *a, **k: None)
     with pytest.raises(nr.NinerouterAdminError, match="tried:"):
         nr.resolve_admin("http://127.0.0.1:20128", tmp_path / "req")
+
+
+def test_kodgar_certifies_persists_and_exports_fallbacks(
+    tmp_path, monkeypatch, capsys
+):
+    """kodgar: daemon up -> certify chain -> persist config + fallbacks."""
+    from app.cli.main import main as cli_main
+
+    monkeypatch.setattr(
+        ninerouter_module, "daemon_health", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        ninerouter_module,
+        "list_models",
+        lambda base_url, api_key="", timeout=10.0: {
+            "models": ["kr/glm-5", "kr/claude-sonnet-4.5"],
+            "combos": ["premium-coding"],
+            "base_url": base_url,
+        },
+    )
+    monkeypatch.setattr(
+        ninerouter_module,
+        "certify_route",
+        lambda model, base_url=ninerouter_module.DEFAULT_BASE_URL,
+        api_key="", timeout=20.0, max_tokens=16: {
+            "model": model,
+            "status": 200,
+            "classification": "PASS",
+            "ok": True,
+            "content": "OK",
+            "detail": "",
+        },
+    )
+
+    target = str(tmp_path / "config.toml")
+    code = cli_main(["kodgar", "--path", target, "--json"])
+    assert code == 0, capsys.readouterr()
+
+    payload = json.loads(capsys.readouterr().out)
+    # Combo-first deterministic preference, all routes certified PASS.
+    assert payload["model"] == "premium-coding"
+    assert payload["healthy_routes"] == [
+        "premium-coding",
+        "kr/claude-sonnet-4.5",
+        "kr/glm-5",
+    ]
+    cfg = load_product_config(target)
+    assert cfg.model == "premium-coding"
+    assert cfg.provider == "9router"
+    # The certified fallback chain is exported for the runtime.
+    import os as _os
+
+    assert (
+        _os.environ["YODAW_LLM_FALLBACK_MODELS"]
+        == "kr/claude-sonnet-4.5,kr/glm-5"
+    )
+
+
+def test_kodgar_doctor_reports_unhealthy_without_daemon(
+    tmp_path, monkeypatch, capsys
+):
+    """kodgar-doctor: fail-closed, non-destructive, exit 1 when down."""
+    from app.cli.main import main as cli_main
+
+    monkeypatch.setattr(
+        ninerouter_module, "daemon_health", lambda *a, **k: False
+    )
+
+    target = tmp_path / "config.toml"
+    target.write_text(
+        '[llm]\nprovider = "9router"\nmode = "local"\n'
+        'base_url = "http://127.0.0.1:20128"\n'
+    )
+    monkeypatch.setenv("YODAW_CONFIG", str(target))
+    code = cli_main(["kodgar-doctor", "--json"])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    by_name = {c["name"]: c for c in payload["checks"]}
+    assert by_name["daemon"]["ok"] is False
+    assert by_name["certified route"]["detail"] == "skipped (no reachable inventory)"
+    # Non-destructive: never wrote or mutated anything.
+    assert target.read_text() == (
+        '[llm]\nprovider = "9router"\nmode = "local"\n'
+        'base_url = "http://127.0.0.1:20128"\n'
+    )
 
 
 def test_start_daemon_precreates_secret_and_binds_loopback(

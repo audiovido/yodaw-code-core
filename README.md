@@ -1,5 +1,51 @@
 # YODAW Code Core
 
+## Installation (kodgar installers)
+
+One-command installers ship in `scripts/` and produce a complete,
+zero-touch install including the 9Router lifecycle and a persistent
+local model server:
+
+**macOS** (`scripts/install_macos.sh`):
+
+```bash
+bash scripts/install_macos.sh                      # standard install to ~/.yodaw
+bash scripts/install_macos.sh --with-launchagent   # + launchd `yodaw serve` at login
+bash scripts/install_macos.sh --install-dir /opt/yodaw
+```
+
+Detects the architecture (Apple Silicon / Intel) and Python 3.12
+(Xcode CLT, Homebrew, or python.org), then runs `scripts/bootstrap.py`
+(isolated venv, dependencies, wrapper, 9Router provisioning).
+
+**Repair an existing macOS machine** (idempotent, no reinstall):
+
+```bash
+bash scripts/repair_current_mac.sh
+```
+
+Ensures the persistent Ollama LaunchAgent and the 9Router keeper
+(auto-recovery) LaunchAgent, waits for a healthy daemon, re-registers
+local model servers, certifies a healthy route, and persists primary
++ fallbacks.
+
+**Windows** (`scripts/install_windows.bat` / `install_windows.ps1`):
+
+```bat
+scripts\install_windows.bat
+scripts\install_windows.bat -Skip9Router
+scripts\install_windows.bat -InstallDir D:\yodaw
+```
+
+The `.bat` shim bootstraps Windows PowerShell and runs the `.ps1`
+installer (py-launcher/PATH Python 3.12 detection, source copy,
+venv, dependencies, `yodaw.cmd` on the user PATH).
+
+**Post-install health check:** `yodaw kodgar-doctor` (or
+`python3 scripts/live_check.py` for a bounded live inventory probe).
+`yodaw kodgar` re-certifies routes and re-persists the chain at any
+time.
+
 ## Launcher (one command)
 
 `./yodaw` (or `python -m app.launcher`) is the product entrypoint: it

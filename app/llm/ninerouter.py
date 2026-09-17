@@ -36,6 +36,13 @@ import shutil
 from typing import Optional
 
 import httpx
+
+# Deterministic tiny probes used by route certification and
+# setup-9router's health-aware default selection.
+CERT_SYSTEM_PROMPT = "You are a provisioning check. Reply exactly."
+CERT_USER_PROMPT = "Reply with exactly: OK"
+CERT_ACCEPTABLE_TEXT = ("OK", "ok", "Ok")
+CHAT_VALIDATION_TIMEOUT_SECONDS = 20.0
 from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "http://127.0.0.1:20128"
@@ -194,6 +201,12 @@ def pick_default_model(models: list[str], combos: list[str]) -> str:
     providers with automatic fallback, which is exactly what YODAW
     wants), then any combo, then a preferred free/code model, then the
     first id alphabetically. Raises NinerouterError when empty.
+
+    NOTE: the inventory is not a health report - a listed combo can
+    still 403 upstream (e.g. a free-tier provider rejecting the
+    routed model). ``pick_healthy_default_model`` wraps this with a
+    real certification probe and callers that persist configuration
+    must use it.
     """
     combos = sorted(combos or [])
     models = sorted(models or [])
@@ -217,6 +230,208 @@ def pick_default_model(models: list[str], combos: list[str]) -> str:
         "/v1/models), pin the model explicitly instead of auto: "
         "`yodaw setup-9router --model <provider/model>`."
     )
+
+
+def classify_route(model: str, status: int, body: str) -> str:
+    """Classify one certification attempt deterministically.
+
+    401/403 are deterministic auth/access failures (never retried
+    against the same route); 408/429/5xx and transport faults are
+    transient and may be retried or failover; anything else is
+    classified from the response body shape.
+    """
+    status = int(status)
+    if status == 200:
+        return "PASS"
+    if status == 401:
+        return "401"
+    if status == 403:
+        return "403"
+    if status == 408:
+        return "408"
+    if status == 429:
+        return "429"
+    if 500 <= status <= 599:
+        return "5xx"
+    if status == 0:
+        return "unavailable"
+    return "malformed"
+
+
+def certify_route(
+    model: str,
+    base_url: str = DEFAULT_BASE_URL,
+    api_key: str = "",
+    timeout: float = CHAT_VALIDATION_TIMEOUT_SECONDS,
+    max_tokens: int = 16,
+) -> dict:
+    """One REAL chat probe against ``model``; never raises.
+
+    Returns ``{"model", "status", "classification", "ok",
+    "content", "detail"}`` where ``content`` is the assistant text
+    (only present on PASS). The probe uses a deterministic prompt so
+    success requires actual inference, not just an HTTP 200.
+    """
+    root = normalize_base_url(base_url)
+    url = f"{root}{CHAT_PATH}"
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": CERT_SYSTEM_PROMPT},
+            {"role": "user", "content": CERT_USER_PROMPT},
+        ],
+    }
+    status = 0
+    text = ""
+    detail = ""
+    try:
+        response = httpx.post(
+            url,
+            json=payload,
+            headers=_auth_headers(api_key),
+            timeout=timeout,
+        )
+        status = getattr(response, "status_code", 0)
+        try:
+            body = response.json()
+        except ValueError:
+            # Shipping 9Router appends a literal `data: [DONE]` SSE
+            # trailer to some non-streaming proxied responses, which
+            # breaks strict parsing even on HTTP 200 with a perfectly
+            # valid completion. Use the lenient parser before giving
+            # up - otherwise healthy routes are misclassified as
+            # "malformed" and never certified.
+            try:
+                body = lenient_json_loads(response.text)
+            except Exception:
+                body = None
+                text = ""
+        if status == 200 and isinstance(body, dict):
+            try:
+                text = parse_chat_response(body)
+            except NinerouterError as exc:
+                detail = str(exc)
+        elif isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                detail = str(err.get("message") or "")
+            elif err is not None:
+                detail = str(err)
+    except Exception as exc:  # transport fault: timeout / refused
+        name = type(exc).__name__
+        if isinstance(exc, httpx.TimeoutException):
+            classification = "timeout"
+        else:
+            classification = "unavailable"
+        return {
+            "model": model,
+            "status": 0,
+            "classification": classification,
+            "ok": False,
+            "content": "",
+            "detail": f"{name}: {exc}"[:300],
+        }
+
+    classification = classify_route(model, status, text)
+    ok = classification == "PASS" and bool((text or "").strip())
+    if not ok and classification == "PASS":
+        classification = "malformed"
+    return {
+        "model": model,
+        "status": status,
+        "classification": classification,
+        "ok": ok,
+        "content": text if ok else "",
+        "detail": (detail or (text if ok else ""))[:300],
+    }
+
+
+def build_fallback_chain(
+    models: list[str],
+    combos: list[str],
+    base_url: str = DEFAULT_BASE_URL,
+    api_key: str = "",
+    wanted: int = 3,
+    timeout: float = CHAT_VALIDATION_TIMEOUT_SECONDS,
+) -> dict:
+    """Certify routes with REAL tiny chats; return primary+fallbacks.
+
+    Candidates are ordered combo-first (deterministic preference),
+    then concrete models. Routes that complete a real chat with
+    non-empty assistant text become the healthy chain; every other
+    route is classified (401/403/429/5xx/timeout/unavailable/
+    malformed). ``wanted`` is a cap, not a promise - the chain only
+    contains routes that actually passed.
+    """
+    ordered = []
+    for combo in sorted(combos or []):
+        if combo not in ordered:
+            ordered.append(combo)
+    for model in sorted(models or []):
+        if model not in ordered:
+            ordered.append(model)
+
+    if not ordered:
+        raise NinerouterError(
+            "9Router reports no models and no combos; nothing to "
+            "certify. Connect a provider in the dashboard first."
+        )
+
+    healthy: list[dict] = []
+    rejected: list[dict] = []
+    for candidate in ordered:
+        if len(healthy) >= max(1, wanted) and healthy:
+            break
+        result = certify_route(
+            candidate, base_url=base_url, api_key=api_key, timeout=timeout
+        )
+        if result["ok"]:
+            healthy.append(result)
+        else:
+            rejected.append(result)
+
+    return {
+        "primary": healthy[0]["model"] if healthy else None,
+        "fallbacks": [r["model"] for r in healthy[1:]],
+        "healthy": healthy,
+        "rejected": rejected,
+    }
+
+
+def pick_healthy_default_model(
+    models: list[str],
+    combos: list[str],
+    base_url: str = DEFAULT_BASE_URL,
+    api_key: str = "",
+    timeout: float = CHAT_VALIDATION_TIMEOUT_SECONDS,
+) -> str:
+    """pick_default_model, proven against the live gateway.
+
+    Falls through candidates in the deterministic order until one
+    completes a REAL tiny chat; raises NinerouterError when no route
+    works (never silently pins a dead route).
+    """
+    chain = build_fallback_chain(
+        models,
+        combos,
+        base_url=base_url,
+        api_key=api_key,
+        wanted=1,
+        timeout=timeout,
+    )
+    if not chain["primary"]:
+        summary = "; ".join(
+            f"{r['model']}={r['classification']}" for r in chain["rejected"][:6]
+        )
+        raise NinerouterError(
+            "no healthy 9Router route completed a real chat request "
+            f"({summary or 'inventory empty'}). Connect a working "
+            "provider in the dashboard, or pin a known-good model: "
+            "`yodaw setup-9router --model <provider/model>`."
+        )
+    return chain["primary"]
 
 
 _model_cache: dict[str, str] = {}
@@ -246,9 +461,25 @@ def resolve_model(
     key = normalize_base_url(base_url)
     if key not in _model_cache:
         listing = list_models(base_url, api_key, timeout=timeout)
-        _model_cache[key] = pick_default_model(
-            listing["models"], listing["combos"]
-        )
+        # Health-aware: prove the candidate with a REAL chat probe.
+        # A bare inventory pick can select a combo that 403s upstream
+        # (e.g. a free-tier provider), which must never become the
+        # auto-selected default.
+        try:
+            _model_cache[key] = pick_healthy_default_model(
+                listing["models"],
+                listing["combos"],
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+            )
+        except NinerouterError:
+            # No route passed certification: fall back to the
+            # deterministic inventory pick (callers still verify and
+            # classify the actual failure).
+            _model_cache[key] = pick_default_model(
+                listing["models"], listing["combos"]
+            )
     return _model_cache[key]
 
 
@@ -330,9 +561,21 @@ def chat(
 
     The runtime path is :class:`app.llm.provider.LocalLLMProvider`
     (bounded retries + attempt log); this helper is a thin direct
-    client for scripts and smoke checks.
+    client for scripts and smoke checks. An ``auto`` model resolves
+    through the health-aware default (a REAL probe), never a bare
+    inventory pick.
     """
-    effective = resolve_model(base_url, api_key, model)
+    if (model or "").strip() in ("", "auto"):
+        listing = list_models(base_url, api_key, timeout=timeout)
+        effective = pick_healthy_default_model(
+            listing["models"],
+            listing["combos"],
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+    else:
+        effective = model
     url, payload, headers = build_chat_request(
         base_url, effective, system, user, api_key
     )
@@ -911,7 +1154,38 @@ def validate_gateway_key(
         )
     except Exception:
         return True
-    return getattr(response, "status_code", 200) not in (401, 403)
+    status = getattr(response, "status_code", 200)
+    if status not in (401, 403):
+        return True
+    # Distinguish a LOCAL gateway auth rejection from an UPSTREAM
+    # provider rejection. A 403 whose body mentions the provider
+    # (e.g. "Error from provider ...", free-tier/credential/quota
+    # wording) means the gateway ACCEPTED our key and the failure is
+    # upstream - rotating the local key would never fix that and
+    # would only mint useless credentials. Only a gateway-level
+    # rejection (401, or a 403 without provider context) invalidates
+    # the local key.
+    try:
+        body = response.json()
+        message = str((body or {}).get("error", ""))
+        if isinstance((body or {}).get("error"), dict):
+            message = str(body["error"].get("message", ""))
+    except Exception:
+        message = ""
+    lowered = message.lower()
+    upstream_markers = (
+        "error from provider",
+        "provider",
+        "freetier",
+        "free tier",
+        "quota",
+        "subscription",
+        "upstream",
+        "credential",
+    )
+    if status == 403 and any(m in lowered for m in upstream_markers):
+        return True  # upstream access problem: the local key is fine
+    return False
 
 
 def provision_gateway_key(

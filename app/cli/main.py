@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Sequence
 
@@ -129,6 +130,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     models_p.add_argument("--base-url", default=None, help="9Router base URL override")
     models_p.add_argument("--json", action="store_true", help="machine-readable output")
+    kodgar_p = sub.add_parser(
+        "kodgar",
+        help=(
+            "one-stop 9Router lifecycle owner: probe, ensure daemon, "
+            "certify routes, persist config + certified fallback chain"
+        ),
+    )
+    kodgar_p.add_argument("--path", default=None, help="config file to write")
+    kodgar_p.add_argument("--base-url", default=None, help="9Router base URL")
+    kodgar_p.add_argument(
+        "--model",
+        default=None,
+        help="pin a model/combo (default: certify and pick the healthiest)",
+   )
+    kodgar_p.add_argument(
+        "--api-key-env",
+        default=None,
+        help="env var holding the gateway key (default: NINEROUTER_API_KEY)",
+    )
+    kodgar_p.add_argument(
+        "--data-dir",
+        default=None,
+        help="9Router data directory (default: $DATA_DIR or ~/.9router)",
+    )
+    kodgar_p.add_argument(
+        "--key-name",
+        default=None,
+        help="name of the local gateway key to provision",
+    )
+    kodgar_p.add_argument(
+        "--install",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="install/start the 9Router daemon automatically (default)",
+    )
+    kodgar_p.add_argument("--timeout", type=float, default=30.0)
+    kodgar_p.add_argument("--json", action="store_true", help="machine-readable output")
+    doctor_p = sub.add_parser(
+        "kodgar-doctor",
+        help="non-destructive health check: daemon, key, certified routes",
+    )
+    doctor_p.add_argument("--json", action="store_true", help="machine-readable output")
     sub.add_parser("version", help="print the CLI version")
     return parser
 
@@ -498,18 +541,72 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
             print(f"setup-9router: {message}", file=sys.stderr)
         return EXIT_TASK_FAILURE
 
-    if detected is None:
-        # Empty inventory with an explicit --model pin: some 9Router
-        # versions omit connected providers (e.g. ollama-local) from
-        # /v1/models. Trust the pin; verification still proves it.
-        print(
-            "warning: 9Router inventory is empty; trusting --model "
-            "pin (verification will prove it)",
-            file=sys.stderr,
-        )
-        model = requested.strip()
+    # ---- health-aware route certification --------------------------
+    # A listed combo/model is not necessarily usable (upstream free
+    # tiers may 403). Certify candidates with REAL tiny chats and
+    # select the primary plus fallbacks ONLY from routes that passed.
+    healthy: list[dict] = []
+    rejected: list[dict] = []
+    certified: list[str] = []
+    if not (requested and requested.strip() != "auto"):
+        try:
+            chain = ninerouter.build_fallback_chain(
+                models,
+                combos,
+                base_url=normalized,
+                api_key=api_key,
+                wanted=3,
+                timeout=max(timeout, 30.0),
+            )
+        except ninerouter.NinerouterError as exc:
+            if as_json:
+                print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+            else:
+                print(f"setup-9router: {exc}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        healthy = chain["healthy"]
+        rejected = chain["rejected"]
+        certified = [r["model"] for r in healthy]
+        if healthy:
+            model = healthy[0]["model"]
+        else:
+            summary = "; ".join(
+                f"{r['model']}={r['classification']}" for r in rejected[:6]
+            )
+            message = (
+                "no 9Router route completed a real chat request "
+                f"({summary}). Fix the upstream provider in the "
+                "dashboard (e.g. free-tier credentials) or pin a "
+                "known-good model with --model."
+            )
+            if as_json:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": message,
+                            "rejected": [
+                                {
+                                    "model": r["model"],
+                                    "classification": r["classification"],
+                                }
+                                for r in rejected
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"setup-9router: {message}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        for result in rejected:
+            print(
+                f"route rejected: {result['model']} -> "
+                f"{result['classification']}",
+                file=sys.stderr,
+            )
     else:
-        model = detected if not requested else requested.strip()
+        model = requested.strip()
     if model and model != "auto":
         known = set(models) | set(combos)
         if model not in known:
@@ -546,6 +643,57 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"could not persist gateway key: {exc}", file=sys.stderr)
         return EXIT_TASK_FAILURE
+
+    # Persist the certified healthy chain into the environment the
+    # runtime already reads (YODAW_LLM_FALLBACK_MODELS), for BOTH the
+    # current process and future shells (launchd plist + shell rc).
+    # Existing environment values win, so manual operator overrides
+    # are never clobbered.
+    fallback_route = ",".join(certified[1:]) if len(certified) > 1 else ""
+    if fallback_route and "YODAW_LLM_FALLBACK_MODELS" not in os.environ:
+        os.environ["YODAW_LLM_FALLBACK_MODELS"] = fallback_route
+    exported_fallbacks = False
+    if fallback_route:
+        for rc in (
+            Path(os.path.expanduser("~")) / ".zshrc",
+            Path(os.path.expanduser("~")) / ".bashrc",
+        ):
+            marker = "# kodgar: certified 9Router fallback routes"
+            try:
+                rc_text = rc.read_text(encoding="utf-8") if rc.exists() else ""
+            except OSError:
+                rc_text = ""
+            if marker in rc_text:
+                # Keep the certified chain current (a previously
+                # exported route may have since failed certification).
+                new_block = (
+                    f"{marker}\n"
+                    f'export YODAW_LLM_FALLBACK_MODELS="{fallback_route}"\n'
+                )
+                import re as _re
+
+                updated = _re.sub(
+                    marker + r"\nexport YODAW_LLM_FALLBACK_MODELS=\"[^\"\n]*\"\n",
+                    new_block,
+                    rc_text,
+                )
+                if updated != rc_text:
+                    try:
+                        rc.write_text(updated, encoding="utf-8")
+                        exported_fallbacks = True
+                    except OSError:
+                        pass
+            else:
+                block = (
+                    f"\n{marker}\n"
+                    f'export YODAW_LLM_FALLBACK_MODELS="{fallback_route}"\n'
+                )
+                try:
+                    with open(rc, "a", encoding="utf-8") as handle:
+                        handle.write(block)
+                    exported_fallbacks = True
+                except OSError:
+                    pass
 
     # ---- 5: verification ---------------------------------------------
     verified: object = "skipped"
@@ -604,6 +752,15 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
                     "models": len(models),
                     "combos": len(combos),
                     "verified": verified,
+                    "healthy_routes": certified,
+                    "rejected_routes": [
+                        {
+                            "model": r["model"],
+                            "classification": r["classification"],
+                        }
+                        for r in rejected
+                    ],
+                    "fallback_models_exported": exported_fallbacks,
                 },
                 indent=2,
             )
@@ -628,6 +785,13 @@ def cmd_setup_9router(args: argparse.Namespace) -> int:
     if combos:
         print(f"  combos   : {', '.join(combos[:8])}")
     print(f"  model    : {model}")
+    if certified:
+        print(f"  healthy  : {', '.join(certified)}")
+        for result in rejected:
+            print(
+                f"  rejected : {result['model']} "
+                f"({result['classification']})"
+            )
     print(f"  config   : {written}")
     print(f"  key file : {key_file or 'n/a (using environment)'}")
     print(f"  verified : {verified}")
@@ -647,6 +811,361 @@ def _provisioning_summary(provisioned) -> object:
         "gateway_key": gateway_key,
         "local_servers": provisioned.get("local_servers"),
     }
+
+
+def cmd_kodgar(args: argparse.Namespace) -> int:
+    """Single owner of the 9Router lifecycle (probe->certify->persist).
+
+    Never starts a second daemon when one already answers; reuses the
+    existing key when valid; certifies routes with REAL tiny chats;
+    persists the healthy chain (primary + fallbacks) so the runtime
+    can fail over without re-certifying.
+    """
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    from app.llm import ninerouter
+    from app.product_config import (
+        ConfigError,
+        config_file_candidates,
+        write_api_key_file,
+        write_llm_config,
+    )
+
+    as_json = bool(getattr(args, "json", False))
+    base_url = (
+        getattr(args, "base_url", None)
+        or ninerouter.DEFAULT_BASE_URL
+    )
+    api_key_env = (
+        getattr(args, "api_key_env", None) or ninerouter.DEFAULT_API_KEY_ENV
+    )
+    existing_key = os.environ.get(api_key_env, "")
+    requested = (getattr(args, "model", None) or "").strip()
+    may_install = bool(getattr(args, "install", True))
+    timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+    data_dir = getattr(args, "data_dir", None)
+    data_dir = Path(data_dir) if data_dir else None
+    key_name = (
+        getattr(args, "key_name", None) or ninerouter.DEFAULT_KEY_NAME
+    )
+
+    # ---- ensure one reachable daemon --------------------------------
+    provisioned = None
+    if not ninerouter.daemon_health(base_url):
+        if not may_install:
+            message = (
+                f"9Router daemon not reachable at {base_url} and "
+                "--no-install given"
+            )
+            if as_json:
+                print(json.dumps({"ok": False, "error": message}, indent=2))
+            else:
+                print(f"kodgar: {message}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        log_dir = Path.home() / ".yodaw" / "logs"
+        try:
+            provisioned = ninerouter.auto_provision(
+                base_url,
+                data_dir=data_dir,
+                port=urlparse(base_url).port or ninerouter.DEFAULT_PORT,
+                key_name=key_name,
+                existing_key=existing_key,
+                install=True,
+                start=True,
+                log_file=log_dir / "9router.log",
+            )
+            api_key = (
+                provisioned["gateway_key"].get("key") or existing_key
+            )
+        except ninerouter.NinerouterAdminError as exc:
+            message = str(exc)
+            if as_json:
+                print(json.dumps({"ok": False, "error": message}, indent=2))
+            else:
+                print(f"kodgar: {message}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+    else:
+        api_key = existing_key
+
+    if not ninerouter.daemon_health(base_url):
+        message = f"9Router daemon still not reachable at {base_url}"
+        if as_json:
+            print(json.dumps({"ok": False, "error": message}, indent=2))
+        else:
+            print(f"kodgar: {message}", file=sys.stderr)
+        return EXIT_TASK_FAILURE
+
+    # ---- inventory + health-aware certification ----------------------
+    try:
+        listing = ninerouter.list_models(base_url, api_key)
+    except ninerouter.NinerouterError as exc:
+        message = str(exc)
+        if as_json:
+            print(json.dumps({"ok": False, "error": message}, indent=2))
+        else:
+            print(f"kodgar: {message}", file=sys.stderr)
+        return EXIT_TASK_FAILURE
+
+    models = listing["models"]
+    combos = listing["combos"]
+    if requested and requested != "auto":
+        model = requested
+        certified = [requested]
+        rejected = []
+        if requested not in (set(models) | set(combos)):
+            print(
+                f"warning: {requested!r} is not in the current 9Router "
+                f"inventory; persisting anyway",
+                file=sys.stderr,
+            )
+    else:
+        try:
+            chain = ninerouter.build_fallback_chain(
+                models,
+                combos,
+                base_url=base_url,
+                api_key=api_key,
+                wanted=3,
+                timeout=max(timeout, 30.0),
+            )
+        except ninerouter.NinerouterError as exc:
+            message = str(exc)
+            if as_json:
+                print(json.dumps({"ok": False, "error": message}, indent=2))
+            else:
+                print(f"kodgar: {message}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        healthy = chain["healthy"]
+        rejected = chain["rejected"]
+        certified = [r["model"] for r in healthy]
+        if not certified:
+            summary = "; ".join(
+                f"{r['model']}={r['classification']}" for r in rejected[:6]
+            )
+            message = (
+                "no 9Router route completed a real chat request "
+                f"({summary}). Connect a working provider in the "
+                "dashboard or pin one with --model."
+            )
+            if as_json:
+                print(json.dumps({"ok": False, "error": message}, indent=2))
+            else:
+                print(f"kodgar: {message}", file=sys.stderr)
+            return EXIT_TASK_FAILURE
+        model = certified[0]
+        for result in rejected:
+            print(
+                f"route rejected: {result['model']} -> "
+                f"{result['classification']}",
+                file=sys.stderr,
+            )
+
+    # ---- persist config + certified fallback chain -------------------
+    config_target = getattr(args, "path", None) or config_file_candidates()[1]
+    key_file_path = (
+        Path(os.path.dirname(os.path.abspath(config_target)))
+        / "secrets"
+        / "9router-api.key"
+    )
+    try:
+        key_file = (
+            write_api_key_file(api_key, str(key_file_path)) if api_key else None
+        )
+        written = write_llm_config(
+            config_target,
+            provider="9router",
+            model=model,
+            base_url=base_url,
+            api_key_env=api_key_env,
+            api_key_file=key_file,
+        )
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except OSError as exc:
+        print(f"could not persist gateway key: {exc}", file=sys.stderr)
+        return EXIT_TASK_FAILURE
+
+    fallback_route = ",".join(certified[1:]) if len(certified) > 1 else ""
+    if fallback_route and "YODAW_LLM_FALLBACK_MODELS" not in os.environ:
+        os.environ["YODAW_LLM_FALLBACK_MODELS"] = fallback_route
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "config": written,
+                    "key_file": key_file,
+                    "model": model,
+                    "base_url": base_url,
+                    "healthy_routes": certified,
+                    "rejected_routes": [
+                        {
+                            "model": r["model"],
+                            "classification": r["classification"],
+                        }
+                        for r in rejected
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return EXIT_OK
+
+    print("kodgar: 9Router lifecycle complete")
+    print(f"  endpoint : {base_url}")
+    print(f"  model    : {model}")
+    if certified:
+        print(f"  healthy  : {', '.join(certified)}")
+        for result in rejected:
+            print(
+                f"  rejected : {result['model']} "
+                f"({result['classification']})"
+            )
+    print(f"  config   : {written}")
+    print(f"  key file : {key_file or 'n/a (using environment)'}")
+    return EXIT_OK
+
+
+def cmd_kodgar_doctor(args: argparse.Namespace) -> int:
+    """Non-destructive health report; exit 1 when the gateway is down."""
+    from app.llm import ninerouter
+    from app.product_config import ConfigError, load_product_config
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        cfg = load_product_config()
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    base_url = cfg.base_url
+    api_key = cfg.api_key
+    checks: list[dict] = []
+
+    cli_path = ninerouter.find_cli()
+    checks.append(
+        {
+            "name": "cli",
+            "ok": bool(cli_path),
+            "detail": cli_path or "9router CLI not found on PATH",
+        }
+    )
+
+    reachable = ninerouter.daemon_health(base_url)
+    checks.append(
+        {
+            "name": "daemon",
+            "ok": reachable,
+            "detail": base_url if reachable else "not reachable",
+        }
+    )
+
+    inventory = None
+    if reachable:
+        try:
+            listing = ninerouter.list_models(base_url, api_key)
+            inventory = {
+                "models": len(listing["models"]),
+                "combos": len(listing["combos"]),
+            }
+            checks.append(
+                {
+                    "name": "inventory",
+                    "ok": bool(listing["models"] or listing["combos"]),
+                    "detail": (
+                        f"{len(listing['models'])} models, "
+                        f"{len(listing['combos'])} combos"
+                    ),
+                }
+            )
+        except ninerouter.NinerouterError as exc:
+            checks.append({"name": "inventory", "ok": False, "detail": str(exc)})
+    else:
+        checks.append(
+            {"name": "inventory", "ok": False, "detail": "skipped (daemon down)"}
+        )
+
+    certification = None
+    if reachable and (inventory is None or any(
+        inventory.values()
+    )):
+        try:
+            chain = ninerouter.build_fallback_chain(
+                (listing["models"] if inventory else []),
+                (listing["combos"] if inventory else []),
+                base_url=base_url,
+                api_key=api_key,
+                wanted=1,
+                timeout=30.0,
+            )
+        except ninerouter.NinerouterError as exc:
+            chain = {"healthy": [], "rejected": []}
+            checks.append({"name": "certified route", "ok": False, "detail": str(exc)})
+        else:
+            healthy = chain["healthy"]
+            rejected = chain["rejected"]
+            certification = {
+                "primary": healthy[0]["model"] if healthy else None,
+                "rejected": [
+                    {
+                        "model": r["model"],
+                        "classification": r["classification"],
+                    }
+                    for r in rejected
+                ],
+            }
+            if healthy:
+                checks.append(
+                    {
+                        "name": "certified route",
+                        "ok": True,
+                        "detail": (
+                            f"primary={healthy[0]['model']} "
+                            f"({len(rejected)} rejected)"
+                        ),
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "name": "certified route",
+                        "ok": False,
+                        "detail": (
+                            "no route completed a real chat "
+                            + "; ".join(
+                                f"{r['model']}={r['classification']}"
+                                for r in rejected[:4]
+                            )
+                        ),
+                    }
+                )
+    else:
+        checks.append(
+            {
+                "name": "certified route",
+                "ok": False,
+                "detail": "skipped (no reachable inventory)",
+            }
+        )
+
+    ok = all(check["ok"] for check in checks)
+    if as_json:
+        print(
+            json.dumps(
+                {"ok": ok, "base_url": base_url, "checks": checks},
+                indent=2,
+            )
+        )
+        return EXIT_OK if ok else EXIT_TASK_FAILURE
+
+    print(f"kodgar-doctor: {'healthy' if ok else 'UNHEALTHY'} ({base_url})")
+    for check in checks:
+        mark = "ok" if check["ok"] else "FAIL"
+        print(f"  [{mark:4}] {check['name']}: {check['detail']}")
+    return EXIT_OK if ok else EXIT_TASK_FAILURE
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -720,13 +1239,27 @@ def _apply_product_config() -> int:
         return EXIT_USAGE
     return EXIT_OK
 
-TASK_COMMANDS = (None, "run", "status", "resume", "sessions", "setup-9router", "models")
+TASK_COMMANDS = (
+    None,
+    "run",
+    "status",
+    "resume",
+    "sessions",
+    "setup-9router",
+    "kodgar",
+    "kodgar-doctor",
+    "models",
+)
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse argv and dispatch; bare `yodaw` opens the interactive REPL."""
     parser = _build_parser()
     raw = list(argv) if argv is not None else sys.argv[1:]
-    if raw and not raw[0].startswith("-") and raw[0] not in ("run", "status", "resume", "sessions", "config", "setup-9router", "models", "version", "-h", "--help"):
+    if raw and not raw[0].startswith("-") and raw[0] not in (
+        "run", "status", "resume", "sessions", "config",
+        "setup-9router", "kodgar", "kodgar-doctor", "models",
+        "version", "-h", "--help",
+    ):
         # Convenience: `yodaw "fix tests"` behaves like `yodaw run`.
         raw = ["run", *raw]
     full = parser.parse_args(raw)
@@ -751,6 +1284,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_config(full)
     if full.command == "setup-9router":
         return cmd_setup_9router(full)
+    if full.command == "kodgar":
+        return cmd_kodgar(full)
+    if full.command == "kodgar-doctor":
+        return cmd_kodgar_doctor(full)
     if full.command == "models":
         return cmd_models(full)
     if full.command == "version":
