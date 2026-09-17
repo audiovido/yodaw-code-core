@@ -16,6 +16,7 @@ from app.workers import (
     worktree_guard,
 )
 from app.workers.mission_evidence import now_iso
+from app.workers.python_runtime import user_site_env
 from app.workers.worker_errors import (
     MissionCancelled,
     MissionTimeout,
@@ -268,7 +269,7 @@ def run_validation(
 
     for cmd in test_commands:
         try:
-            result = run(cmd, cwd=worktree)
+            result = run(cmd, cwd=worktree, env=user_site_env())
         except FileNotFoundError as exc:
             # A selected validation tool must exist; fail with a
             # clear environment diagnostic, never a silent one.

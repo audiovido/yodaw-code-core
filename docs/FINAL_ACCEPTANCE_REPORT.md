@@ -176,6 +176,42 @@ health samples: 2   real chats: 2   failures: 0   VERDICT: PASS
   certify→chat), used for all evidence above
 - `kodgar-installer.zip` — contains only scripts + docs; secret-audited
 
+## Post-release executor-wiring hotfix (commit 54c8992)
+
+The installed CLI ran plan-only because `start_interactive()` and
+`cmd_run()` never passed an executor to `run_task`, so every goal hit
+`[execute] no execution backend wired; nothing was executed`. The fix
+wired the existing `execute_with_worker` as the default executor (DI
+preserved), added a read-only chat path for conversational goals,
+extended `kodgar-doctor` with `EXECUTOR_WIRING`, `WORKER_REGISTRY`, and
+`LLM_INFERENCE` checks, and taught the plan contract the `create`
+action (new-file edits) plus tolerant `parse_plan` handling for it.
+Regression coverage: `tests/test_cli_shell.py` (executor wiring,
+read-only path, NOT_EXECUTED guard) — all live acceptance paths
+(interactive REPL, non-interactive `run`, read-only reply,
+fresh-process default) re-verified against the real local model.
+
+## Post-hotfix hermetic-HOME validation fix
+
+After the hotfix, the two hermetic `test_ninerouter` worker-E2E tests
+failed on this machine — at every prior commit too. Root cause (found
+by bisecting the hermetic fixture and tracing the worker evidence
+dump): the fixture relocates `HOME`, and the worker's validation
+subprocesses inherit the relocated HOME while using an interpreter
+whose pytest is installed in *user site-packages* — which Python
+resolves **from HOME at interpreter boot**. The subprocess therefore
+could not import pytest, validation failed, and the edit (which had
+applied correctly) was misreported as a worker failure. Same failure
+class for any relocated-HOME deployment (launchd daemons, CI).
+
+Fix: `app/workers/python_runtime.py` now captures the boot-time user
+site-packages base once at process start and worker validation
+subprocesses (`run_validation` in both `repo_code_worker` and
+`validation.py`, the only two validation spawn points) pin
+`PYTHONUSERBASE` to that base — a no-op for venvs, framework builds,
+and stdlib-only interpreters, and an operator-set `PYTHONUSERBASE`
+always wins. Regression coverage: `tests/test_portable_python_runtime.py`.
+
 ## Secret audit
 
 - `git diff` / staged diff: no keys or tokens (config stores only the

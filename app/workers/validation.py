@@ -15,7 +15,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-from app.workers.python_runtime import resolve_python_executable
+from app.workers.python_runtime import (
+    resolve_python_executable,
+    user_site_env,
+)
 from app.workers.safe_subprocess import run, which
 from app.workers.worker_errors import ToolMissingError
 
@@ -212,6 +215,7 @@ def run_validation(
                 timeout=timeout,
                 cancel_check=cancel_check,
                 max_output_bytes=max_output_bytes,
+                env=user_site_env(),
             )
         except FileNotFoundError as exc:
             raise ToolMissingError(
