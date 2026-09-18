@@ -144,8 +144,12 @@ def build_repo_context(
     max_chars: int = 24000,
     max_entries: int = 200,
 ) -> str:
-    candidates = []
+    """Build bounded repository context with executable source before docs.
 
+    This keeps the existing flat-context fallback architecture, but prevents
+    README/Markdown/config files from consuming the entire context budget
+    before relevant source code is shown to the coding model.
+    """
     ignored_dirs = {
         ".git",
         ".venv",
@@ -157,9 +161,6 @@ def build_repo_context(
         ".pytest_cache",
     }
 
-    # SWARM_CONTEXT_ROBUSTNESS_V2
-    # Generated dependency manifests can consume the entire bounded
-    # context before real source code is reached.
     ignored_files = {
         "package-lock.json",
         "pnpm-lock.yaml",
@@ -171,55 +172,30 @@ def build_repo_context(
         ".DS_Store",
     }
 
-    allowed_suffixes = {
-        ".py",
-        ".js",
-        ".jsx",
-        ".ts",
-        ".tsx",
-        ".json",
-        ".md",
-        ".toml",
-        ".yaml",
-        ".yml",
-        ".java",
-        ".kt",
-        ".swift",
-        ".go",
-        ".rs",
-        ".rb",
-        ".php",
-        ".c",
-        ".cc",
-        ".cpp",
-        ".h",
-        ".hpp",
-        ".html",
-        ".css",
-        ".scss",
-        ".sass",
-        ".less",
-        ".vue",
-        ".svelte",
+    code_suffixes = {
+        ".py", ".js", ".jsx", ".ts", ".tsx",
+        ".java", ".kt", ".swift", ".go", ".rs",
+        ".rb", ".php", ".c", ".cc", ".cpp",
+        ".h", ".hpp", ".vue", ".svelte",
     }
 
-    # Walk with followlinks=False: symlinked directories are never
-    # traversed and symlinked files are skipped, so context can never
-    # leak outside the worktree or loop on directory cycles.
+    supplemental_suffixes = {
+        ".json", ".md", ".toml", ".yaml", ".yml",
+        ".html", ".css", ".scss", ".sass", ".less",
+    }
+
+    allowed_suffixes = code_suffixes | supplemental_suffixes
+    source_dirs = {"src", "app", "lib", "components", "pages", "tests", "test"}
+
+    code_candidates = []
+    supplemental_candidates = []
+
     for dirpath, dirnames, filenames in os.walk(worktree, followlinks=False):
-        source_dirs = {
-            "src",
-            "app",
-            "lib",
-            "components",
-            "pages",
-            "tests",
-            "test",
-        }
         dirnames[:] = sorted(
             (d for d in dirnames if d not in ignored_dirs),
             key=lambda d: (d not in source_dirs, d),
         )
+
         for name in sorted(filenames):
             if name in ignored_files:
                 continue
@@ -229,31 +205,60 @@ def build_repo_context(
             if path.is_symlink():
                 continue
 
-            if path.suffix.lower() not in allowed_suffixes:
+            suffix = path.suffix.lower()
+            if suffix not in allowed_suffixes:
                 continue
 
             try:
                 if path.stat().st_size > 120_000:
                     continue
-
                 content = path.read_text(errors="replace")
-
             except OSError:
                 continue
 
             rel = path.relative_to(worktree).as_posix()
+            block = f"\n--- FILE: {rel} ---\n{content}\n"
 
-            candidates.append(
-                f"\n--- FILE: {rel} ---\n{content}\n"
-            )
+            if suffix in code_suffixes:
+                code_candidates.append((rel, block))
+            else:
+                supplemental_candidates.append((rel, block))
 
-            if len(candidates) >= max_entries:
-                return "".join(candidates)[:max_chars]
+    # Deterministic ordering:
+    # executable source first, documentation/config only with remaining budget.
+    code_candidates.sort(
+        key=lambda item: (
+            not any(part in source_dirs for part in Path(item[0]).parts[:-1]),
+            item[0],
+        )
+    )
+    supplemental_candidates.sort(key=lambda item: item[0])
 
-    joined = "".join(candidates)
+    output = []
+    used = 0
+    entries = 0
 
-    return joined[:max_chars]
+    for _, block in code_candidates + supplemental_candidates:
+        if entries >= max_entries:
+            break
 
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+
+        if len(block) <= remaining:
+            output.append(block)
+            used += len(block)
+            entries += 1
+        elif not output:
+            # A single large source file may be clipped, but context must
+            # still contain real source rather than becoming empty.
+            output.append(block[:remaining])
+            used += remaining
+            entries += 1
+            break
+
+    return "".join(output)
 
 def _loads_plan_json_lenient(text: str):
     """Parse model JSON while tolerating raw control chars in strings.
