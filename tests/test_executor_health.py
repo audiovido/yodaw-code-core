@@ -38,6 +38,7 @@ from app.background.executors.health import (
     error_class_action,
 )
 from app.background.executors.registry import ExecutorRegistry
+from app.background.verifier import parse_test_counts
 from app.background.models import (
     ExecutionOutcome,
     ExecutorHealth,
@@ -775,3 +776,23 @@ class _FakeService:
             "unavailable": [h.id for h in hs if not h.eligible],
             "healthy": [h.id for h in hs if h.healthy],
         }
+
+
+# ------------------------------- 17. verifier count parsing (reporting)
+def test_test_count_parsing_handles_pytest_summary_order():
+    """pytest prints "N failed, M passed"; a parser that only accepts
+    "M passed, N failed" silently reports failures as zero.
+
+    Observed live: a suite that exited 1 with 4 failures was reported as
+    "1295 passed, 0 failed", which hides exactly the evidence the
+    verifier exists to surface.
+    """
+    assert parse_test_counts("4 failed, 1295 passed, 7 skipped in 611s") == (1295, 4)
+    assert parse_test_counts("1295 passed, 7 skipped in 611s") == (1295, 0)
+    assert parse_test_counts("1 failed in 2.32s") == (0, 1)
+    # Collection errors count as failures.
+    assert parse_test_counts("2 passed, 1 error in 3s") == (2, 1)
+    # Jest-style output is still understood.
+    assert parse_test_counts("Tests:       1 failed, 2 passed") == (2, 1)
+    # No counts at all -> no fabricated numbers.
+    assert parse_test_counts("no counts here") == (0, 0)

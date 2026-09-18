@@ -41,10 +41,13 @@ from app.workers.worker_errors import ToolMissingError
 # Checks that must be PASS for a task to be allowed to commit.
 MANDATORY_CHECKS = ("worktree", "files_changed", "expected_files", "syntax")
 
-PYTEST_COUNT = re.compile(
-    r"(?P<passed>\d+) passed(?:, (?P<failed>\d+) failed)?"
-)
+# pytest prints its summary in varying order ("4 failed, 1295
+# passed", or "1295 passed, 7 skipped"), so the counts are extracted
+# independently instead of assuming an order. Matching only
+# "N passed, M failed" silently reported failures as zero.
+PYTEST_COUNT = re.compile(r"(?P<passed>\d+) passed")
 PYTEST_FAILED = re.compile(r"(?P<failed>\d+) failed")
+PYTEST_ERRORS = re.compile(r"(?P<errors>\d+) errors?")
 JEST_COUNT = re.compile(r"Tests?:\s+(?P<failed>\d+) failed,\s+(?P<passed>\d+) passed")
 JEST_ALL = re.compile(r"Tests?:\s+(?P<passed>\d+) passed")
 
@@ -760,16 +763,22 @@ def parse_test_counts(text: str) -> tuple[int, int]:
     """
     if not text:
         return 0, 0
-    match = PYTEST_COUNT.search(text)
-    if match:
-        return int(match.group("passed")), int(match.group("failed") or 0)
     match = JEST_COUNT.search(text)
     if match:
         return int(match.group("passed")), int(match.group("failed"))
     match = JEST_ALL.search(text)
     if match:
         return int(match.group("passed")), 0
+    passed = 0
+    failed = 0
+    match = PYTEST_COUNT.search(text)
+    if match:
+        passed = int(match.group("passed"))
     match = PYTEST_FAILED.search(text)
     if match:
-        return 0, int(match.group("failed"))
-    return 0, 0
+        failed = int(match.group("failed"))
+    # Collection errors are failures for verification purposes.
+    match = PYTEST_ERRORS.search(text)
+    if match:
+        failed += int(match.group("errors"))
+    return passed, failed
