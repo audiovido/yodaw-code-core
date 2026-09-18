@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from app.background.events import TaskEventBus, get_bus
+from app.background.managed_source import resolve_execution_source
 from app.background.executors.base import ExecutionContext
 from app.background.executors.registry import ExecutorRegistry, default_registry
 from app.background.models import (
@@ -45,6 +46,7 @@ from app.background.models import (
     TaskRequest,
     TaskState,
     TaskTimeout,
+    error_class_action,
 )
 from app.background.planner import GrokArchitect
 from app.background.store import TaskStore
@@ -61,6 +63,9 @@ from app.workers.worker_errors import MissionCancelled
 logger = logging.getLogger("kodgar.tasks")
 
 DEFAULT_TASK_TIMEOUT = 1800
+# Bounded executor fallback: at most this many real execution attempts
+# per task, each on a distinct (or transient-retried) executor.
+MAX_EXECUTOR_ATTEMPTS = 3
 DEFAULT_WORKERS = 2
 LOG_FLUSH_SECONDS = 0.5
 LOG_FLUSH_LINES = 20
@@ -170,7 +175,7 @@ class TaskEngine:
             project_id=project_id or request.project_id,
             preferences=dict(request.preferences or {}),
             planner=self.architect.name,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=request.timeout_seconds or self.timeout_seconds,
             state=TaskState.queued,
             progress=0,
             current_step="queued",
@@ -311,13 +316,17 @@ class TaskEngine:
             )
 
             # --------------------------------------- EXECUTOR SELECT
+            # Health-gated: the chain contains only executors that are
+            # eligible right now, in preference order. The engine may
+            # attempt up to MAX_EXECUTOR_ATTEMPTS distinct runs; each
+            # failure is classified and, when the evidence says the
+            # executor itself is broken, the circuit opens and the next
+            # eligible executor takes over with a fresh worktree.
             try:
-                executor_id, choice_reason = self.registry.select(
+                chain, choice_reason = self.registry.select_chain(
                     plan, preference=(task.preferences or {}).get("executor")
                 )
             except RuntimeError as exc:
-                # No coding agent exists on this machine at all: that is
-                # an environment problem, not a task failure.
                 self._fail(
                     task_id,
                     {"type": "NoExecutorAvailable", "message": str(exc)},
@@ -325,113 +334,386 @@ class TaskEngine:
                     state=TaskState.blocked,
                 )
                 return
-            executor = self.registry.get(executor_id)
-            if executor is None:  # pragma: no cover - registry invariant
-                raise RuntimeError(f"executor {executor_id} vanished from the registry")
-
-            task = self.store.update(
-                task_id,
-                executor=executor_id,
-                executor_reason=choice_reason,
-                state=TaskState.planned,
-                progress=20,
-                current_step=f"executor: {executor.label}",
-            ) or task
-            self._emit(
-                task_id,
-                "executor.selected",
-                executor=executor_id,
-                label=executor.label,
-                reason=choice_reason,
-            )
-
-            # --------------------------------------------- PREPARING
-            cancel()
-            self._transition(
-                task_id, TaskState.preparing, "allocating isolated worktree"
-            )
-            self.worktree_root.mkdir(parents=True, exist_ok=True)
-            allocation = worktree_guard.allocate(
-                Path(task.repo),
-                self.worktree_root,
-                branch_name=task.result.get("branch_name") if task.result else None,
-                run=run_command,
-            )
-            if allocation.get("error"):
+            if not chain:
                 self._fail(
                     task_id,
-                    dict(allocation["error"]),
-                    "worktree allocation failed",
+                    {
+                        "type": "NoExecutorEligible",
+                        "message": choice_reason,
+                    },
+                    "no healthy executor is eligible",
+                    state=TaskState.blocked,
                 )
                 return
-            worktree = Path(allocation["worktree"])
-            task = self.store.update(
-                task_id,
-                worktree=str(worktree),
-                branch=allocation["branch"],
-                base_sha=allocation["base_sha"],
-            ) or task
-            self._emit(
-                task_id,
-                "worktree.created",
-                worktree=str(worktree),
-                branch=allocation["branch"],
-                base_sha=allocation["base_sha"],
-            )
 
-            # ------------------------------------------------ CODING
-            self._transition(
-                task_id, TaskState.coding, f"{executor.label} editing files"
-            )
-            self._emit(
-                task_id,
-                "executor.started",
-                executor=executor_id,
-                worktree=str(worktree),
-            )
-
-            sink = _OutputSink(self.store, self.bus, task_id)
-            ctx = ExecutionContext(
-                task=task,
-                repo=Path(task.repo),
-                worktree=worktree,
-                plan=plan,
-                timeout_seconds=max(30.0, deadline - time.monotonic()),
-                cancel_check=cancel,
-                on_output=sink.push,
-                on_pid=lambda pid: self._set_pid(task_id, pid),
-            )
-            try:
-                outcome = executor.execute(ctx)
-            finally:
-                sink.flush()
-                self._set_pid(task_id, None)
-
-            self._emit(
-                task_id,
-                "executor.completed",
-                executor=executor_id,
-                succeeded=outcome.succeeded,
-                exit_code=outcome.exit_code,
-                summary=outcome.summary,
-                files_touched=outcome.files_touched,
-            )
-
-            changed = _changed_files(worktree)
-            if changed:
-                self._emit(task_id, "file.changed", files=changed)
-            task = self.store.update(
-                task_id,
-                files_changed=len(changed),
-                touched_files=changed,
-            ) or task
-
-            if not outcome.succeeded:
+            # ------------------------------------ EXECUTION SOURCE
+            # Background tasks must not depend on the user's working
+            # copy being clean -- and must never fix it. A clean repo
+            # is used directly; a dirty one is served from a managed
+            # mirror refreshed read-only from the user's HEAD.
+            source_info = resolve_execution_source(task.repo)
+            if source_info.get("error"):
+                error = dict(source_info["error"])
                 self._fail(
                     task_id,
-                    dict(outcome.error or {"type": "ExecutorFailed", "message": outcome.summary}),
-                    "executor failed",
-                    extra={"executor": executor_id, "summary": outcome.summary},
+                    error,
+                    "could not establish a clean execution source",
+                    state=TaskState.blocked,
+                )
+                return
+            exec_repo = Path(source_info["repo"])
+            if source_info.get("mirror"):
+                task = self.store.update(
+                    task_id,
+                    result={
+                        **(task.result or {}),
+                        "execution_source": {
+                            "repo": source_info["repo"],
+                            "source_repo": source_info.get("source_repo"),
+                            "source_head": source_info.get("source_head"),
+                            "mirror": True,
+                        },
+                    },
+                ) or task
+                self._emit(
+                    task_id,
+                    "source.mirrored",
+                    execution_repo=source_info["repo"],
+                    source_repo=source_info.get("source_repo"),
+                    source_head=source_info.get("source_head"),
+                )
+
+            max_attempts = MAX_EXECUTOR_ATTEMPTS
+            # Transient-class failures earn one same-executor retry:
+            # each chain entry appears twice, and the attempt bound
+            # still caps total work. Fatal-class failures add their
+            # executor to seen_fatal so it is never re-entered.
+            expanded: list[str] = []
+            for entry in chain:
+                expanded.extend([entry, entry])
+            seen_fatal: set[str] = set()
+            attempts_history: list[dict[str, Any]] = []
+            executor_id: Optional[str] = None
+            executor = None
+            outcome = None
+            attempt_no = 0
+
+            for candidate_id in expanded:
+                if attempt_no >= max_attempts:
+                    break
+                if candidate_id in seen_fatal:
+                    continue
+                candidate = self.registry.get(candidate_id)
+                if candidate is None:  # pragma: no cover - registry invariant
+                    continue
+                executor_id = candidate_id
+                executor = candidate
+                attempt_no += 1
+                attempt_started = _now()
+
+                # The circuit may have opened since the chain was built
+                # (another task's failure). Never enter a known-broken
+                # executor.
+                health = self.registry.health_of(executor_id)
+                if health is not None and not health.eligible:
+                    attempts_history.append(
+                        {
+                            "executor": executor_id,
+                            "attempt": attempt_no,
+                            "skipped": True,
+                            "reason": (
+                                f"health gate: {health.error_type or 'ineligible'}"
+                            ),
+                            "started_at": attempt_started,
+                        }
+                    )
+                    self._emit(
+                        task_id,
+                        "executor.fallback",
+                        executor=executor_id,
+                        reason=(
+                            f"health gate rejected {executor_id}: "
+                            f"{health.error_type or 'ineligible'}"
+                        ),
+                    )
+                    attempt_no -= 1
+                    continue
+
+                task = self.store.update(
+                    task_id,
+                    executor=executor_id,
+                    executor_reason=choice_reason,
+                    state=TaskState.planned,
+                    progress=20,
+                    current_step=f"executor: {executor.label}",
+                    result={
+                        **(task.result or {}),
+                        "executor_attempts": attempts_history,
+                    },
+                ) or task
+                self._emit(
+                    task_id,
+                    "executor.selected",
+                    executor=executor_id,
+                    label=executor.label,
+                    reason=choice_reason,
+                    attempt=attempt_no,
+                    chain=list(chain),
+                )
+
+                # ----------------------------------------- PREPARING
+                cancel()
+                self._transition(
+                    task_id, TaskState.preparing, "allocating isolated worktree"
+                )
+                self.worktree_root.mkdir(parents=True, exist_ok=True)
+                allocation = worktree_guard.allocate(
+                    exec_repo,
+                    self.worktree_root,
+                    run=run_command,
+                )
+                if allocation.get("error"):
+                    error_type = allocation["error"].get("type", "")
+                    if error_type == "DirtyRepo":
+                        # The user's working copy is not ours to fix:
+                        # no clean, no reset, no stash. Say so and stop.
+                        self._fail(
+                            task_id,
+                            dict(allocation["error"]),
+                            "source repository has uncommitted changes; "
+                            "point the task at a clean managed clone",
+                            state=TaskState.blocked,
+                        )
+                    else:
+                        self._fail(
+                            task_id,
+                            dict(allocation["error"]),
+                            "worktree allocation failed",
+                        )
+                    return
+                worktree = Path(allocation["worktree"])
+                task = self.store.update(
+                    task_id,
+                    worktree=str(worktree),
+                    branch=allocation["branch"],
+                    base_sha=allocation["base_sha"],
+                ) or task
+                self._emit(
+                    task_id,
+                    "worktree.created",
+                    worktree=str(worktree),
+                    branch=allocation["branch"],
+                    base_sha=allocation["base_sha"],
+                    attempt=attempt_no,
+                )
+
+                # ------------------------------------------- CODING
+                self._transition(
+                    task_id, TaskState.coding, f"{executor.label} editing files"
+                )
+                self._emit(
+                    task_id,
+                    "executor.started",
+                    executor=executor_id,
+                    worktree=str(worktree),
+                    attempt=attempt_no,
+                )
+
+                sink = _OutputSink(self.store, self.bus, task_id)
+                ctx = ExecutionContext(
+                    task=task,
+                    repo=exec_repo,
+                    worktree=worktree,
+                    plan=plan,
+                    timeout_seconds=max(30.0, deadline - time.monotonic()),
+                    cancel_check=cancel,
+                    on_output=sink.push,
+                    on_pid=lambda pid: self._set_pid(task_id, pid),
+                )
+                attempt_start_mono = time.monotonic()
+                try:
+                    outcome = executor.execute(ctx)
+                finally:
+                    sink.flush()
+                    self._set_pid(task_id, None)
+
+                self._emit(
+                    task_id,
+                    "executor.completed",
+                    executor=executor_id,
+                    succeeded=outcome.succeeded,
+                    exit_code=outcome.exit_code,
+                    summary=outcome.summary,
+                    files_touched=outcome.files_touched,
+                    attempt=attempt_no,
+                )
+
+                changed = _changed_files(worktree)
+                if changed:
+                    self._emit(task_id, "file.changed", files=changed)
+                task = self.store.update(
+                    task_id,
+                    files_changed=len(changed),
+                    touched_files=changed,
+                ) or task
+
+                if outcome.succeeded:
+                    self.registry.health_service.record_success(executor_id)
+                    # Record the successful attempt as well: the history
+                    # must show which executor actually finished the
+                    # task, how long it took, and what it changed -- not
+                    # only the attempts that failed.
+                    attempts_history.append(
+                        {
+                            "executor": executor_id,
+                            "attempt": attempt_no,
+                            "started_at": attempt_started,
+                            "finished_at": _now(),
+                            "duration_seconds": round(
+                                time.monotonic() - attempt_start_mono, 2
+                            ),
+                            "exit_code": outcome.exit_code,
+                            "error_type": None,
+                            "action": "SUCCESS",
+                            "error": None,
+                            "worktree": str(worktree),
+                            "changed_files": len(changed),
+                            "fallback_reason": None,
+                        }
+                    )
+                    task = self.store.update(
+                        task_id,
+                        result={
+                            **(task.result or {}),
+                            "executor_attempts": attempts_history,
+                        },
+                    ) or task
+                    break
+
+                # ------------------------------------- FAILURE ROUTING
+                error_dict = dict(outcome.error or {})
+                message = str(
+                    error_dict.get("message")
+                    or outcome.summary
+                    or "executor failed"
+                )
+                raw_status = error_dict.get("api_error_status") or error_dict.get("status")
+                status_int = (
+                    int(raw_status)
+                    if isinstance(raw_status, (int, str)) and str(raw_status).isdigit()
+                    else None
+                )
+                error_type = self.registry.health_service.record_failure(
+                    executor_id, message, status_int
+                )
+                action = error_class_action(error_type)
+                attempt_record = {
+                    "executor": executor_id,
+                    "attempt": attempt_no,
+                    "started_at": attempt_started,
+                    "finished_at": _now(),
+                    "duration_seconds": round(
+                        time.monotonic() - attempt_start_mono, 2
+                    ),
+                    "exit_code": outcome.exit_code,
+                    "error_type": error_type,
+                    "action": action,
+                    "error": message[:500],
+                    "worktree": str(worktree),
+                    "changed_files": len(changed),
+                    "fallback_reason": None,
+                }
+                attempts_history.append(attempt_record)
+                task = self.store.update(
+                    task_id,
+                    result={
+                        **(task.result or {}),
+                        "executor_attempts": attempts_history,
+                    },
+                ) or task
+                self._emit(
+                    task_id,
+                    "executor.failed",
+                    executor=executor_id,
+                    attempt=attempt_no,
+                    error_type=error_type,
+                    action=action,
+                    error=message[:500],
+                )
+
+                if action == "NON_RETRYABLE_TASK_ERROR":
+                    self._fail(
+                        task_id,
+                        {
+                            "type": "ExecutorFailed",
+                            "executor": executor_id,
+                            "error_type": error_type,
+                            "message": message,
+                            "attempts": attempts_history,
+                        },
+                        "executor failed with a non-retryable task error",
+                        extra={
+                            "executor": executor_id,
+                            "summary": outcome.summary,
+                        },
+                    )
+                    return
+
+                # Fatal-for-executor: the circuit is now open
+                # (record_failure did that) and this executor is never
+                # re-entered for this task. Transient: the duplicate
+                # chain entry below gives it one same-executor retry.
+                self._cleanup_worktree(task, worktree, failed=True)
+                worktree = None
+                if action == "RETRY_DIFFERENT_EXECUTOR":
+                    seen_fatal.add(executor_id)
+                next_candidate = next(
+                    (
+                        c
+                        for c in expanded[expanded.index(candidate_id) + 1:]
+                        if c not in seen_fatal
+                    ),
+                    None,
+                )
+                attempt_record["fallback_reason"] = (
+                    f"{error_type} -> "
+                    + (
+                        f"retry with {next_candidate}"
+                        if next_candidate
+                        else "no executor left"
+                    )
+                )
+                task = self.store.update(
+                    task_id,
+                    result={
+                        **(task.result or {}),
+                        "executor_attempts": attempts_history,
+                    },
+                ) or task
+                self._emit(
+                    task_id,
+                    "executor.fallback",
+                    executor=executor_id,
+                    attempt=attempt_no,
+                    error_type=error_type,
+                    next_executor=next_candidate,
+                    reason=attempt_record["fallback_reason"],
+                )
+                outcome = None
+
+            if outcome is None or not outcome.succeeded or executor_id is None:
+                self._fail(
+                    task_id,
+                    {
+                        "type": "AllExecutorsFailed",
+                        "message": (
+                            f"all executor attempts failed after {attempt_no} "
+                            "attempt(s)"
+                        ),
+                        "attempts": attempts_history,
+                    },
+                    "every eligible executor attempt failed",
+                    extra={"attempts": attempts_history},
                 )
                 return
 
@@ -457,7 +739,7 @@ class TaskEngine:
             report = verifier.verify_worktree(
                 task,
                 plan,
-                Path(task.repo),
+                exec_repo,
                 worktree,
                 timeout=self._suite_timeout(deadline),
                 suite=suite,
@@ -506,7 +788,7 @@ class TaskEngine:
             commit_check = verifier.verify_commit(
                 task,
                 plan,
-                Path(task.repo),
+                exec_repo,
                 worktree,
                 commit["sha"],
                 expected_files=_expected_files(plan),
@@ -655,7 +937,15 @@ class TaskEngine:
         return check
 
     def _suite_timeout(self, deadline: float) -> float:
-        return max(30.0, min(600.0, deadline - time.monotonic()))
+        """Bounded test/build budget for one verification pass.
+
+        The cap must comfortably fit real repositories: the Kodgar
+        core suite alone takes ~15 minutes on a busy developer
+        machine. It is configurable but never extends past the task's
+        own deadline, so a hung suite still gets killed.
+        """
+        cap = float(os.environ.get("KODGAR_SUITE_TIMEOUT", "1500"))
+        return max(30.0, min(cap, deadline - time.monotonic()))
 
     def _transition(
         self, task_id: str, state: TaskState, step: str, progress: Optional[int] = None
@@ -735,9 +1025,14 @@ class TaskEngine:
         if worktree is None:
             return
         keep = self.keep_worktrees or failed
+        # Worktrees are registered against the *execution source*
+        # (which may be a managed mirror), so cleanup must target the
+        # same repository git metadata lives in.
+        source_meta = (task.result or {}).get("execution_source") or {}
+        cleanup_repo = Path(source_meta.get("repo") or task.repo)
         try:
             worktree_guard.cleanup(
-                Path(task.repo), worktree, keep=keep, failed=failed, run=run_command
+                cleanup_repo, worktree, keep=keep, failed=failed, run=run_command
             )
         except Exception:  # pragma: no cover - cleanup is best effort
             logger.exception("worktree cleanup failed for %s", task.id)

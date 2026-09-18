@@ -586,7 +586,7 @@ def test_cleanup_failure_does_not_hide_mission_result(tmp_path, monkeypatch):
 
     real_run = worker_module.run
 
-    def failing_git_remove(cmd, cwd=None, timeout=300):
+    def failing_git_remove(cmd, cwd=None, timeout=300, env=None):
         if "worktree" in cmd and "remove" in cmd:
             return {
                 "cmd": " ".join(cmd),
@@ -596,7 +596,7 @@ def test_cleanup_failure_does_not_hide_mission_result(tmp_path, monkeypatch):
                 "returncode": 1,
                 "timestamp": "simulated",
             }
-        return real_run(cmd, cwd=cwd, timeout=timeout)
+        return real_run(cmd, cwd=cwd, timeout=timeout, env=env)
 
     monkeypatch.setattr(worker_module, "run", failing_git_remove)
 

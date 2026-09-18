@@ -268,7 +268,7 @@ def test_validation_failure_restores_all_files_and_commits_nothing(
 
     real_run = worker_module.run
 
-    def fail_test_commands(cmd, cwd=None, timeout=300):
+    def fail_test_commands(cmd, cwd=None, timeout=300, env=None):
         if cmd and cmd[0] == "python" and "pytest" in cmd:
             return {
                 "cmd": " ".join(cmd),
@@ -279,7 +279,7 @@ def test_validation_failure_restores_all_files_and_commits_nothing(
                 "timestamp": "simulated",
             }
 
-        return real_run(cmd, cwd=cwd, timeout=timeout)
+        return real_run(cmd, cwd=cwd, timeout=timeout, env=env)
 
     monkeypatch.setattr(worker_module, "run", fail_test_commands)
 

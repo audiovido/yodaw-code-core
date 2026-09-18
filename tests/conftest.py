@@ -8,6 +8,13 @@ imported, so:
 - tests never touch data/yodaw.db (the developer's real DB)
 - single-flight duplicate detection can't 409 across test runs
 - each pytest session starts with a clean mission/learning store
+
+The background-task store is isolated the same way. It defaults to
+``data/kodgar_tasks.db`` relative to the working directory, which is
+the *same* file a locally running Kodgar API server holds open. Without
+this override a full-suite run raced the developer's server over one
+SQLite file, and a handful of task/tenancy/persistence tests failed or
+passed depending on whether that server happened to be running.
 """
 
 import atexit
@@ -20,6 +27,7 @@ from pathlib import Path
 
 _TMPDIR = tempfile.mkdtemp(prefix="yodaw_test_")
 os.environ["YODAW_DB_PATH"] = str(Path(_TMPDIR) / "test_yodaw.db")
+os.environ["KODGAR_TASKS_DB"] = str(Path(_TMPDIR) / "test_kodgar_tasks.db")
 
 
 def _cleanup_tmpdir() -> None:

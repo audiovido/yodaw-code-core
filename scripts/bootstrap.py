@@ -475,9 +475,12 @@ def perform_dependency_checks(install_dir):
         "writable_var": check_writable_directory(install_dir / "var"),
     }
 
-    # Default ports to check
+    # Default ports to check. The port is configurable so managed
+    # environments (multiple installations, CI, dev machines already
+    # running Kodgar on the default port) can pick a different one
+    # without editing the script.
     default_host = "127.0.0.1"
-    default_port = 8844
+    default_port = int(os.environ.get("KODGAR_INSTALL_PORT", "8844"))
     checks["port_available"] = check_port_available(default_host, default_port)
 
     return checks, system_info

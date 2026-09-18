@@ -111,6 +111,59 @@ def store(tmp_path):
     return TaskStore(tmp_path / "tasks.db")
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_health(monkeypatch):
+    """Keep default registries hermetic: no live binary/inference probes.
+
+    The default ExecutorRegistry uses the process-wide health service;
+    swap it for a stub that derives health from ``available()`` only.
+    Tests that specifically exercise health/circuit behavior construct
+    their own ``ExecutorHealthService`` with fake probes.
+    """
+    import app.background.executors.registry as registry_mod
+    from app.background.executors import health as health_mod
+    from app.background.models import ExecutorHealth
+
+    class _StubHealth:
+        def health(self, executor, force=False):
+            installed, detail = executor.available()
+            return ExecutorHealth(
+                id=executor.id,
+                label=executor.label,
+                kind=executor.kind,
+                installed=installed,
+                authenticated=True if installed else None,
+                model_available=True if installed else None,
+                inference_ok=True if installed else None,
+                healthy=installed,
+                eligible=installed,
+                detail=detail,
+                capabilities=list(getattr(executor, "capabilities", ()) or ()),
+            )
+
+        def record_failure(self, executor_id, message, status=None):
+            return health_mod.classify_executor_error(message, status)
+
+        def record_success(self, executor_id):
+            pass
+
+        def eligible_ids(self, executors):
+            return [e.id for e in executors if self.health(e).eligible]
+
+        def status(self, executors):
+            hs = [self.health(e) for e in executors]
+            return {
+                "executors": {h.id: h.model_dump() for h in hs},
+                "available": [h.id for h in hs if h.eligible],
+                "unavailable": [h.id for h in hs if not h.eligible],
+                "healthy": [h.id for h in hs if h.healthy],
+            }
+
+    stub = _StubHealth()
+    monkeypatch.setattr(registry_mod, "_health_service", stub)
+    yield stub
+
+
 @pytest.fixture()
 def engine_factory(store, tmp_path):
     engines: list[TaskEngine] = []

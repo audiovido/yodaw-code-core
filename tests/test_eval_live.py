@@ -352,7 +352,20 @@ def test_live_report_separates_score_semantics():
 
 def test_default_repo_code_coder_runs_real_worker(monkeypatch):
     monkeypatch.setenv("YODAW_ENABLE_GITHUB", "false")
-    hook = default_repo_code_coder()
+
+    # The hook must run the REAL RepoCodeWorker end to end, but the
+    # LLM brain is injected so the suite stays hermetic (this module's
+    # contract) instead of doing real local-model inference, which can
+    # take minutes per call and makes CI non-deterministic.
+    class _MalformedPlanStub:
+        """Provider stub that always returns unparseable plan text."""
+
+        attempts_log = [{"attempt": 1, "ok": False, "error": "malformed plan"}]
+
+        def chat(self, system, user):
+            return "definitely not a json plan"
+
+    hook = default_repo_code_coder(_MalformedPlanStub())
     from app.eval.fixtures import FixtureManager
 
     manager = FixtureManager()

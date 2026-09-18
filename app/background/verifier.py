@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -55,6 +56,49 @@ class TaskVerifier:
         self.cancel_check = cancel_check or (lambda: None)
         self.on_event = on_event or (lambda *a, **k: None)
 
+    # ------------------------------------------------------------- deps
+    def _ensure_js_deps(self, worktree: Path, timeout: float = 300) -> None:
+        """Install JS dependencies inside a disposable worktree.
+
+        A fresh ``git worktree`` never carries node_modules, so any
+        npm test/build would fail for purely environmental reasons.
+        Background worktrees are isolated and disposable, so install
+        matches what CI does. Failures here are deliberately
+        non-fatal: the real test/build command still runs and reports
+        the truth; this only removes the guaranteed-failure case.
+        """
+        if not (worktree / "package.json").exists():
+            return
+        if (worktree / "node_modules").exists():
+            return
+        if shutil.which("npm") is None:
+            return
+        if (worktree / "package-lock.json").exists():
+            cmd = ["npm", "ci", "--no-audit", "--no-fund"]
+        else:
+            cmd = ["npm", "install", "--no-audit", "--no-fund"]
+        self.on_event(
+            "test.started", {"command": " ".join(cmd), "phase": "deps"}
+        )
+        try:
+            result = run(
+                cmd,
+                cwd=str(worktree),
+                timeout=timeout,
+                cancel_check=self.cancel_check,
+            )
+        except Exception:
+            return
+        self.on_event(
+            "test.completed",
+            {
+                "command": cmd,
+                "returncode": result.get("returncode"),
+                "phase": "deps",
+                "status": "PASS" if result.get("returncode") == 0 else "FAIL",
+            },
+        )
+
     # ----------------------------------------------------------- suite
     def run_suite(
         self, worktree: Path, plan: PlanResult, timeout: float = 600
@@ -65,6 +109,7 @@ class TaskVerifier:
         state and the full evidence audit in VERIFYING without paying
         for the suite twice.
         """
+        self._ensure_js_deps(worktree)
         checks = [
             *self._test_checks(worktree, plan, timeout),
             *self._build_checks(worktree, plan, timeout),

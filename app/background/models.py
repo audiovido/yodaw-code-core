@@ -182,6 +182,11 @@ class TaskRequest(BaseModel):
     repo: Optional[str] = None
     project_id: Optional[str] = None
     preferences: dict[str, Any] = Field(default_factory=dict)
+    # Optional per-task wall-clock budget. Some repositories have
+    # legitimately slow suites, so a caller may need more than the
+    # engine default; bounded so a request can never disable the
+    # timeout entirely.
+    timeout_seconds: Optional[int] = Field(default=None, ge=60, le=14400)
 
     @field_validator("goal")
     @classmethod
@@ -211,6 +216,37 @@ class ExecutorInfo(BaseModel):
     detail: str = ""
     capabilities: list[str] = Field(default_factory=list)
     command: Optional[str] = None
+    version: Optional[str] = None
+
+
+class ExecutorHealth(BaseModel):
+    """Structured, evidence-based executor health.
+
+    ``available == binary exists`` was a lie that routed real tasks
+    into broken model configurations. Health is a ladder of distinct
+    facts: installed -> authenticated -> model_available ->
+    inference_ok. Anything still unknown is ``None``, never silently
+    assumed good; known-fatal ``error_type`` values (quota, upstream
+    forbiddance, missing model, auth) make the executor ineligible for
+    routing even though its binary exists.
+    """
+
+    id: str
+    label: str = ""
+    kind: str = "cli"
+    installed: bool = False
+    authenticated: Optional[bool] = None
+    model_available: Optional[bool] = None
+    inference_ok: Optional[bool] = None
+    healthy: bool = False
+    eligible: bool = False
+    latency_ms: Optional[int] = None
+    error_type: Optional[str] = None
+    detail: str = ""
+    checked_at: str = Field(default_factory=now_iso)
+    cooldown_until: Optional[str] = None
+    circuit_open: bool = False
+    capabilities: list[str] = Field(default_factory=list)
     version: Optional[str] = None
 
 
@@ -368,3 +404,52 @@ class TaskCancelled(RuntimeError):
 
 class TaskTimeout(RuntimeError):
     """Raised when a task exceeds its wall-clock budget."""
+
+
+# ------------------------------------------------------------ error classes
+# How an executor failure should be handled. Classification is derived
+# from structured CLI/provider evidence (status codes, named error
+# types) first, with string patterns only as the fallback net.
+RETRY_SAME_EXECUTOR = "RETRY_SAME_EXECUTOR"
+RETRY_DIFFERENT_EXECUTOR = "RETRY_DIFFERENT_EXECUTOR"
+NON_RETRYABLE_TASK_ERROR = "NON_RETRYABLE_TASK_ERROR"
+VERIFICATION_FAILURE = "VERIFICATION_FAILURE"
+
+# Fatal-for-executor error types: seeing one of these means the
+# executor cannot run *any* task right now, so the circuit opens.
+FATAL_EXECUTOR_ERRORS = frozenset(
+    {
+        "not_installed",
+        "auth_failed",
+        "model_not_found",
+        "quota_exhausted",
+        "upstream_forbidden",
+        "headless_unsupported",
+    }
+)
+
+# Error types that are the *task's* fault, not the executor's:
+# falling back to another executor would fail the same way.
+TASK_FAULT_ERRORS = frozenset(
+    {
+        "invalid_repo",
+        "invalid_request",
+        "impossible_acceptance",
+        "security_rejection",
+    }
+)
+
+
+def error_class_action(error_type: str) -> str:
+    """The routing decision for a classified executor error.
+
+    Fatal-for-executor types (and the conservative unknown) mean "try
+    a different executor"; transient types mean "same executor may
+    succeed on retry"; task-fault types mean "no executor would do
+    better".
+    """
+    if error_type in {"transient_timeout", "transient_overload"}:
+        return RETRY_SAME_EXECUTOR
+    if error_type in FATAL_EXECUTOR_ERRORS or error_type == "unknown":
+        return RETRY_DIFFERENT_EXECUTOR
+    return NON_RETRYABLE_TASK_ERROR

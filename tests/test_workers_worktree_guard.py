@@ -25,7 +25,9 @@ def _git(repo, *args):
 
 
 def _make_repo(path):
-    _git(path, "init", "-q")
+    # Deterministic default branch: the suite must not depend on the
+    # machine's init.defaultBranch (this host defaults to "main").
+    _git(path, "-c", "init.defaultBranch=main", "init", "-q")
     _git(path, "config", "user.email", "test@yodaw.local")
     _git(path, "config", "user.name", "YODAW Test")
     (path / "seed.txt").write_text("seed\n", encoding="utf-8")
@@ -140,7 +142,7 @@ def test_commit_fence_moved_base_raises(repo, tmp_path):
     _git(repo, "commit", "-q", "-m", "move base")
     with pytest.raises(FenceViolation):
         verify_commit_fence(repo, allocated["worktree"], allocated["base_sha"])
-    _git(repo, "checkout", "-q", "master")
+    _git(repo, "checkout", "-q", "main")
 
 
 def test_cleanup_removes_success(repo, tmp_path):

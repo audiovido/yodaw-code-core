@@ -275,8 +275,18 @@ def test_bootstrap_script_help():
     assert "--check-deps-only" in result.stdout
 
 
-def test_bootstrap_check_deps_only(tmp_path):
+def test_bootstrap_check_deps_only(tmp_path, monkeypatch):
     """Test the --check-deps-only option."""
+    # Bind an ephemeral port now and hand it to the script so the
+    # port-available check is hermetic: the machine running the suite
+    # may legitimately have Kodgar (8844) or other services listening.
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
+    monkeypatch.setenv("KODGAR_INSTALL_PORT", str(free_port))
+
     install_dir = tmp_path / "install"
     result = subprocess.run(
         [sys.executable, "scripts/bootstrap.py", "--check-deps-only", "--install-dir", str(install_dir)],

@@ -2,6 +2,7 @@
 termination, bounded output, and return-code honesty."""
 
 import os
+import subprocess
 import sys
 import time
 
@@ -19,8 +20,19 @@ PYTHON = sys.executable
 
 
 def _is_running(cmd_fragment: str) -> bool:
+    """True while a process matching the fragment is still alive.
+
+    Runs pgrep with argv (no shell) on purpose: going through
+    ``os.popen``/``sh -c`` made pgrep match its own wrapper command
+    line, so this helper always reported "running" and the
+    process-group assertions could never pass.
+    """
     for _ in range(40):
-        result = os.popen("pgrep -f %s" % cmd_fragment).read().strip()
+        result = subprocess.run(
+            ["pgrep", "-f", cmd_fragment],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         if not result:
             return False
         time.sleep(0.05)

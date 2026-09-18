@@ -214,10 +214,23 @@ def cancel_task(
 
 # ------------------------------------------------------------ executors
 @router.get("/executors")
-def list_executors(authorization: str | None = Header(default=None)):
+def list_executors(
+    refresh: bool = Query(default=False),
+    authorization: str | None = Header(default=None),
+):
+    """Live executor health (TTL-cached; ``?refresh=true`` re-probes).
+
+    Every entry carries the full health ladder (installed/
+    authenticated/model_available/inference_ok), the routing verdict
+    (``healthy``/``eligible``), and the real error reason when
+    ineligible — the UI shows why an executor is unhealthy.
+    """
     principal = _principal(authorization)
     _require(principal, TASK_READ_PERMISSIONS, "missing permission: tasks.read")
-    return get_engine().registry.status()
+    registry = get_engine().registry
+    if refresh:
+        return registry.refresh()
+    return registry.status()
 
 
 @router.get("/tasks-engine/status")
