@@ -9,3 +9,7 @@ workspace/*
 .env
 .DS_Store
 dist/
+# SQLite sidecar files (WAL/journal artifacts are runtime state)
+data/*.db-shm
+data/*.db-wal
+data/*.db-journal

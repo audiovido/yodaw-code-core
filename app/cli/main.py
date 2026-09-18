@@ -167,6 +167,42 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     kodgar_p.add_argument("--timeout", type=float, default=30.0)
     kodgar_p.add_argument("--json", action="store_true", help="machine-readable output")
+    # kodgar task <verb>: a client of the same Task API the web UI
+    # uses. The CLI is an interface into the backend, not a second
+    # execution engine.
+    task_p = sub.add_parser(
+        "task",
+        help="submit and follow background coding tasks (Task API client)",
+    )
+    task_p.add_argument(
+        "verb",
+        choices=("submit", "status", "watch", "list", "cancel", "diff"),
+        help="task operation",
+    )
+    task_p.add_argument(
+        "goal", nargs="?", help="goal text (submit) or task id",
+        default=None,
+    )
+    task_p.add_argument(
+        "--repo", default=None, help="target git repository (submit)"
+    )
+    task_p.add_argument(
+        "--executor", default="auto",
+        choices=("auto", "claude-code", "codex", "grok-cli", "kodgar-native"),
+        help="executor preference (default: planner decides)",
+    )
+    task_p.add_argument("--project-id", default=None, help="project grouping id")
+    task_p.add_argument(
+        "--api", default=None,
+        help="Task API base URL (default: $KODGAR_API_URL or "
+        "http://127.0.0.1:8844)",
+    )
+    task_p.add_argument(
+        "--watch", action="store_true",
+        help="submit then stream live events until the task finishes",
+    )
+    task_p.add_argument("--limit", type=int, default=20, help="list size")
+
     doctor_p = sub.add_parser(
         "kodgar-doctor",
         help="non-destructive health check: daemon, key, certified routes",
@@ -1288,6 +1324,59 @@ def cmd_models(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_task(args: argparse.Namespace) -> int:
+    """`kodgar task ...` — a thin client of the background Task API."""
+    from app.cli import tasks as task_client
+
+    verb = args.verb
+    if verb == "submit":
+        if not args.goal:
+            print("submit requires a goal", file=sys.stderr)
+            return EXIT_USAGE
+        if args.repo:
+            repo = args.repo
+        else:
+            detected = detect_repo(".")
+            repo = str(detected.root) if detected.root else None
+        code, task_id = task_client.submit(
+            args.goal,
+            repo,
+            api=args.api,
+            executor=args.executor,
+            project_id=args.project_id,
+            as_json=args.json,
+        )
+        if code != EXIT_OK or not args.watch or not task_id:
+            return code
+        return task_client.watch(task_id, api=args.api, as_json=args.json)
+    if verb == "status":
+        if not args.goal:
+            print("status requires a task id", file=sys.stderr)
+            return EXIT_USAGE
+        return task_client.status(args.goal, api=args.api, as_json=args.json)
+    if verb == "watch":
+        if not args.goal:
+            print("watch requires a task id", file=sys.stderr)
+            return EXIT_USAGE
+        return task_client.watch(args.goal, api=args.api, as_json=args.json)
+    if verb == "list":
+        return task_client.list_tasks(
+            api=args.api, as_json=args.json, limit=args.limit
+        )
+    if verb == "cancel":
+        if not args.goal:
+            print("cancel requires a task id", file=sys.stderr)
+            return EXIT_USAGE
+        return task_client.cancel(args.goal, api=args.api)
+    if verb == "diff":
+        if not args.goal:
+            print("diff requires a task id", file=sys.stderr)
+            return EXIT_USAGE
+        return task_client.diff(args.goal, api=args.api)
+    print(f"unknown task verb: {verb}", file=sys.stderr)
+    return EXIT_USAGE
+
+
 def _apply_product_config() -> int:
     """Feed the config file into the environment before task commands. Env wins."""
     from app.product_config import ConfigError, apply_product_config
@@ -1309,6 +1398,7 @@ TASK_COMMANDS = (
     "kodgar",
     "kodgar-doctor",
     "models",
+    "task",
 )
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1317,7 +1407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw = list(argv) if argv is not None else sys.argv[1:]
     if raw and not raw[0].startswith("-") and raw[0] not in (
         "run", "status", "resume", "sessions", "config",
-        "setup-9router", "kodgar", "kodgar-doctor", "models",
+        "setup-9router", "kodgar", "kodgar-doctor", "models", "task",
         "version", "-h", "--help",
     ):
         # Convenience: `yodaw "fix tests"` behaves like `yodaw run`.
@@ -1350,6 +1440,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return cmd_kodgar_doctor(full)
     if full.command == "models":
         return cmd_models(full)
+    if full.command == "task":
+        return cmd_task(full)
     if full.command == "version":
         print(f"yodaw {cli_version}")
         return EXIT_OK

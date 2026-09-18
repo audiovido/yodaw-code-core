@@ -28,6 +28,9 @@ PERMISSIONS = {
         "runtime.control",     # start/stop runtime surfaces
         "audit.read",          # full audit trail
         "outbox.manage",       # inspect/requeue/dead-letter outbox
+        "tasks.create",        # submit background coding tasks
+        "tasks.read.all",      # read any background task
+        "tasks.cancel",        # cancel any background task
     },
     "operator": {
         "missions.create",
@@ -36,16 +39,23 @@ PERMISSIONS = {
         "missions.retry",
         "audit.read",          # operators may inspect but not mutate
         "outbox.manage",
+        "tasks.create",
+        "tasks.read.all",
+        "tasks.cancel",
     },
     "auditor": {
         "audit.read",
         "missions.read.all",   # read-only observability
+        "tasks.read.all",
     },
     "client": {
         # isolation: client reads are scoped to own missions in
         # the API layer; this role has no administrative surface
         "missions.create",
         "missions.cancel.own",  # own missions only (isolation-scoped)
+        "tasks.create",
+        "tasks.read.all",
+        "tasks.cancel.own",
     },
 }
 
@@ -60,6 +70,18 @@ ROLE_LEVELS = {
 def role_can(role: str, permission: str) -> bool:
     """True only when the role explicitly holds the permission."""
     return permission in PERMISSIONS.get(role, set())
+
+
+# Background-task permissions share one prefix convention: `tasks.*`
+# gates the Task API, and the `*.own` variants exist for tenant-scoped
+# cancellation. They live in the same matrix as everything else so an
+# unknown role still fails closed.
+TASK_PERMISSIONS = frozenset(
+    permission
+    for role in PERMISSIONS.values()
+    for permission in role
+    if permission.startswith("tasks.")
+)
 
 
 def known_role(role: str) -> bool:

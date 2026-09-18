@@ -343,12 +343,35 @@ async def lifespan(_app):
         )
 
     get_coordinator()
+
+    # Background task engine (Kodgar Task API). Started with the API
+    # process like the coordinator; YODAW_EMBED_TASK_ENGINE=0 opts out
+    # for a deployment that runs task workers in a separate process.
+    if os.environ.get("YODAW_EMBED_TASK_ENGINE", "1") == "1":
+        try:
+            from app.background.service import start_engine
+
+            start_engine()
+        except Exception as exc:
+            # A broken task engine must not take the whole API down:
+            # missions keep serving, and the failure is logged loudly.
+            logging.getLogger("kodgar.tasks").error(
+                "background task engine failed to start: %s", exc
+            )
+
     yield
 
     coordinator = _coordinator
 
     if coordinator is not None:
         coordinator.stop(drain=True, timeout=20)
+
+    try:
+        from app.background.service import stop_engine
+
+        stop_engine(timeout=20)
+    except Exception:  # pragma: no cover - shutdown is best effort
+        pass
 
 
 import contextvars
@@ -494,6 +517,34 @@ class BodyLimitMiddleware:
 app.add_middleware(BodyLimitMiddleware, max_bytes=256 * 1024)
 # Correlation IDs wrap the body guard so rejected requests stay traceable.
 app.add_middleware(CorrelationIdMiddleware)
+
+# Kodgar background Task API: the surface the web terminal and the CLI
+# both speak. Mounted on the same app (and the same principal/RBAC
+# resolution) as everything else — never a second execution engine.
+from app.background.api import router as tasks_router  # noqa: E402
+
+app.include_router(tasks_router)
+
+# CORS for the Kodgar Terminal web UI (a separate Vite origin during
+# development). Localhost-only by default; explicit origins can be
+# widened via YODAW_CORS_ORIGINS without opening the API to the world.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+_cors_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "YODAW_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # API-A public contract handlers (RFC 7807 envelopes) subsume the
