@@ -31,6 +31,7 @@ import os
 import queue
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -143,12 +144,36 @@ class TaskEngine:
         )
         return recovered
 
-    def stop(self, timeout: float = 20.0) -> None:
+    def stop(self, timeout: float = 20.0) -> bool:
+        """Signal shutdown and wait for the workers.
+
+        Returns ``True`` only when every worker actually stopped. A
+        partial stop is reported instead of being hidden, because
+        callers own shared resources: closing the task store while a
+        worker is still executing makes that worker's failure path hit
+        a closed SQLite connection (``ProgrammingError: Cannot operate
+        on a closed database``) and the task is never finalised.
+        """
         self._stop.set()
+        still_running: list[threading.Thread] = []
         for thread in self._threads:
             thread.join(timeout=timeout)
+            if thread.is_alive():
+                still_running.append(thread)
+        if still_running:
+            logger.warning(
+                "task engine did not stop within %.1fs: %s worker(s) still "
+                "running; leaving shared resources open",
+                timeout,
+                len(still_running),
+            )
+            # Keep tracking them so a later stop() can still join, and so
+            # start() cannot pretend this engine is fresh.
+            self._threads = still_running
+            return False
         self._threads.clear()
         self._started = False
+        return True
 
     def recover(self) -> list[str]:
         """Requeue every non-terminal task and say so in the stream."""
@@ -224,11 +249,22 @@ class TaskEngine:
                 self._execute(task_id)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.exception("task %s crashed in the engine: %s", task_id, exc)
-                self._fail(
-                    task_id,
-                    {"type": type(exc).__name__, "message": str(exc)},
-                    "engine exception",
-                )
+                try:
+                    self._fail(
+                        task_id,
+                        {"type": type(exc).__name__, "message": str(exc)},
+                        "engine exception",
+                    )
+                except Exception:
+                    # Recording the failure must never kill the worker
+                    # thread: during shutdown the store may already be
+                    # closing, and an unhandled exception here would
+                    # abandon the task without finalising it.
+                    logger.error(
+                        "could not record engine failure for %s\n%s",
+                        task_id,
+                        traceback.format_exc(),
+                    )
             finally:
                 with self._lock:
                     self._running.discard(task_id)

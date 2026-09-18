@@ -116,6 +116,10 @@ class Coordinator:
         self._inflight: set[str] = set()
         self._inflight_repos: set[str] = set()
         self._inflight_lock = threading.Lock()
+        # Shutdown handshake with the heartbeat loop: held for a whole
+        # beat, and acquired by stop() after it sets _stop, so no
+        # heartbeat write can still be in flight once stop() returns.
+        self._hb_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -202,6 +206,12 @@ class Coordinator:
         if self._thread:
             self._thread.join(timeout=5)
 
+        # Wait out any beat that is already writing before we report
+        # ourselves stopped: after this point the loop can only observe
+        # _stop and exit, so no heartbeat can land post-shutdown.
+        with self._hb_lock:
+            pass
+
         if self._hb_thread:
             self._hb_thread.join(timeout=5)
 
@@ -267,32 +277,41 @@ class Coordinator:
         last_watchdog = 0.0
 
         while not self._stop.is_set():
-            failures = 0
+            # A whole beat runs under _hb_lock, and stop() takes the same
+            # lock after setting _stop. Without that handshake a pass
+            # already past the loop condition committed a heartbeat
+            # *after* shutdown, so "no heartbeats after stop" was racy and
+            # failed under load.
+            with self._hb_lock:
+                if self._stop.is_set():
+                    break
 
-            try:
-                failures += self._heartbeat_inflight()
-            except Exception:
-                failures += 1
-                logger.error(
-                    "heartbeat pass failed\n%s",
-                    traceback.format_exc(),
-                )
+                failures = 0
 
-            if failures:
-                self._hb_failures += failures
-
-            self._hb_beats += 1
-
-            now = time.monotonic()
-            if now - last_watchdog >= max(self.heartbeat_interval, 5):
-                last_watchdog = now
                 try:
-                    self.recover_stale_missions()
+                    failures += self._heartbeat_inflight()
                 except Exception:
+                    failures += 1
                     logger.error(
-                        "watchdog pass failed\n%s",
+                        "heartbeat pass failed\n%s",
                         traceback.format_exc(),
                     )
+
+                if failures:
+                    self._hb_failures += failures
+
+                self._hb_beats += 1
+
+                now = time.monotonic()
+                if now - last_watchdog >= max(self.heartbeat_interval, 5):
+                    last_watchdog = now
+                    try:
+                        self.recover_stale_missions()
+                    except Exception:
+                        logger.error(
+                            "watchdog pass failed\n%s",
+                            traceback.format_exc(),
+                        )
 
             self._stop.wait(self.heartbeat_interval / 2)
 

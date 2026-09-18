@@ -266,6 +266,34 @@ Regression coverage: `tests/test_runtime_coordinator_lifecycle.py`
 asserts that lifespan shutdown leaves the cached instance stopped and that
 the accessor returns a *live* replacement afterwards.
 
+### Shutdown determinism (heartbeat and task store)
+
+Two shutdown races remained and were fixed by making termination
+explicit rather than timing-dependent.
+
+**Heartbeat writes after stop.** `_heartbeat_loop` re-checked `_stop`
+only at the *top* of an iteration, so a beat already inside
+`_heartbeat_inflight()` committed after `stop()` returned — under load
+`test_shutdown_stops_heartbeat_activity` then observed a heartbeat later
+than its pre-stop sample. A beat now runs under `_hb_lock`, and `stop()`
+acquires that lock after setting `_stop`, so no write can still be in
+flight when shutdown completes. Verified by three consecutive runs of the
+heartbeat suite (6 passed each).
+
+**Store closed under a live worker.** `Engine.stop()` cleared its thread
+list and reported nothing even when `join(timeout=...)` timed out, so
+`reset_for_tests()` closed the task store while a worker was still inside
+`_execute`; the worker's failure path then hit
+`sqlite3.ProgrammingError: Cannot operate on a closed database` and the
+task was never finalised. `Engine.stop()` now returns whether every worker
+actually stopped, keeps unfinished threads tracked (so `start()` cannot
+pretend the engine is fresh), and the store is closed only when the engine
+confirms it stopped. The worker loop's defensive `_fail` also can no
+longer kill its own thread.
+
+Effect on the suite: warnings fell from 3 to 2 (the unhandled-thread
+exception disappeared) and the full suite stayed green.
+
 ## Verifier reporting bug found and fixed
 
 Both Phase K tasks reported `tests: {passed: 1295, failed: 0}` while

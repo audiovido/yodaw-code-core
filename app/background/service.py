@@ -71,15 +71,25 @@ def stop_engine(timeout: float = 20.0) -> None:
 
 
 def reset_for_tests() -> None:
-    """Drop process-wide singletons (tests only)."""
+    """Drop process-wide singletons (tests only).
+
+    The store is closed **only** once the engine confirms every worker
+    stopped. Closing it while a worker was still executing made that
+    worker's failure path touch a closed SQLite connection and the task
+    was never finalised.
+    """
     global _store, _engine
     with _lock:
-        if _engine is not None:
-            try:
-                _engine.stop(timeout=5)
-            except Exception:
-                pass
+        engine = _engine
+        store = _store
         _engine = None
-        if _store is not None:
-            _store.close()
         _store = None
+
+    stopped = True
+    if engine is not None:
+        try:
+            stopped = engine.stop(timeout=5)
+        except Exception:
+            stopped = False
+    if store is not None and stopped:
+        store.close()
