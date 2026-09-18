@@ -314,3 +314,74 @@ limits, not local defects. The machinery itself — health gate, chain
 construction, attempt bound, classification, circuit breaker, persisted
 attempt history — is exercised by `tests/test_executor_health.py`
 (25 tests) and by the two live tasks above.
+
+## Verification against a red suite: name the failures, confirm the flake
+
+Phase K acceptance surfaced the last real blocker in the verifier itself.
+A task could not commit because the repository suite exited 1, and the
+check recorded only:
+
+    /Library/Developer/CommandLineTools/usr/bin/python3 -B -m pytest
+      -q -p no:cacheprovider exited 1
+
+The failing test names were discarded, so there was nothing to attribute
+the failure to and no way to tell a broken change from a broken run. Two
+defects, one fix:
+
+1. **A red run was unreadable.** The tests check now parses pytest's short
+   summary (`FAILED <node id>`) and carries the node IDs into the check
+   `detail` and `evidence.failing_tests`. A failure without a test name is
+   not a reportable result.
+2. **A load flake blocked a sound change.** A full suite executed inside a
+   busy engine is ~3x slower than solo (18:43 vs 5:31 wall clock for the
+   same 1302-test suite) and loses one load-sensitive test on some runs.
+   Only the tests that actually failed are now re-run, exactly once. A
+   reproducible failure fails both runs and still blocks the commit; a
+   failure that does not reproduce is recorded as a load flake in the
+   check detail and in the `test.completed` event — named, never hidden.
+   Collection errors carry no node ID and are never retried.
+
+This fired in production on two of the three Phase K acceptance tasks
+(`test_launcher.py::test_crash_recovery_respawns_runtime` and
+`test_wave2_runtime_wiring.py::test_evidence_report_pass`), which is
+exactly the class of failure that previously produced an unattributable
+`exited 1`.
+
+Regression coverage:
+`test_failing_node_ids_are_extracted_from_pytest_summary`,
+`test_reproducible_failure_still_blocks_the_commit`,
+`test_load_flake_is_confirmed_not_hidden`,
+`test_unnamed_failure_is_reported_but_not_retried`
+(`tests/test_executor_health.py`).
+
+## Phase K acceptance: Startup, Marketing and Business agents
+
+All three run against the clean managed source
+(`/Users/Shared/kodgar-worker-source`) with `executor=auto`, sequentially,
+at commit `47a7afc` of the feature branch. Every row is a real task record
+with a real worktree, real suite execution, real verification and a real
+commit on an isolated branch — the source branch is never mutated
+(`main`/`master` untouched, working tree clean throughout).
+
+| Task | State | Executor | Tests | Verifier | Commit |
+|---|---|---|---|---|---|
+| Marketing | COMPLETED | kodgar-native | 1302 passed / 0 failed | PASS | `5e03069f` |
+| Startup | COMPLETED | kodgar-native | 1301 passed / 0 failed | PASS | `a3feba37` |
+| Business | COMPLETED | kodgar-native | 1301 passed / 0 failed | PASS | `9a4d342e` |
+
+Each task produced exactly the planned file (`docs/MARKETING_PLAN.md`,
+`docs/STARTUP_PLAN.md`, `docs/BUSINESS_PLAN.md`) with the required section
+headings, one commit, one changed file, and no out-of-scope changes.
+
+The earlier `DirtyRepo` failures are gone: worktrees are allocated from
+the managed clean mirror, so a dirty user working copy no longer blocks
+background execution.
+
+## Verifier interpreter
+
+The verifier runs the repository suite with the project's own default
+interpreter as resolved on this machine:
+`/Library/Developer/CommandLineTools/usr/bin/python3` (Python 3.9.6).
+That exact command, in the exact worktree, is green standalone:
+`1302 passed, 7 skipped, 0 failed in 331.87s` — so the previously
+observed single failure was load, not interpreter incompatibility.
