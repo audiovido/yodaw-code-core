@@ -796,3 +796,119 @@ def test_test_count_parsing_handles_pytest_summary_order():
     assert parse_test_counts("Tests:       1 failed, 2 passed") == (2, 1)
     # No counts at all -> no fabricated numbers.
     assert parse_test_counts("no counts here") == (0, 0)
+
+
+# ------------------- 18. red suites must name their failing tests
+def _verifier_with_runs(monkeypatch, results):
+    """A TaskVerifier whose test runner returns canned results.
+
+    ``results`` is consumed one entry per invocation, so a test can
+    state exactly what the first run and the confirmation re-run each
+    returned.
+    """
+    from app.background import verifier as verifier_module
+
+    calls: list[list[str]] = []
+    queue = list(results)
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return queue.pop(0) if queue else {"cmd": cmd, "returncode": 0}
+
+    monkeypatch.setattr(verifier_module, "run", fake_run)
+    monkeypatch.setattr(
+        "app.workers.validation.detect_test_commands", lambda path: [["pytest", "-q"]]
+    )
+    return verifier_module.TaskVerifier(), calls
+
+
+def _run_result(returncode, stdout, cmd=None):
+    return {
+        "cmd": cmd or "pytest -q",
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": "",
+        "timed_out": False,
+    }
+
+
+def test_failing_node_ids_are_extracted_from_pytest_summary():
+    from app.background.verifier import parse_failing_node_ids
+
+    text = (
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_heartbeat_hardening.py::test_shutdown_stops_heartbeat_activity\n"
+        "FAILED tests/test_x.py::TestC::test_y - AssertionError: nope\n"
+        "ERROR tests/test_broken.py\n"
+        "1 failed, 1 error in 2.32s\n"
+    )
+    assert parse_failing_node_ids(text) == [
+        "tests/test_heartbeat_hardening.py::test_shutdown_stops_heartbeat_activity",
+        "tests/test_x.py::TestC::test_y",
+    ]
+    # A collection error has no node ID and must not be retried.
+    assert parse_failing_node_ids("ERROR tests/test_broken.py") == []
+
+
+def test_reproducible_failure_still_blocks_the_commit(monkeypatch, tmp_path):
+    """A real failure fails both runs: the check must stay FAIL, and it
+    must name the test instead of reporting a bare exit code."""
+    failing = (
+        "FAILED tests/test_stable.py::test_really_broken - AssertionError\n"
+        "1 failed, 3 passed in 1.10s\n"
+    )
+    verifier, calls = _verifier_with_runs(
+        monkeypatch,
+        [
+            _run_result(1, failing),
+            _run_result(1, "FAILED tests/test_stable.py::test_really_broken\n1 failed in 0.4s\n"),
+        ],
+    )
+
+    (check,) = verifier._test_checks(tmp_path, None, timeout=60)
+
+    assert check.status == "FAIL"
+    assert "test_really_broken" in check.detail
+    assert "reproducible failure" in check.detail
+    # The confirmation re-ran only the failing test.
+    assert calls[1] == ["pytest", "-q", "tests/test_stable.py::test_really_broken"]
+    assert check.evidence["retry"]["outcome"] == "FAIL"
+    # Nothing was hidden: the failed count survives into the report.
+    assert check.evidence["failed"] == 1
+
+
+def test_load_flake_is_confirmed_not_hidden(monkeypatch, tmp_path):
+    """A suite that loses one load-sensitive test under engine load must
+    not block a task forever — but the flake stays visible."""
+    noisy = (
+        "FAILED tests/test_heartbeat_hardening.py::test_shutdown_stops_heartbeat_activity\n"
+        "1 failed, 1301 passed, 7 skipped in 331s\n"
+    )
+    verifier, calls = _verifier_with_runs(
+        monkeypatch, [_run_result(1, noisy), _run_result(0, "1 passed in 1.9s\n")]
+    )
+
+    (check,) = verifier._test_checks(tmp_path, None, timeout=60)
+
+    assert check.status == "PASS"
+    assert "load flake" in check.detail
+    assert "test_shutdown_stops_heartbeat_activity" in check.detail
+    assert check.evidence["retry"]["outcome"] == "PASS"
+    # Exactly one confirmation run, of only the failed test.
+    assert len(calls) == 2
+    assert calls[1][-1] == (
+        "tests/test_heartbeat_hardening.py::test_shutdown_stops_heartbeat_activity"
+    )
+
+
+def test_unnamed_failure_is_reported_but_not_retried(monkeypatch, tmp_path):
+    """Without node IDs there is nothing to confirm, so no extra run is
+    spent — but the red run is still reported as a failure."""
+    verifier, calls = _verifier_with_runs(
+        monkeypatch, [_run_result(1, "interrupted in 0.10s\n")]
+    )
+
+    (check,) = verifier._test_checks(tmp_path, None, timeout=60)
+
+    assert check.status == "FAIL"
+    assert len(calls) == 1

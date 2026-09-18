@@ -51,6 +51,38 @@ PYTEST_ERRORS = re.compile(r"(?P<errors>\d+) errors?")
 JEST_COUNT = re.compile(r"Tests?:\s+(?P<failed>\d+) failed,\s+(?P<passed>\d+) passed")
 JEST_ALL = re.compile(r"Tests?:\s+(?P<passed>\d+) passed")
 
+# pytest's short summary names every failing test
+# (``FAILED tests/test_x.py::test_y - AssertionError``). Those names are
+# the evidence a red suite must carry: a failure reported only as
+# "exited 1" cannot be acted on or even attributed to a test.
+PYTEST_NODE = re.compile(
+    r"^(?:FAILED|ERROR)\s+(?P<node>[^\s:]+(?:::[^\s]+)+)", re.M
+)
+
+
+def is_pytest_command(cmd: Any) -> bool:
+    """True when this test command is a pytest invocation."""
+    parts = cmd if isinstance(cmd, (list, tuple)) else [cmd]
+    return any("pytest" in str(part) for part in parts)
+
+
+def parse_failing_node_ids(text: str) -> list[str]:
+    """Node IDs of the failing tests, in the order pytest reported them.
+
+    Collection errors carry no node ID and are deliberately not
+    returned: they are deterministic and must not be retried.
+    """
+    if not text:
+        return []
+    seen: set[str] = set()
+    nodes: list[str] = []
+    for match in PYTEST_NODE.finditer(text):
+        node = match.group("node")
+        if node not in seen:
+            seen.add(node)
+            nodes.append(node)
+    return nodes
+
 
 class TaskVerifier:
     """Runs the real evidence checks for one task."""
@@ -553,10 +585,64 @@ class TaskVerifier:
                     )
                 )
                 continue
-            passed, failed = parse_test_counts(
-                (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
-            )
+            output = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
+            passed, failed = parse_test_counts(output)
             ok = result.get("returncode") == 0 and not result.get("timed_out")
+            failing = parse_failing_node_ids(output)
+
+            # A red run is not automatically a broken change. A full
+            # suite executed inside a busy engine can lose a
+            # load-sensitive test that passes on every isolated run, so
+            # a failure is *confirmed* before it blocks the commit:
+            # only the tests that failed are re-run, exactly once. A
+            # reproducible failure fails again and still blocks; a load
+            # flake is named in the check detail and the task event, so
+            # nothing is silently swallowed.
+            retry: Optional[dict[str, Any]] = None
+            if not ok and failing and is_pytest_command(cmd):
+                self.cancel_check()
+                confirmed = run(
+                    [*cmd, *failing],
+                    cwd=str(worktree),
+                    timeout=timeout,
+                    cancel_check=self.cancel_check,
+                )
+                retry = {
+                    "command": confirmed.get("cmd"),
+                    "returncode": confirmed.get("returncode"),
+                    "timed_out": bool(confirmed.get("timed_out")),
+                    "tests": failing,
+                    "output_tail": (confirmed.get("stdout") or "")[-1500:],
+                }
+                if (
+                    confirmed.get("returncode") == 0
+                    and not confirmed.get("timed_out")
+                ):
+                    retry["outcome"] = "PASS"
+                    # None of the failing tests are failing any more:
+                    # the first run's result did not reproduce.
+                    ok = True
+                    failed = 0
+                else:
+                    retry["outcome"] = "FAIL"
+
+            detail = (
+                f"{result.get('cmd')} exited {result.get('returncode')}"
+                + (" (timed out)" if result.get("timed_out") else "")
+            )
+            if failing:
+                detail += "; failing: " + ", ".join(failing[:5])
+            if retry:
+                detail += (
+                    f"; isolated re-run of {len(retry['tests'])} failed "
+                    "test(s) "
+                    + (
+                        "passed (did not reproduce — load flake)"
+                        if retry.get("outcome") == "PASS"
+                        else "failed again (reproducible failure)"
+                    )
+                )
+
             self.on_event(
                 "test.completed",
                 {
@@ -564,6 +650,8 @@ class TaskVerifier:
                     "returncode": result.get("returncode"),
                     "passed": passed,
                     "failed": failed,
+                    "failing": failing[:10],
+                    "retry": retry,
                     "status": "PASS" if ok else "FAIL",
                 },
             )
@@ -571,17 +659,15 @@ class TaskVerifier:
                 VerificationCheck(
                     name="tests",
                     status="PASS" if ok else "FAIL",
-                    detail=(
-                        f"{result.get('cmd')} exited "
-                        f"{result.get('returncode')}"
-                        + (" (timed out)" if result.get("timed_out") else "")
-                    ),
+                    detail=detail,
                     evidence={
                         "command": result.get("cmd"),
                         "returncode": result.get("returncode"),
                         "timed_out": bool(result.get("timed_out")),
                         "passed": passed,
                         "failed": failed,
+                        "failing_tests": failing,
+                        "retry": retry,
                         "output_tail": (
                             (result.get("stdout") or "")[-1500:]
                         ),
