@@ -178,6 +178,18 @@ class Coordinator:
         )
         self._hb_thread.start()
 
+    def is_stopped(self) -> bool:
+        """True once :meth:`stop` has run.
+
+        A stopped coordinator can never claim another mission: its
+        claim loop has exited and ``_shutting_down`` short-circuits
+        every capacity check. Callers that cache a coordinator (the
+        app's process-wide accessor) must therefore never hand a
+        stopped instance out again, or missions are accepted and then
+        sit in ``QUEUED`` forever with no error.
+        """
+        return self._shutting_down or self._stop.is_set()
+
     def stop(self, drain: bool = True, timeout: float = 30.0):
         """
         Clean shutdown: stop claiming, optionally drain inflight

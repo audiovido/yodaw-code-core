@@ -174,11 +174,12 @@ worktree and reached real execution on `kodgar-native` (two of them
 reached `TESTING`, running the repository's own suite). No task failed on
 `DirtyRepo`.
 
-They did **not** reach `COMPLETED`, and the reason is not the executor
-layer: their verification runs the *target repository's* test suite, and
-that suite is red — see "Pre-existing failures" below. Verification
-refused to commit on top of a failing suite, which is the intended
-contract.
+They did **not** reach `COMPLETED` at that time, and the reason was not
+the executor layer: their verification runs the *target repository's* own
+suite, and that suite was red (see below). Verification refused to commit
+on top of a failing suite, which is the intended contract. With the
+coordinator fix in this document the suite is green, so that blocker is
+removed.
 
 ## Pre-existing failures in the target repository's suite
 
@@ -189,7 +190,8 @@ comparison was run to establish causality:
 | Run | Result |
 |---|---|
 | Pristine baseline `5e0fbdc` (none of this work applied) | **11 failed**, 1263 passed, 7 skipped (9:24) |
-| After this work | **4 failed**, 1296 passed, 7 skipped |
+| After the executor work | 4 failed, 1296 passed, 7 skipped (19:00) |
+| After the coordinator fix below | **0 failed**, 1302 passed, 7 skipped (5:06) |
 
 The four that still fail are a **strict subset of the baseline failures**,
 so they are pre-existing and unrelated to the executor layer:
@@ -206,40 +208,63 @@ The other seven baseline failures were repaired by this work
 both `test_workers_safe_subprocess` cases, `test_workers_worktree_guard`,
 `test_worktree_lifecycle`).
 
-### Characterisation of the four remaining failures
+### Root cause of the four remaining failures (found and fixed)
 
-All four are in the **mission runtime** (`app/runtime/*`), a subsystem this
-change does not touch, and all four wait on a mission the runtime never
-starts:
+All four wait on a mission the runtime never starts:
 
 ```
 AssertionError: mission m_c3eb6b8f3151 did not reach a terminal state within 120.0s
 AssertionError: assertion <MissionStatus.QUEUED> == 'RUNNING'
 ```
 
-Measured facts:
+Instrumenting a full run with a read-only probe that samples the cached
+coordinator's state on every transition produced the answer in one line:
 
-- They **pass in isolation** (each alone, per-file, and in several file
-groups: `test_tenancy.py` alone → 9 passed; `test_auth_and_events.py` +
-failing test → 11 passed; `test_cancellation.py` +
-`test_runtime_queue_and_claims.py` + failing test → 14 passed).
-- They **fail only in a full-suite run**, and only ever with `QUEUED` /
-not-terminal status.
-- **Raising the deadlines did not fix them** — 10→60 s, 30→120 s,
-60→180 s and 120→300 s all still failed. That measurement is why the
-timeout inflation was **reverted** rather than shipped: the timeout is not
-the invariant.
-- The runtime's concurrency is capped (`YODAW_MAX_CONCURRENT_MISSIONS`,
-default **2**) and the coordinator is a process-global singleton whose
-`_inflight` state spans tests, so a mission left in flight by an earlier
-test can leave no capacity to claim later missions. That mechanism fits
-every observation (QUEUED status, isolation-only passing, timeout
-immunity) but was not conclusively proven — the targeted group attempts
-above did not reproduce it.
+```
+[trans] tests/test_background_tasks.py::test_task_api_contract
+        inflight=0/2 stop=True down=True coord=coord_7635f504
+```
 
-Per the acceptance rule, work stopped here rather than looping: this is a
-true pre-existing blocker in a subsystem outside the executor repair, and
-it is reported rather than papered over.
+The chain:
+
+1. any `with TestClient(app)` block exits the app lifespan, and the
+   lifespan calls `coordinator.stop()`;
+2. `stop()` sets `_shutting_down = True` and `_stop.set()` permanently —
+   the claim loop exits and every capacity check short-circuits, so that
+   instance can never claim another mission;
+3. `app.main.get_coordinator()` cached the coordinator and returned it
+   whenever it was not `None`, so it kept handing out the **dead**
+   instance for the rest of the process.
+
+Every mission created after the first lifespan shutdown was therefore
+accepted and then sat in `QUEUED` forever, silently. That explains all
+four symptoms at once: passing in isolation (fresh coordinator), failing
+only in a full run, `QUEUED` rather than `RUNNING`, complete immunity to
+deadline increases, and victims in three distant test files.
+
+**Minimal reproducer (33 s):**
+
+```
+pytest tests/test_background_tasks.py::test_task_api_contract \
+       tests/test_tenancy.py::test_tenant_mission_carries_identity_priority_and_quota
+# before the fix: 1 failed, 1 passed
+# after  the fix: 2 passed
+```
+
+**Fix:** `Coordinator.is_stopped()` exposes the condition, and
+`get_coordinator()` discards a stopped instance and builds a fresh one
+(both at the fast path and inside the lock). No timeout was changed — the
+earlier deadline inflation was measured to be ineffective and was
+reverted.
+
+This is a product bug, not only a test-isolation issue: in any process
+that starts and stops the app (test sessions, embedding, reloads) the
+mission runtime silently stopped working, accumulating `QUEUED` missions
+with no error reported anywhere.
+
+Regression coverage: `tests/test_runtime_coordinator_lifecycle.py`
+asserts that lifespan shutdown leaves the cached instance stopped and that
+the accessor returns a *live* replacement afterwards.
 
 ## Verifier reporting bug found and fixed
 

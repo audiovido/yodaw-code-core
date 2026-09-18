@@ -264,12 +264,20 @@ def get_coordinator():
         return None
 
     if _coordinator is not None:
-        return _coordinator
+        if not _coordinator.is_stopped():
+            return _coordinator
+        # App lifespan shutdown stops this coordinator permanently, and
+        # the claim loop cannot be revived. Returning the corpse meant
+        # every mission created afterwards was accepted and then stayed
+        # QUEUED forever with no error -- a silent stall. Rebuild it.
+        _coordinator = None
 
     if _coordinator_lock is None:
         _coordinator_lock = threading.Lock()
 
     with _coordinator_lock:
+        if _coordinator is not None and _coordinator.is_stopped():
+            _coordinator = None
         if _coordinator is None:
             from app.runtime.coordinator import Coordinator
 
