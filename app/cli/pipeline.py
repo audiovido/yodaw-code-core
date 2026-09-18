@@ -92,9 +92,32 @@ EXPLICIT_READONLY_PHRASES = (
 
 
 def is_explicit_readonly(goal: str) -> bool:
-    """True when the goal explicitly forbids mutation/execution."""
+    """True only when the goal forbids repository mutation itself.
+
+    A scoped safety constraint such as "do not modify files outside
+    this repository" is still a mutating coding mission and must not
+    be routed into conversational chat.
+    """
     lowered = goal.lower()
-    return any(phrase in lowered for phrase in EXPLICIT_READONLY_PHRASES)
+
+    scoped_mutation_phrases = (
+        "do not modify files outside",
+        "don't modify files outside",
+        "do not modify any files outside",
+        "don't modify any files outside",
+        "do not edit files outside",
+        "don't edit files outside",
+    )
+
+    check_text = lowered
+
+    for phrase in scoped_mutation_phrases:
+        check_text = check_text.replace(phrase, "")
+
+    return any(
+        phrase in check_text
+        for phrase in EXPLICIT_READONLY_PHRASES
+    )
 
 
 def is_high_risk(goal: str) -> bool:

@@ -99,3 +99,17 @@ def test_js_build_is_validation_when_no_test_script(
     ] in commands
 
     assert ["npm", "run", "build"] in commands
+
+
+
+def test_scoped_mutation_constraint_is_not_readonly():
+    from app.cli.pipeline import is_explicit_readonly
+
+    assert not is_explicit_readonly(
+        "Implement the feature. "
+        "Do not modify files outside this repository."
+    )
+
+    assert is_explicit_readonly(
+        "Do not modify files or run commands."
+    )
